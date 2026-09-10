@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/x0c/sesskit/schemas/conversation.v1.json",
+  "title": "SessKit Conversation Message",
+  "type": "object",
+  "required": ["role", "text"],
+  "properties": {
+    "role": { "type": "string", "enum": ["user", "assistant"] },
+    "text": { "type": "string" },
+    "time": { "type": ["string", "null"] },
+    "mtime": { "type": ["number", "null"] }
+  },
+  "additionalProperties": false
+}
