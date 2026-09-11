@@ -396,13 +396,20 @@ def scan_signature() -> tuple | None:
     return (stat_signature(files), live_pid_snapshot("codex"))
 
 
-def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[SessionInfo]:
+def scan_sessions(
+    cwd_filter: str | None = None,
+    limit: int = 50,
+    *,
+    include_missing_cwd: bool = False,
+) -> list[SessionInfo]:
     """扫描 Codex 会话，返回统一结构列表，按 mtime 降序。
 
     历史会话可能有上千个，但调用方只要最近 limit 条。_build_session_info 要
     读文件头尾解析 JSONL 较慢，所以先用廉价的 os.stat 按真实文件 mtime（而非
     文件名里的创建时间——同一会话被续接会更新 mtime 但不改文件名）排好序，
     凑够 limit 条有效结果就提前停止，不必解析全部历史文件。
+
+    ``include_missing_cwd``：见 Claude 扫描同名参数。
 
     首屏必须 ≤1s（见 AGENTS.md 验证要求）：cwd 判活按 cwd 记忆化，避免大量
     会话共享同一个 cwd 时重复 os.path.isdir——这个调用在同步/网络目录上很
@@ -462,7 +469,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
             continue  # 后台标题生成自产的噪音会话,和 Claude 侧同一套 PROMPT_MARKER 过滤
         if is_ephemeral_agent_cwd(info["cwd"]):
             continue  # OpenConductor 管家等 /tmp/oc-manager-* 自动任务，目录复活会刷屏
-        if info["cwd"] and not cached_isdir(info["cwd"]):
+        if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
             continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue

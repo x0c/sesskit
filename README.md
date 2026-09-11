@@ -8,10 +8,12 @@ Any tool can integrate by shelling out to the `sesskit` CLI (stable JSON envelop
 
 ## Install
 
+SessKit is not on PyPI yet. Install from GitHub (recommended) or from a local checkout:
+
 ```bash
-pip install sesskit
+pip install "sesskit @ git+https://github.com/x0c/sesskit.git"
 # or
-pipx install sesskit
+pipx install "sesskit @ git+https://github.com/x0c/sesskit.git"
 # or from source
 pip install -e .
 ```
@@ -38,6 +40,7 @@ All commands print:
 ## Python API
 
 ```python
+from sesskit import load_session_conversation
 from sesskit.registry import default_registry
 from sesskit.transcript import load_events, SCHEMA_ID
 
@@ -45,7 +48,7 @@ registry = default_registry()
 sessions = registry.scan_all(limit=20)
 for runtime_id, items in sessions.items():
     for session in items[:3]:
-        messages = registry.get(runtime_id).load_conversation(session)
+        messages = load_session_conversation(session)  # or registry.get(runtime_id).load_conversation(session)
         events = load_events(session)  # SCHEMA_ID == "sesskit.transcript/v1"
 ```
 

@@ -93,6 +93,10 @@ def active_messages(entries: list[dict]) -> list[dict]:
     Pi v1 jsonl 的 message 没有 ``id`` / ``parentId``（官方加载时才 migrate 成
     v2 树）。只读扫描不能等那次迁移落盘：没有 id 的 message 按文件顺序平铺，
     否则整段历史会被当成「没有活动分支」丢掉。
+
+    官方 SessionManager 从磁盘恢复时，未指定 leafId 就取文件**最后一条**记录再
+    沿 parentId 回溯（见 pi-mono ``buildSessionPath``：``leaf ??= entries.at(-1)``）。
+    不能用 timestamp 挑叶子：时钟回拨时会错进旧分支。
     """
     messages = [
         item for item in entries
@@ -103,11 +107,18 @@ def active_messages(entries: list[dict]) -> list[dict]:
     if any(not isinstance(item.get("id"), str) for item in messages):
         return messages
     by_id = {str(item["id"]): item for item in entries if isinstance(item.get("id"), str)}
-    parents = {str(item["parentId"]) for item in entries if isinstance(item.get("parentId"), str)}
-    leaves = [item for item in by_id.values() if str(item.get("id")) not in parents]
-    if not leaves:
+    leaf: dict | None = None
+    if entries:
+        last = entries[-1]
+        if isinstance(last, dict) and isinstance(last.get("id"), str) and last["id"] in by_id:
+            leaf = by_id[str(last["id"])]
+    if leaf is None:
+        for item in reversed(entries):
+            if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"] in by_id:
+                leaf = by_id[str(item["id"])]
+                break
+    if leaf is None:
         return messages
-    leaf = max(leaves, key=lambda item: str(item.get("timestamp") or ""))
     path: list[dict] = []
     while isinstance(leaf, dict):
         path.append(leaf)

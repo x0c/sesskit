@@ -478,7 +478,12 @@ def scan_signature() -> tuple | None:
     return (stat_signature(paths), live_pid_snapshot("kimi"))
 
 
-def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[SessionInfo]:
+def scan_sessions(
+    cwd_filter: str | None = None,
+    limit: int = 50,
+    *,
+    include_missing_cwd: bool = False,
+) -> list[SessionInfo]:
     """扫描所有 Kimi Code 会话，返回统一结构列表，按 mtime 降序。
 
     先用一次廉价的 os.stat（按 wire.jsonl 文件 mtime）排序，只对最可能入选的
@@ -539,7 +544,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
             continue
         if is_ephemeral_agent_cwd(info["cwd"]):
             continue  # OpenConductor 管家临时 cwd，目录复活会刷屏
-        if info["cwd"] and not cached_isdir(info["cwd"]):
+        if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
             continue  # 工作目录已删除，无法原生恢复
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue

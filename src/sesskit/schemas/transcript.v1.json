@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/x0c/sesskit/schemas/transcript.v1.json",
+  "title": "SessKit Transcript Event",
+  "type": "object",
+  "required": ["type", "seq"],
+  "properties": {
+    "schema_note": {
+      "description": "Envelope field schema is sesskit.transcript/v1 (legacy alias: corral.share/v1)"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["user_message", "assistant_message", "thinking", "tool_call", "tool_result"]
+    },
+    "seq": { "type": "integer", "minimum": 1 },
+    "ts": { "type": ["number", "null"] },
+    "text": { "type": "string" },
+    "id": { "type": "string" },
+    "name": { "type": "string" },
+    "kind": { "type": "string" },
+    "input": {},
+    "call_id": { "type": "string" },
+    "status": { "type": "string" },
+    "output": {}
+  },
+  "additionalProperties": true
+}

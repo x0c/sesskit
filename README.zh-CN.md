@@ -8,10 +8,12 @@
 
 ## 安装
 
+SessKit 尚未上架 PyPI。请从 GitHub 安装（推荐），或本地源码安装：
+
 ```bash
-pip install sesskit
+pip install "sesskit @ git+https://github.com/x0c/sesskit.git"
 # 或
-pipx install sesskit
+pipx install "sesskit @ git+https://github.com/x0c/sesskit.git"
 # 或从源码
 pip install -e .
 ```
@@ -38,11 +40,16 @@ sesskit describe
 ## Python API
 
 ```python
+from sesskit import load_session_conversation
 from sesskit.registry import default_registry
 from sesskit.transcript import load_events, SCHEMA_ID
 
 registry = default_registry()
 sessions = registry.scan_all(limit=20)
+for runtime_id, items in sessions.items():
+    for session in items[:3]:
+        messages = load_session_conversation(session)
+        events = load_events(session)  # SCHEMA_ID == "sesskit.transcript/v1"
 ```
 
 ## 契约

@@ -30,7 +30,8 @@ from sesskit.envelope import (
 )
 from sesskit.hosted import cache_dir
 from sesskit.models import format_message_time, session_key
-from sesskit.registry import ParserRegistry, default_registry
+from sesskit.paths import assert_not_history_path, atomic_write_json
+from sesskit.registry import ConversationLoadError, ParserRegistry, default_registry
 from sesskit.transcript import SCHEMA_ID, count_events, load_events
 
 STATUS_LABELS = {
@@ -149,7 +150,47 @@ def _apply_top(items: list, top: int | None) -> list:
     return items[: max(0, top)]
 
 
-def resolve_ref(registry: ParserRegistry, ref: str, limit: int) -> dict:
+def _include_missing_cwd(args) -> bool:
+    return bool(getattr(args, "include_missing_cwd", False))
+
+
+def _scan_map(registry: ParserRegistry, args, limit: int | None = None) -> dict:
+    depth = args.limit if limit is None else limit
+    include_missing = _include_missing_cwd(args)
+    if getattr(args, "runtime", None):
+        runtime = registry.get(args.runtime)
+        return {args.runtime: runtime.scan_sessions(depth, include_missing_cwd=include_missing)}
+    return registry.scan_all(depth, include_missing_cwd=include_missing)
+
+
+def _load_messages(runtime, session: dict):
+    try:
+        return runtime.load_conversation(session)
+    except ConversationLoadError as exc:
+        raise ApiError(
+            "not_found",
+            str(exc),
+            EXIT_NOT_FOUND,
+            hint="the session may have been deleted; refresh with sesskit list",
+            next_commands=["sesskit list"],
+        ) from exc
+
+
+def _write_envelope_file(envelope: dict, out_path: str, *, compact: bool, protected: list[str]) -> str:
+    output_path = os.path.abspath(out_path)
+    try:
+        assert_not_history_path(output_path, protected)
+    except ValueError as exc:
+        raise ApiError("usage_error", str(exc), EXIT_USAGE) from exc
+    try:
+        return atomic_write_json(output_path, envelope, compact=compact)
+    except FileNotFoundError as exc:
+        raise ApiError("usage_error", str(exc), EXIT_USAGE) from exc
+    except IsADirectoryError as exc:
+        raise ApiError("usage_error", str(exc), EXIT_USAGE) from exc
+
+
+def resolve_ref(registry: ParserRegistry, ref: str, limit: int, *, include_missing_cwd: bool = False) -> dict:
     if not ref:
         raise ApiError("usage_error", "missing session reference", EXIT_USAGE)
 
@@ -159,9 +200,9 @@ def resolve_ref(registry: ParserRegistry, ref: str, limit: int) -> dict:
             runtime = registry.get(runtime_id)
         except KeyError as exc:
             raise ApiError("not_found", f"unregistered runtime: {runtime_id}", EXIT_NOT_FOUND) from exc
-        matches = _match_sessions(runtime.scan_sessions(limit), ident)
+        matches = _match_sessions(runtime.scan_sessions(limit, include_missing_cwd=include_missing_cwd), ident)
     else:
-        scanned = registry.scan_all(limit)
+        scanned = registry.scan_all(limit, include_missing_cwd=include_missing_cwd)
         matches = []
         for runtime in registry:
             matches.extend(_match_sessions(scanned[runtime.id], ref))
@@ -230,10 +271,7 @@ def cmd_list(args, registry: ParserRegistry) -> dict:
     top = getattr(args, "top", None)
     fields = _parse_fields(getattr(args, "fields", None), DEFAULT_LIST_FIELDS if compact else None)
     runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
-    if args.runtime:
-        scanned = {args.runtime: registry.get(args.runtime).scan_sessions(args.limit)}
-    else:
-        scanned = registry.scan_all(args.limit)
+    scanned = _scan_map(registry, args)
 
     candidates = []
     for runtime in runtimes:
@@ -248,8 +286,16 @@ def cmd_list(args, registry: ParserRegistry) -> dict:
 
     candidates.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
     candidates = _apply_top(candidates, top)
-    sessions = [session_payload(session, fields) for session in candidates]
-    return ok({"count": len(sessions), "scan_limit": args.limit, "top": top, "sessions": sessions})
+    data = {
+        "count": len(candidates),
+        "scan_limit": args.limit,
+        "include_missing_cwd": _include_missing_cwd(args),
+        "top": top,
+        "sessions": [session_payload(s, fields) for s in candidates],
+    }
+    if registry.last_scan_errors:
+        data["scan_errors"] = registry.last_scan_errors
+    return ok(data)
 
 
 def cmd_search(args, registry: ParserRegistry) -> dict:
@@ -258,7 +304,7 @@ def cmd_search(args, registry: ParserRegistry) -> dict:
     top = getattr(args, "top", None)
     fields = _parse_fields(getattr(args, "fields", None), DEFAULT_SEARCH_FIELDS if compact else None)
     runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
-    scanned = registry.scan_all(args.limit) if args.runtime is None else {args.runtime: registry.get(args.runtime).scan_sessions(args.limit)}
+    scanned = _scan_map(registry, args)
 
     results = []
     for runtime in runtimes:
@@ -280,7 +326,10 @@ def cmd_search(args, registry: ParserRegistry) -> dict:
                 score, matched_fields = _score_quick_match(session, title, keywords)
                 results.append((score, "quick", matched_fields, runtime, session, None))
             elif args.deep:
-                messages = runtime.load_conversation(session)
+                try:
+                    messages = _load_messages(runtime, session)
+                except ApiError:
+                    continue
                 full_text = "\n".join(m.text for m in messages).lower()
                 if all(kw in full_text for kw in keywords):
                     score, matched_fields = _score_quick_match(session, title, keywords)
@@ -301,26 +350,33 @@ def cmd_search(args, registry: ParserRegistry) -> dict:
             payload["snippet"] = snippet
         sessions.append(_apply_fields(payload, fields))
 
-    return ok(
-        {
-            "query": args.keywords,
-            "deep": args.deep,
-            "count": len(sessions),
-            "scan_limit": args.limit,
-            "top": top,
-            "sessions": sessions,
-        }
-    )
+    data = {
+        "query": args.keywords,
+        "deep": args.deep,
+        "count": len(sessions),
+        "scan_limit": args.limit,
+        "include_missing_cwd": _include_missing_cwd(args),
+        "top": top,
+        "sessions": sessions,
+    }
+    if registry.last_scan_errors:
+        data["scan_errors"] = registry.last_scan_errors
+    return ok(data)
 
 
 def cmd_show(args, registry: ParserRegistry) -> dict:
-    session = resolve_ref(registry, args.session, args.limit)
+    session = resolve_ref(
+        registry,
+        args.session,
+        args.limit,
+        include_missing_cwd=_include_missing_cwd(args),
+    )
     compact = getattr(args, "compact", False)
     out = getattr(args, "out", None)
     fields = _parse_fields(getattr(args, "fields", None), DEFAULT_SHOW_FIELDS if compact else None)
     runtime = registry.get(str(session.get("source") or ""))
     payload = session_payload(session)
-    messages = runtime.load_conversation(session)
+    messages = _load_messages(runtime, session)
     total_messages = len(messages)
     if not args.full:
         n = args.messages if args.messages else 20
@@ -340,21 +396,12 @@ def cmd_show(args, registry: ParserRegistry) -> dict:
 
     if out:
         envelope = ok(payload)
-        output_path = os.path.abspath(out)
-        parent = os.path.dirname(output_path) or "."
-        if not os.path.isdir(parent):
-            raise ApiError("usage_error", f"output directory does not exist: {parent}", EXIT_USAGE)
-        if os.path.isdir(output_path):
-            raise ApiError("usage_error", f"output path is a directory: {output_path}", EXIT_USAGE)
-        with open(output_path, "w", encoding="utf-8") as fp:
-            json.dump(
-                envelope,
-                fp,
-                ensure_ascii=False,
-                separators=(",", ":") if compact else None,
-                indent=None if compact else 2,
-            )
-            fp.write("\n")
+        output_path = _write_envelope_file(
+            envelope,
+            out,
+            compact=compact,
+            protected=[str(session.get("path") or "")],
+        )
         summary = session_payload(session, DEFAULT_LIST_FIELDS if compact else None)
         summary.update(
             {
@@ -399,7 +446,7 @@ def cmd_export(args, registry: ParserRegistry) -> dict:
 
     compact = getattr(args, "compact", False)
     runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
-    scanned = registry.scan_all(args.limit) if args.runtime is None else {args.runtime: registry.get(args.runtime).scan_sessions(args.limit)}
+    scanned = _scan_map(registry, args)
 
     candidates = []
     for runtime in runtimes:
@@ -417,9 +464,14 @@ def cmd_export(args, registry: ParserRegistry) -> dict:
 
     candidates.sort(key=lambda item: item[1].get("mtime") or 0)
     sessions = []
+    load_errors = []
     for runtime, session in candidates:
         payload = session_payload(session)
-        messages = runtime.load_conversation(session)
+        try:
+            messages = _load_messages(runtime, session)
+        except ApiError as exc:
+            load_errors.append({"id": session.get("id"), "runtime": runtime.id, "error": exc.message})
+            continue
         payload["messages"] = [
             {
                 "role": m.role,
@@ -441,29 +493,21 @@ def cmd_export(args, registry: ParserRegistry) -> dict:
         },
         "count": len(sessions),
         "scan_limit": args.limit,
+        "include_missing_cwd": _include_missing_cwd(args),
         "sessions": sessions,
     }
+    if load_errors:
+        data["load_errors"] = load_errors
+    if registry.last_scan_errors:
+        data["scan_errors"] = registry.last_scan_errors
 
     out = getattr(args, "out", None)
     if not out:
         return ok(data)
 
     envelope = ok(data)
-    output_path = os.path.abspath(out)
-    parent = os.path.dirname(output_path) or "."
-    if not os.path.isdir(parent):
-        raise ApiError("usage_error", f"output directory does not exist: {parent}", EXIT_USAGE)
-    if os.path.isdir(output_path):
-        raise ApiError("usage_error", f"output path is a directory: {output_path}", EXIT_USAGE)
-    with open(output_path, "w", encoding="utf-8") as fp:
-        json.dump(
-            envelope,
-            fp,
-            ensure_ascii=False,
-            separators=(",", ":") if compact else None,
-            indent=None if compact else 2,
-        )
-        fp.write("\n")
+    protected = [str(session.get("path") or "") for _, session in candidates]
+    output_path = _write_envelope_file(envelope, out, compact=compact, protected=protected)
     return ok(
         {
             "output_path": output_path,
@@ -472,12 +516,15 @@ def cmd_export(args, registry: ParserRegistry) -> dict:
             "message_count_total": sum(s["message_count_total"] for s in sessions),
             "range": data["range"],
             "sessions_omitted": True,
+            "load_error_count": len(load_errors),
         }
     )
 
 
 def build_share_payload(session: dict, registry: ParserRegistry) -> dict:
     runtime = registry.get(str(session.get("source") or ""))
+    # Surface missing history as an error instead of a successful empty transcript.
+    _load_messages(runtime, session)
     events = load_events(session)
     payload = session_payload(session)
     payload["schema"] = SCHEMA_ID
@@ -488,23 +535,13 @@ def build_share_payload(session: dict, registry: ParserRegistry) -> dict:
     return payload
 
 
-def write_share_envelope(payload: dict, out_path: str, *, compact: bool = False) -> str:
-    output_path = os.path.abspath(out_path)
-    parent = os.path.dirname(output_path) or "."
-    if not os.path.isdir(parent):
-        raise ApiError("usage_error", f"output directory does not exist: {parent}", EXIT_USAGE)
-    if os.path.isdir(output_path):
-        raise ApiError("usage_error", f"output path is a directory: {output_path}", EXIT_USAGE)
-    with open(output_path, "w", encoding="utf-8") as fp:
-        json.dump(
-            ok(payload),
-            fp,
-            ensure_ascii=False,
-            separators=(",", ":") if compact else None,
-            indent=None if compact else 2,
-        )
-        fp.write("\n")
-    return output_path
+def write_share_envelope(payload: dict, out_path: str, *, compact: bool = False, protected: list[str] | None = None) -> str:
+    return _write_envelope_file(
+        ok(payload),
+        out_path,
+        compact=compact,
+        protected=list(protected or []) + [str(payload.get("history_path") or "")],
+    )
 
 
 def share_cache_path(session: dict) -> str:
@@ -520,17 +557,32 @@ def share_cache_path(session: dict) -> str:
 
 
 def export_share_to_cache(session: dict, registry: ParserRegistry, *, compact: bool = True) -> str:
-    return write_share_envelope(build_share_payload(session, registry), share_cache_path(session), compact=compact)
+    return write_share_envelope(
+        build_share_payload(session, registry),
+        share_cache_path(session),
+        compact=compact,
+        protected=[str(session.get("path") or "")],
+    )
 
 
 def cmd_share(args, registry: ParserRegistry) -> dict:
-    session = resolve_ref(registry, args.session, args.limit)
+    session = resolve_ref(
+        registry,
+        args.session,
+        args.limit,
+        include_missing_cwd=_include_missing_cwd(args),
+    )
     compact = getattr(args, "compact", False)
     out = getattr(args, "out", None)
     payload = build_share_payload(session, registry)
     if not out:
         return ok(payload)
-    output_path = write_share_envelope(payload, out, compact=compact)
+    output_path = write_share_envelope(
+        payload,
+        out,
+        compact=compact,
+        protected=[str(session.get("path") or "")],
+    )
     summary = session_payload(session, DEFAULT_LIST_FIELDS if compact else None)
     summary.update(
         {
@@ -557,6 +609,13 @@ COMMANDS = [
             {"flags": ["--status"], "kwargs": {"choices": ["done", "pending", "aborted", "unknown"]}},
             {"flags": ["--cwd"], "kwargs": {"help": "substring filter on session cwd"}},
             {"flags": ["--live"], "kwargs": {"action": "store_true", "help": "only sessions currently live"}},
+            {
+                "flags": ["--include-missing-cwd"],
+                "kwargs": {
+                    "action": "store_true",
+                    "help": "keep sessions whose project directory was deleted (archive mode; default hides them for resume-oriented lists)",
+                },
+            },
             {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
             {"flags": ["--fields"], "kwargs": {"help": "comma-separated field allowlist"}},
         ],
@@ -573,6 +632,7 @@ COMMANDS = [
             {"flags": ["--limit"], "kwargs": {"type": int, "default": 50}},
             {"flags": ["--top"], "kwargs": {"type": int, "default": None}},
             {"flags": ["--live"], "kwargs": {"action": "store_true"}},
+            {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
             {"flags": ["--fields"], "kwargs": {}},
         ],
@@ -587,6 +647,7 @@ COMMANDS = [
             {"flags": ["--messages"], "kwargs": {"type": int, "default": None}},
             {"flags": ["--full"], "kwargs": {"action": "store_true"}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": _RESOLVE_SCAN_LIMIT}},
+            {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
             {"flags": ["--out"], "kwargs": {"help": "write full envelope to a file"}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
             {"flags": ["--fields"], "kwargs": {}},
@@ -604,6 +665,7 @@ COMMANDS = [
             {"flags": ["--status"], "kwargs": {"choices": ["done", "pending", "aborted", "unknown"]}},
             {"flags": ["--cwd"], "kwargs": {}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": 200}},
+            {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
             {"flags": ["--out"], "kwargs": {}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
         ],
@@ -616,6 +678,7 @@ COMMANDS = [
         "args": [
             {"flags": ["session"], "kwargs": {}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": _RESOLVE_SCAN_LIMIT}},
+            {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
             {"flags": ["--out"], "kwargs": {}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
         ],

@@ -241,7 +241,12 @@ def scan_signature() -> tuple | None:
     return (stat_signature(paths), live_pid_snapshot("agent"))
 
 
-def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[SessionInfo]:
+def scan_sessions(
+    cwd_filter: str | None = None,
+    limit: int = 50,
+    *,
+    include_missing_cwd: bool = False,
+) -> list[SessionInfo]:
     """扫描 Cursor CLI 会话，按 mtime 降序；只读 meta/prompt_history，不打开 store.db。"""
     if not os.path.isdir(CHATS_DIR):
         return []
@@ -313,7 +318,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
             continue
         if is_ephemeral_agent_cwd(info["cwd"]):
             continue  # OpenConductor 管家临时 cwd，目录复活会刷屏
-        if info["cwd"] and not cached_isdir(info["cwd"]):
+        if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
             continue
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue

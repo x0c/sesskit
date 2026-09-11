@@ -484,13 +484,22 @@ def scan_signature() -> tuple | None:
     return (_jsonl_stat_signature(), _live_pid_file_snapshot())
 
 
-def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[SessionInfo]:
+def scan_sessions(
+    cwd_filter: str | None = None,
+    limit: int = 50,
+    *,
+    include_missing_cwd: bool = False,
+) -> list[SessionInfo]:
     """扫描所有项目下的 Claude Code 会话，返回统一结构列表，按 mtime 降序。
 
     历史会话可能有成百上千个，但调用方只要最近 limit 条。真正耗时的
     _build_session_info 会读取整个文件头尾并解析 JSONL，所以先用一次廉价的
     os.stat 按文件 mtime 排好序，只对最可能入选的候选文件做完整解析，凑够
     limit 条有效结果就停止。
+
+    ``include_missing_cwd=False``（默认）适合 Corral 恢复列表：项目目录已删的
+    会话无法原生 resume，直接丢掉。SessKit 归档/检索可传 True，只要历史文件
+    仍在就保留。
 
     首屏必须 ≤1s（见 AGENTS.md 验证要求），这里做两项针对性优化，改动前后
     结果字节级一致（已用真实会话数据核验 id 顺序、兜底标题、原生标题）：
@@ -541,7 +550,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
             continue  # 廉价探测已确认是自产噪音会话，跳过整文件解析
         if peek_cwd and is_ephemeral_agent_cwd(peek_cwd):
             continue  # OpenConductor 管家临时 cwd，目录复活会刷屏
-        if peek_cwd and not cached_isdir(peek_cwd):
+        if peek_cwd and not include_missing_cwd and not cached_isdir(peek_cwd):
             continue  # 廉价探测已确认 cwd 不存在，跳过整文件解析
 
         cache = get_cache()
@@ -561,7 +570,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
             continue  # sc 自己生成标题留下的噪音会话，跳过（廉价探测失手时的兜底）
         if is_ephemeral_agent_cwd(info["cwd"]):
             continue
-        if info["cwd"] and not cached_isdir(info["cwd"]):
+        if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
             continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue

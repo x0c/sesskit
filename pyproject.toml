@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sesskit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Language-agnostic SDK to read, parse, and export local coding-agent sessions (Claude Code, Codex, OpenCode, Kimi, Cursor, Pi)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -55,7 +55,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-sesskit = ["py.typed"]
+sesskit = ["py.typed", "schemas/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
