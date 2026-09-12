@@ -76,6 +76,7 @@ def make_session_info(
 ) -> SessionInfo:
     """Assemble a SessionInfo dict shared by all runtime parsers."""
     from sesskit.parsers.common import shorten_cwd
+    from sesskit.titles import clip_user_excerpt
 
     session: SessionInfo = {
         "source": source,
@@ -95,9 +96,9 @@ def make_session_info(
         "status_tag": status_tag,
         "live": False,
         "pid": None,
-        "first_user_msg": (first_user_msg or "")[:300],
-        "last_user_msg": (last_user_msg or "")[:300],
-        "last_agent_msg": (last_agent_msg or "")[:300],
+        "first_user_msg": clip_user_excerpt(first_user_msg),
+        "last_user_msg": clip_user_excerpt(last_user_msg),
+        "last_agent_msg": clip_user_excerpt(last_agent_msg),
         "path": path,
     }
     session.update(extra)  # type: ignore[typeddict-item]
