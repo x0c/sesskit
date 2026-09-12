@@ -57,7 +57,11 @@ _OPEN_CHAT_STORE_RE = re.compile(
 )
 # 判活时只收集 Cursor chat 相关 fd，避免读取 agent 打开的全部文件。
 _CURSOR_FD_HINT = ".cursor/chats/"
-_CHAT_SIG_FILES = ("meta.json", "prompt_history.json", "store.db", "store.db-wal")
+# Per-session conversation cache must include the WAL: uncheckpointed writes do
+# not bump store.db mtime. The *list* scan_signature must not — a live agent
+# keeps rewriting store.db-wal, and folding that into the global signature forces
+# a full rescan of every chat every few seconds while the UI is open.
+_CHAT_LIST_SIG_FILES = ("meta.json", "prompt_history.json", "store.db")
 _STORE_PATH_CACHE: tuple[tuple[int, ...], dict[int, list[str]]] | None = None
 
 
@@ -217,7 +221,11 @@ def _build_session_info(chat_dir: str, chat_id: str) -> dict | None:
 
 
 def scan_signature() -> tuple | None:
-    """逐 chat 文件 stat + agent pid 快照；禁止用工作区目录 mtime。"""
+    """逐 chat 列表级文件 stat + agent pid 快照；禁止用工作区目录 mtime。
+
+    不含 ``store.db-wal``：流式写入只动 WAL 时列表元数据未变，应复用上一轮
+    ``scan_sessions`` 结果。会话正文缓存仍通过 ``extra_version`` 带上 WAL。
+    """
     paths: list[str] = []
     if os.path.isdir(CHATS_DIR):
         try:
@@ -236,7 +244,7 @@ def scan_signature() -> tuple | None:
                 chat_dir = os.path.join(workspace_dir, chat_id)
                 if not os.path.isdir(chat_dir):
                     continue
-                for name in _CHAT_SIG_FILES:
+                for name in _CHAT_LIST_SIG_FILES:
                     paths.append(os.path.join(chat_dir, name))
     return (stat_signature(paths), live_pid_snapshot("agent"))
 

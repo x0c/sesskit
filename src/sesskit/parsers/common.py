@@ -134,6 +134,36 @@ def is_pi_cmdline(cmdline: str) -> bool:
     return "pi-coding-agent/" in normalized and "/cli.js" in normalized
 
 
+# macOS ``ps -axo`` is shared by agent + pi cmdline fallbacks in one scan wave;
+# without a short TTL each runtime forks its own full process table read.
+_PS_CMDLINE_CACHE: tuple[float, str] | None = None
+_PS_CMDLINE_TTL_SEC = 1.0
+
+
+def _ps_axo_pid_command() -> str:
+    """Return ``ps -axo pid=,command=`` text, reused for ~1s within a scan wave."""
+    global _PS_CMDLINE_CACHE
+    now = time.monotonic()
+    cached = _PS_CMDLINE_CACHE
+    if cached is not None and (now - cached[0]) < _PS_CMDLINE_TTL_SEC:
+        return cached[1]
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,command="],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+        out = ""
+    _PS_CMDLINE_CACHE = (now, out)
+    return out
+
+
+def clear_ps_cmdline_cache() -> None:
+    """Tests: drop the short-lived ``ps`` table cache."""
+    global _PS_CMDLINE_CACHE
+    _PS_CMDLINE_CACHE = None
+
+
 def _pids_matching_cmdline(predicate) -> list[int]:
     """按 cmdline 谓词扫进程 pid；失败返回空列表。"""
     pids: list[int] = []
@@ -156,12 +186,8 @@ def _pids_matching_cmdline(predicate) -> list[int]:
             if predicate(cmdline):
                 pids.append(int(name))
         return pids
-    try:
-        out = subprocess.check_output(
-            ["ps", "-axo", "pid=,command="],
-            stderr=subprocess.DEVNULL,
-        ).decode(errors="replace")
-    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+    out = _ps_axo_pid_command()
+    if not out:
         return []
     for line in out.splitlines():
         line = line.strip()
@@ -271,6 +297,7 @@ def clear_live_cwd_cache() -> None:
     _PROC_CMDLINE_CACHE.clear()
     _PROC_ENVIRON_CACHE.clear()
     _LIVE_PIDS_BY_NAME.clear()
+    clear_ps_cmdline_cache()
 
 
 def _cwds_for_pids(pids: list[int]) -> list[tuple[int, str]]:
