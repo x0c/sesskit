@@ -5,22 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sesskit"
 version = "0.1.2"
-description = "Language-agnostic SDK to read, parse, and export local coding-agent sessions (Claude Code, Codex, OpenCode, Kimi, Cursor, Pi)."
+description = "Parse and export local Claude Code, Codex CLI, and Cursor agent session files from disk. Python transcript parser library and JSON CLI — not a TUI."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "SessKit contributors" }]
 keywords = [
-  "ai-coding-agent",
   "claude-code",
   "codex-cli",
-  "opencode",
-  "kimi-code",
-  "cursor-cli",
-  "pi-agent",
-  "session",
+  "cursor",
+  "session-parser",
   "transcript",
+  "jsonl",
+  "parser",
+  "export",
   "sdk",
+  "opencode",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
