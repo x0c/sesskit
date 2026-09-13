@@ -56,22 +56,22 @@ SELECT
   (SELECT m.data FROM message m WHERE m.session_id = s.id
      ORDER BY m.time_created DESC, m.id DESC LIMIT 1)              AS last_msg_data,
   (SELECT json_extract(p.data, '$.text')
-     FROM part p JOIN message m ON m.id = p.message_id
-     WHERE p.session_id = s.id
+     FROM message m JOIN part p ON p.message_id = m.id
+     WHERE m.session_id = s.id
        AND json_extract(p.data, '$.type') = 'text'
        AND json_extract(p.data, '$.synthetic') IS NOT 1
        AND json_extract(m.data, '$.role') = 'user'
      ORDER BY m.time_created ASC, m.id ASC, p.id ASC LIMIT 1)      AS first_user_text,
   (SELECT json_extract(p.data, '$.text')
-     FROM part p JOIN message m ON m.id = p.message_id
-     WHERE p.session_id = s.id
+     FROM message m JOIN part p ON p.message_id = m.id
+     WHERE m.session_id = s.id
        AND json_extract(p.data, '$.type') = 'text'
        AND json_extract(p.data, '$.synthetic') IS NOT 1
        AND json_extract(m.data, '$.role') = 'user'
      ORDER BY m.time_created DESC, m.id DESC, p.id DESC LIMIT 1)   AS last_user_text,
   (SELECT json_extract(p.data, '$.text')
-     FROM part p JOIN message m ON m.id = p.message_id
-     WHERE p.session_id = s.id
+     FROM message m JOIN part p ON p.message_id = m.id
+     WHERE m.session_id = s.id
        AND json_extract(p.data, '$.type') = 'text'
        AND json_extract(p.data, '$.synthetic') IS NOT 1
        AND json_extract(m.data, '$.role') = 'assistant'
