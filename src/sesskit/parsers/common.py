@@ -215,24 +215,66 @@ def _pi_pids_by_cmdline() -> list[int]:
     return _pids_matching_cmdline(is_pi_cmdline)
 
 
-def _pids_for_process_name(process_name: str) -> list[int]:
-    """精确进程名 +（agent / pi）cmdline 兜底，合并去重。"""
+def _exact_pids_from_ps_table(process_name: str, table: str) -> list[int] | None:
+    """从一份 ``ps -axo pid=,command=`` 全表里按精确进程名挑 pid。
+
+    ``pgrep -x`` 按 comm 精确匹配；这里取每行 command 的 argv0 basename 等值
+    即视为同一进程。拿不到表（Linux / ps 失败）返回 None，调用方回落 pgrep。
+    """
+    if not table:
+        return None
     found: list[int] = []
-    seen: set[int] = set()
-    try:
-        raw = subprocess.check_output(
-            ["pgrep", "-x", process_name], stderr=subprocess.DEVNULL
-        ).decode().split()
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        raw = []
-    for pid_str in raw:
+    for line in table.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
         try:
-            pid = int(pid_str)
+            pid = int(parts[0])
         except ValueError:
             continue
-        if pid not in seen:
-            seen.add(pid)
+        argv0 = parts[1].split(None, 1)[0]
+        if os.path.basename(argv0) == process_name:
             found.append(pid)
+    return found
+
+
+def _pids_for_process_name(process_name: str) -> list[int]:
+    """精确进程名 +（agent / pi）cmdline 兜底，合并去重。
+
+    darwin 下精确匹配优先复用同波次的 ``ps`` 全表（``_ps_axo_pid_command``
+    带 1 秒 TTL）：一次 fork 约 36ms，供 6 个运行时共用；pgrep 每次 fork
+    约 20ms，6 个名字串行就是 ~120ms。ps 表拿不到时回落 pgrep。
+    comm 被改掉的进程（agent→MainThread、pi→node）本来就走下面的 cmdline
+    兜底，不受数据源切换影响。
+    """
+    found: list[int] = []
+    seen: set[int] = set()
+    exact: list[int] | None = None
+    if not sys.platform.startswith("linux"):
+        exact = _exact_pids_from_ps_table(process_name, _ps_axo_pid_command())
+    if exact is None:
+        try:
+            raw = subprocess.check_output(
+                ["pgrep", "-x", process_name], stderr=subprocess.DEVNULL
+            ).decode().split()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            raw = []
+        for pid_str in raw:
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+            if pid not in seen:
+                seen.add(pid)
+                found.append(pid)
+    else:
+        for pid in exact:
+            if pid not in seen:
+                seen.add(pid)
+                found.append(pid)
     if process_name == "agent":
         extra = _cursor_agent_pids_by_cmdline()
     elif process_name == "pi":
