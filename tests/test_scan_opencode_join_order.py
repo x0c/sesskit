@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """opencode _SCAN_SQL join 顺序回归：message 先行必须与旧写法逐行一致。
 
 背景：旧写法 ``FROM part p JOIN message m ON m.id = p.message_id WHERE
