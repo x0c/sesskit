@@ -45,6 +45,7 @@ Legacy Corral share payloads used `corral.share/v1`; readers should accept both 
 
 ## Runtime-specific restore semantics
 
+- **Codex liveness:** use the shared process snapshot before inspecting open rollout files. On macOS, an executable with a long path can be missed by `pgrep -x codex` while its PID and open history file are present. A missing pgrep match alone is not evidence that the task ended.
 - **Pi:** when reconstructing the active branch from a v2+ tree, start from the **last appended file entry**, then walk `parentId` (matches pi-mono `buildSessionPath`). Do not pick the leaf by max wall-clock timestamp — clock skew selects the wrong branch.
 - **Cursor:** list-level `scan_signature` must **not** include `store.db-wal` (streaming writes would invalidate the whole list every few seconds). Per-session conversation / `extra_version` **must** still include the WAL so previews see uncheckpointed tails. Do not collapse these two version keys into one.
 
@@ -61,9 +62,49 @@ Legacy Corral share payloads used `corral.share/v1`; readers should accept both 
 
 Not on PyPI yet. Documented install is GitHub (`pip install "sesskit @ git+https://github.com/x0c/sesskit.git"`) or editable source. Corral Homebrew vendors the GitHub Release **sdist** (`scripts/sesskit_dep.py` / formula resource) — do not switch Corral’s runtime dep to a git URL.
 
+## Status tags and abnormal endings
+
+List `status_tag` values come from `sesskit.titles` (`STATUS_DONE` / `STATUS_PENDING` / `STATUS_ABORTED` / `STATUS_NONE`). They are **history-tail inferences**, not liveness and not a substitute for Corral’s working/waiting/idle phase.
+
+### Required semantics (product rule)
+
+Consumers (Corral notifications, mobile “job finished”, scripts) must be able to tell **successful completion** apart from **abnormal ends**. Abnormal ends that exist in native history **must** be visible through SessKit — at minimum via correct `status_tag`, and ideally via retained detail (error text / code) in list fields and/or `load_events`.
+
+| Outcome | Expected `status_tag` | Detail consumers need |
+|---|---|---|
+| Normal turn finished with assistant reply | `STATUS_DONE` | `last_agent_msg` / trailing `assistant_message` in `load_events` |
+| Waiting on user | `STATUS_PENDING` | last turn is user-owned |
+| Rate limit, quota, provider error, abort, interrupt | `STATUS_ABORTED` (or a future dedicated failure tag) | Human-readable error summary must not be dropped |
+| Truly unknown | `STATUS_NONE` | Prefer unknown over false `DONE` |
+
+**Do not** treat a native “task/turn complete” marker as success when the same record carries a non-empty error. **Do not** drop error-only assistant turns from `load_events` so that only the preceding user line remains.
+
+### Native signals (reference)
+
+Use these when implementing or reviewing parsers (not an event-bus API — SessKit stays pull/snapshot):
+
+| Runtime | Success signal | Abnormal signal (examples) |
+|---|---|---|
+| Codex | `event_msg` / `task_complete` **without** `error` | Same event with `error` (e.g. `codex_error_info: usage_limit_exceeded`); `turn_aborted` |
+| Pi | assistant `stopReason` in `{stop, …}` with content | `stopReason` in `{error, aborted, …}` plus `errorMessage` (e.g. weekly 429) |
+| OpenCode | assistant `finish=stop`, no `error` | Non-empty message `error` → aborted (existing parser rule) |
+| Cursor | Prefer transcript / store tail; list `status_tag` is weak today | Prefer unknown over false done when terminal reason is unclear |
+| Claude | Stop / transcript end without interrupt markers | Interrupt markers / failure ends (see Claude parser) |
+| Kimi | Stable `step.end` / assistant tail | Cancel / failure markers in wire history |
+
+### Verified gaps (2026-09-15 live Mac runs)
+
+These are **confirmed** against freshly generated history; fix before claiming abnormal-end support:
+
+1. **Codex usage limit:** rollout ends with `task_complete` + `error.usage_limit_exceeded` and `last_agent_message: null`. SessKit labeled **`STATUS_DONE`** and left `last_agent_msg` empty — false success.
+2. **Pi weekly rate limit:** multiple assistant rows with `stopReason=error` and a full 429 `errorMessage`. SessKit labeled **`STATUS_PENDING`**, empty `last_agent_msg`, and `load_events` returned **only** the user message (error rows discarded).
+3. **Pi / OpenCode success paths** on the same machine correctly produced `STATUS_DONE` and `last_agent_msg=PONG` — success wiring is not the main hole; **failure paths are**.
+
+Until those gaps are closed, Corral must not treat SessKit `STATUS_DONE` alone as “notify user the job finished.”
+
 ## Verification (mandatory when changing parsers or load wiring)
 
-Unit tests that **mock** `load_conversation` can stay green while the real registry wiring is broken. After any change to parsers, registry adapters, transcript parsing, or CLI show/export/share:
+Unit tests that **mock** `load_conversation` can stay green while the real registry wiring is broken. After any change to parsers, registry adapters, transcript parsing, status inference, or CLI show/export/share:
 
 1. Run the fixture wiring tests (`tests/test_registry_load.py`) — they must exercise the **real** adapter, not a session-dict stub that hides path wiring.
 2. On a machine with local history, sample **every installed runtime** that has sessions (not one Codex-only check):
@@ -71,5 +112,10 @@ Unit tests that **mock** `load_conversation` can stay green while the real regis
    - Roles are only `user` / `assistant`; no empty text; no literal `"None"`.
    - Strong system / injection markers must not appear in plain user turns (e.g. `system reminder`, `<system`, `task-notification`, `<ide_opened_file`, `<agent_skills>`, `<mcp_file_system>`, `<function_calls>`).
    - Every plain user text appears in `load_events` `user_message` texts (allow substring match when share splits more finely).
-3. If Corral consumes the same change: confirm Corral’s `sesskit_bridge` path and SessKit registry path return the **same** `(role, text)` sequences for the sampled sessions.
-4. Do not claim “data correctness OK” from fixture-only runs when real history is available.
+3. **Fine-grained live runtime checks (required for SessKit maintenance, not optional polish):**
+   - Prefer **fresh one-shot prompts** per installed runtime (install the CLI if missing; skip only when policy forbids install — e.g. removed Claude Code — or when auth/quota truly blocks, and record the skip).
+   - For each runtime, verify **at least one success path** and, when reproducible, **one abnormal path** (usage limit, rate limit, forced error). Compare **native history** → SessKit `status_tag` / `last_agent_msg` / `load_events` on the **exact** session path (do not trust “matched N of scan window” without path/id equality).
+   - Official docs / web search inform expected native fields; they do **not** replace a live run on this machine.
+   - Hooks / notify / SSE are Corral integration concerns; SessKit verification still owns correct **parse of whatever landed on disk** after those runs.
+4. If Corral consumes the same change: confirm Corral’s `sesskit_bridge` path and SessKit registry path return the **same** `(role, text)` sequences for the sampled sessions.
+5. Do not claim “data correctness OK” from fixture-only runs when real history is available. Do not claim “abnormal endings OK” without a live failure sample (or a checked-in fixture cloned from one).

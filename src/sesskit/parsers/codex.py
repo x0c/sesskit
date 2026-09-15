@@ -356,22 +356,14 @@ def _live_uuids_from_lsof(pids: list[str]) -> dict[str, int]:
 
 
 def _live_session_ids() -> dict[str, int]:
-    """返回进程仍存活的 Codex 会话 UUID -> pid 映射。
+    """Map live Codex rollout UUIDs to PIDs using the shared process snapshot.
 
-    Codex 没有类似 Claude 的 pid 注册表，但活着的 codex 进程会持有自己的
-    rollout JSONL 文件描述符。先用 pgrep 拿到所有 codex 进程 pid，再按平台
-    选择最快的路径抽取 UUID：Linux 直接读 /proc/<pid>/fd（近乎零成本），
-    其余平台（如 macOS）退回合并调用的 lsof（实测单次 ~500ms，逐 pid 调用
-    曾是首屏卡顿的主因，改为一次调用覆盖全部候选 pid）。
-    任一环节缺工具或调用失败都静默降级为空集（判活失败时全部按已结束显示）。
+    macOS pgrep exact matching can miss a native binary launched through its
+    long absolute path. The shared snapshot normalizes executable basenames.
+    Open rollout files still establish the actual session identity.
     """
     live_ids: dict[str, int] = {}
-    try:
-        pids = subprocess.check_output(
-            ["pgrep", "-x", "codex"], stderr=subprocess.DEVNULL
-        ).decode().split()
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        return live_ids
+    pids = [str(pid) for pid in live_pid_snapshot("codex")]
     if not pids:
         return live_ids
 
