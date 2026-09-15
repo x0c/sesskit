@@ -200,13 +200,27 @@ def _read_session_tail(path: str, max_bytes: int = 8192) -> list[dict]:
 
 def _status_tag(last_event_type: str | None) -> str:
     """末轮状态判定，与 scan_claude.py 共用 titles.py 里的统一枚举。"""
-    if last_event_type == "turn_aborted":
+    if last_event_type in ("turn_aborted", "task_complete_error"):
         return titles.STATUS_ABORTED
     if last_event_type == "user_message":
         return titles.STATUS_PENDING
     if last_event_type in ("task_complete", "agent_message"):
         return titles.STATUS_DONE
     return titles.STATUS_NONE
+
+
+def task_complete_error_text(payload: dict) -> str:
+    """Human-readable summary from a Codex ``task_complete`` error payload."""
+    err = payload.get("error")
+    if not err:
+        return ""
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("codex_error_info") or "").strip()
+    return str(err).strip()
+
+
+# Keep the private name as an alias for in-module call sites.
+_task_complete_error_text = task_complete_error_text
 
 
 def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
@@ -259,10 +273,14 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
             last_agent_msg = assistant_text
             last_event_type = "agent_message"
         elif t == "event_msg" and pt == "task_complete":
-            msg = payload.get("last_agent_message")
+            msg = str(payload.get("last_agent_message") or "").strip()
+            err_text = _task_complete_error_text(payload)
             if msg:
                 last_agent_msg = msg
-            last_event_type = "task_complete"
+            elif err_text:
+                # Quota / provider failures often complete with null last_agent_message.
+                last_agent_msg = err_text
+            last_event_type = "task_complete_error" if err_text else "task_complete"
         elif t == "event_msg" and pt == "turn_aborted":
             last_event_type = "turn_aborted"
 
@@ -522,6 +540,8 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                     messages.append(ConversationMessage("assistant", assistant_text, _entry_time(entry)))
                 elif entry.get("type") == "event_msg" and payload_type == "task_complete":
                     text = str(payload.get("last_agent_message") or "").strip()
+                    if not text:
+                        text = _task_complete_error_text(payload)
                     if text and (not messages or messages[-1].role != "assistant" or messages[-1].text != text):
                         messages.append(ConversationMessage("assistant", text, _entry_time(entry)))
     except OSError:

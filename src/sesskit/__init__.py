@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 from sesskit.models import ConversationMessage, SessionInfo, make_session_info, session_key
 from sesskit.registry import ConversationLoadError, load_session_conversation

@@ -92,15 +92,15 @@ Use these when implementing or reviewing parsers (not an event-bus API — SessK
 | Claude | Stop / transcript end without interrupt markers | Interrupt markers / failure ends (see Claude parser) |
 | Kimi | Stable `step.end` / assistant tail | Cancel / failure markers in wire history |
 
-### Verified gaps (2026-09-15 live Mac runs)
+### Verified gaps closed (2026-09-15 live Mac runs)
 
-These are **confirmed** against freshly generated history; fix before claiming abnormal-end support:
+Previously confirmed failures, now covered by parser fixes + `tests/test_abnormal_endings.py` and re-checked on the original live history files:
 
-1. **Codex usage limit:** rollout ends with `task_complete` + `error.usage_limit_exceeded` and `last_agent_message: null`. SessKit labeled **`STATUS_DONE`** and left `last_agent_msg` empty — false success.
-2. **Pi weekly rate limit:** multiple assistant rows with `stopReason=error` and a full 429 `errorMessage`. SessKit labeled **`STATUS_PENDING`**, empty `last_agent_msg`, and `load_events` returned **only** the user message (error rows discarded).
-3. **Pi / OpenCode success paths** on the same machine correctly produced `STATUS_DONE` and `last_agent_msg=PONG` — success wiring is not the main hole; **failure paths are**.
+1. **Codex usage limit:** `task_complete` + `error.usage_limit_exceeded` → `STATUS_ABORTED`; error message fills `last_agent_msg` / `load_events` when `last_agent_message` is null.
+2. **Pi weekly rate limit:** `stopReason=error` + `errorMessage` → `STATUS_ABORTED`; error text retained in list, plain conversation, and `load_events` (no longer user-only).
+3. **Pi / OpenCode success paths** remain `STATUS_DONE` with the assistant reply.
 
-Until those gaps are closed, Corral must not treat SessKit `STATUS_DONE` alone as “notify user the job finished.”
+Until consumers migrate, prefer `status_tag` + `last_agent_msg` together: do not treat `STATUS_DONE` alone as “notify job finished” without confirming the sample is not an older SessKit build.
 
 ## Verification (mandatory when changing parsers or load wiring)
 

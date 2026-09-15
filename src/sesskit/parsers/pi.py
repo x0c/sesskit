@@ -146,6 +146,7 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
     branch = _active_messages(entries)
     first_user = last_user = last_agent = None
     last_role = None
+    last_stop_reason: str | None = None
     event_time = parse_timestamp(header.get("timestamp"))
     for item in branch:
         message = item["message"]
@@ -158,9 +159,20 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
             first_user = first_user or text
             last_user = text
             last_role = "user"
-        elif role == "assistant" and text:
-            last_agent = text
-            last_role = "assistant"
+            last_stop_reason = None
+        elif role == "assistant":
+            stop_reason = str(message.get("stopReason") or "").strip() or None
+            error_text = str(message.get("errorMessage") or "").strip()
+            if text:
+                last_agent = text
+                last_role = "assistant"
+                last_stop_reason = stop_reason
+            elif stop_reason in {"error", "aborted"} or error_text:
+                # Empty-body failures (rate limit / abort) still own the turn.
+                last_role = "assistant"
+                last_stop_reason = stop_reason or "error"
+                if error_text:
+                    last_agent = error_text
     if not first_user:
         return None
     try:
@@ -172,13 +184,14 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
         None,
     )
     mtime, time_source = effective_session_time(stat.st_mtime, event_time)
-    status = (
-        titles.STATUS_PENDING
-        if last_role == "user"
-        else titles.STATUS_DONE
-        if last_role == "assistant"
-        else titles.STATUS_NONE
-    )
+    if last_stop_reason in {"error", "aborted"}:
+        status = titles.STATUS_ABORTED
+    elif last_role == "user":
+        status = titles.STATUS_PENDING
+    elif last_role == "assistant":
+        status = titles.STATUS_DONE
+    else:
+        status = titles.STATUS_NONE
     created = parse_timestamp(header.get("timestamp")) or 0.0
     info = make_session_info(
         source="pi", id=session_id, short_id=session_id[:12], cwd=cwd, mtime=mtime,
@@ -265,6 +278,11 @@ def load_conversation(path: str) -> list[ConversationMessage]:
         message = item["message"]
         role = message.get("role")
         text = _text(message.get("content"))
+        if role == "assistant" and not text:
+            stop_reason = str(message.get("stopReason") or "").strip()
+            error_text = str(message.get("errorMessage") or "").strip()
+            if error_text and (stop_reason in {"error", "aborted"} or error_text):
+                text = error_text
         if role not in ("user", "assistant") or not text:
             continue
         timestamp = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))

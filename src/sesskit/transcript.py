@@ -305,6 +305,12 @@ def _parse_codex(session: dict) -> list[dict]:
                     status=_failed(output),
                     output=output,
                 )
+            elif kind == "task_complete":
+                text = str(payload.get("last_agent_message") or "").strip()
+                if not text:
+                    text = scan_codex.task_complete_error_text(payload)
+                if text and not _adjacent_dup(sink, "assistant_message", text):
+                    sink.add("assistant_message", ts, text=text)
     return sink.events
 
 
@@ -564,29 +570,43 @@ def _parse_pi(session: dict) -> list[dict]:
         if role != "assistant":
             continue
         content = message.get("content")
+        emitted = False
         if isinstance(content, str):
-            sink.add("assistant_message", ts, text=content.strip())
-            continue
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = part.get("type")
-            if part_type == "thinking":
-                sink.add("thinking", ts, text=str(part.get("thinking") or part.get("text") or "").strip())
-            elif part_type == "text":
-                sink.add("assistant_message", ts, text=str(part.get("text") or "").strip())
-            elif part_type == "toolCall":
-                sink.add(
-                    "tool_call",
-                    ts,
-                    id=str(part.get("id") or ""),
-                    name=str(part.get("name") or "tool"),
-                    input=_json_args(
-                        part.get("arguments") if part.get("arguments") is not None else part.get("input")
-                    ),
-                )
+            text = content.strip()
+            if text:
+                sink.add("assistant_message", ts, text=text)
+                emitted = True
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "thinking":
+                    thinking = str(part.get("thinking") or part.get("text") or "").strip()
+                    if thinking:
+                        sink.add("thinking", ts, text=thinking)
+                        emitted = True
+                elif part_type == "text":
+                    text = str(part.get("text") or "").strip()
+                    if text:
+                        sink.add("assistant_message", ts, text=text)
+                        emitted = True
+                elif part_type == "toolCall":
+                    sink.add(
+                        "tool_call",
+                        ts,
+                        id=str(part.get("id") or ""),
+                        name=str(part.get("name") or "tool"),
+                        input=_json_args(
+                            part.get("arguments") if part.get("arguments") is not None else part.get("input")
+                        ),
+                    )
+                    emitted = True
+        if not emitted:
+            stop_reason = str(message.get("stopReason") or "").strip()
+            error_text = str(message.get("errorMessage") or "").strip()
+            if error_text and (stop_reason in {"error", "aborted"} or error_text):
+                sink.add("assistant_message", ts, text=error_text)
     return sink.events
 
 
