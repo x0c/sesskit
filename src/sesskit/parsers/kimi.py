@@ -433,6 +433,9 @@ def _build_session_info(session_dir: str, session_id: str) -> dict | None:
     if not first_user_msg and not native_title and not fallback:
         return None  # 空会话（刚创建、还没任何用户消息），无展示价值
 
+    from sesskit.models import completion_id_for
+
+    tail_text = f"{(last_user_msg or '')[:120]}\n{(last_agent_msg or '')[:120]}"
     return make_session_info(
         source="kimi",
         id=session_id,
@@ -450,6 +453,12 @@ def _build_session_info(session_dir: str, session_id: str) -> dict | None:
         first_user_msg=first_user_msg,
         last_user_msg=last_user_msg,
         last_agent_msg=last_agent_msg,
+        completion_id=completion_id_for(
+            file_mtime=file_mtime,
+            size_bytes=stat.st_size,
+            status_tag=status_tag,
+            tail_text=tail_text,
+        ),
     )
 
 

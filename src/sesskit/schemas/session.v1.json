@@ -3,24 +3,81 @@
   "$id": "https://github.com/x0c/sesskit/schemas/session.v1.json",
   "title": "SessKit Session",
   "type": "object",
-  "required": ["runtime", "id", "short_id", "title", "mtime", "cwd", "history_path"],
+  "required": [
+    "runtime",
+    "id",
+    "short_id",
+    "title",
+    "mtime",
+    "cwd",
+    "history_path"
+  ],
   "properties": {
-    "runtime": { "type": "string", "description": "claude | codex | opencode | kimi | cursor | pi" },
-    "id": { "type": "string" },
-    "short_id": { "type": "string" },
-    "title": { "type": "string" },
-    "cwd": { "type": "string" },
-    "cwd_display": { "type": "string" },
-    "time": { "type": "string" },
-    "mtime": { "type": ["number", "null"] },
-    "size_kb": { "type": "number" },
-    "status": { "type": "string", "enum": ["done", "pending", "aborted", "unknown"] },
-    "status_tag": { "type": "string" },
-    "history_path": { "type": "string" },
-    "live": { "type": "boolean" },
-    "pid": { "type": ["integer", "null"] },
-    "last_user": { "type": "string" },
-    "last_agent": { "type": "string" }
+    "runtime": {
+      "type": "string",
+      "description": "claude | codex | opencode | kimi | cursor | pi"
+    },
+    "id": {
+      "type": "string"
+    },
+    "short_id": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "cwd_display": {
+      "type": "string"
+    },
+    "time": {
+      "type": "string"
+    },
+    "mtime": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "size_kb": {
+      "type": "number"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "done",
+        "pending",
+        "aborted",
+        "unknown"
+      ]
+    },
+    "status_tag": {
+      "type": "string"
+    },
+    "completion_id": {
+      "type": "string",
+      "description": "Stable per-round completion identity; empty unless terminal (done/aborted). Used by Corral for dedup."
+    },
+    "history_path": {
+      "type": "string"
+    },
+    "live": {
+      "type": "boolean"
+    },
+    "pid": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "last_user": {
+      "type": "string"
+    },
+    "last_agent": {
+      "type": "string"
+    }
   },
   "additionalProperties": true
 }

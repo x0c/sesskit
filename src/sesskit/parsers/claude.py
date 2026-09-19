@@ -339,6 +339,9 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
     else:
         status_tag = titles.STATUS_NONE
 
+    from sesskit.models import completion_id_for
+
+    tail_text = f"{(last_user_msg or '')[:120]}\n{(last_agent_msg or '')[:120]}"
     return make_session_info(
         source="claude",
         id=session_id,
@@ -356,6 +359,12 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
         first_user_msg=first_user_msg,
         last_user_msg=last_user_msg,
         last_agent_msg=last_agent_msg,
+        completion_id=completion_id_for(
+            file_mtime=stat.st_mtime,
+            size_bytes=stat.st_size,
+            status_tag=status_tag,
+            tail_text=tail_text,
+        ),
     )
 
 

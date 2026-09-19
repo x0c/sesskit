@@ -257,6 +257,8 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         if user_text and first_user_msg is None:
             first_user_msg = user_text
 
+    # 尾事件指纹：本轮最后一组结束事件的稳定字段，供 completion_id 区分轮次。
+    tail_fingerprint = ""
     for e in tail_entries:
         entry_time = _entry_time(e)
         if entry_time is not None:
@@ -269,9 +271,11 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         if user_text:
             last_user_msg = user_text
             last_event_type = "user_message"
+            tail_fingerprint = f"user:{user_text[:120]}"
         elif assistant_text:
             last_agent_msg = assistant_text
             last_event_type = "agent_message"
+            tail_fingerprint = f"agent:{assistant_text[:120]}"
         elif t == "event_msg" and pt == "task_complete":
             msg = str(payload.get("last_agent_message") or "").strip()
             err_text = _task_complete_error_text(payload)
@@ -281,8 +285,13 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
                 # Quota / provider failures often complete with null last_agent_message.
                 last_agent_msg = err_text
             last_event_type = "task_complete_error" if err_text else "task_complete"
+            tail_fingerprint = (
+                f"{last_event_type}:{payload.get('id') or ''!s}:"
+                f"{(msg or err_text)[:120]}"
+            )
         elif t == "event_msg" and pt == "turn_aborted":
             last_event_type = "turn_aborted"
+            tail_fingerprint = f"turn_aborted:{payload.get('id') or ''!s}"
 
     mtime = os.path.getmtime(path)
     resolved_event_time = event_time or (dt.timestamp() if dt else None)
@@ -293,6 +302,9 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         fallback = fallback[:60] + "…"
     if not fallback:
         fallback = "Codex 新会话"
+
+    status = _status_tag(last_event_type)
+    from sesskit.models import completion_id_for
 
     return make_session_info(
         source="codex",
@@ -306,12 +318,18 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         size_bytes=size_bytes,
         native_title=index.get(uuid),
         fallback_title=fallback,
-        status_tag=_status_tag(last_event_type),
+        status_tag=status,
         path=path,
         first_user_msg=first_user_msg,
         last_user_msg=last_user_msg,
         last_agent_msg=last_agent_msg,
         thread_source=thread_source,  # 运行时私有字段，见 SessionInfo 的 total=False 部分
+        completion_id=completion_id_for(
+            file_mtime=mtime,
+            size_bytes=size_bytes,
+            status_tag=status,
+            tail_text=tail_fingerprint,
+        ),
     )
 
 

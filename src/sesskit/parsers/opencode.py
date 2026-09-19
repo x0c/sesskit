@@ -372,7 +372,13 @@ def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
     session_id = str(row["id"])
     mtime = row["time_updated"] / 1000
     size_bytes = int(row["content_bytes"] or 0)
+    status = _status_tag(row["last_msg_data"])
+    from sesskit.models import completion_id_for
 
+    tail_text = (
+        f"{str(row['last_user_text'] or '')[:120]}\n"
+        f"{str(row['last_agent_text'] or '')[:120]}"
+    )
     return make_session_info(
         source="opencode",
         id=session_id,
@@ -385,11 +391,17 @@ def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
         size_bytes=size_bytes,
         native_title=native_title,
         fallback_title=fallback,
-        status_tag=_status_tag(row["last_msg_data"]),
+        status_tag=status,
         path=db_path,
         first_user_msg=first_user,
         last_user_msg=str(row["last_user_text"] or ""),
         last_agent_msg=str(row["last_agent_text"] or ""),
+        completion_id=completion_id_for(
+            file_mtime=mtime,
+            size_bytes=size_bytes,
+            status_tag=status,
+            tail_text=tail_text,
+        ),
     )
 
 

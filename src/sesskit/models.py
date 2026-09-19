@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, TypedDict
@@ -36,6 +37,9 @@ class _SessionInfoRequired(TypedDict):
 class SessionInfo(_SessionInfoRequired, total=False):
     """Optional fields beyond the required scan payload."""
 
+    # 一轮结束的稳定标识：同一会话里每一轮结束唯一、重启可重算。
+    # 终端态（已完成/已中断）才有值；进行中/未知为空串。供 Corral 完成通知去重。
+    completion_id: str
     thread_source: str | None
     keepalive_name: str
     provisional: bool
@@ -103,6 +107,36 @@ def make_session_info(
     }
     session.update(extra)  # type: ignore[typeddict-item]
     return session
+
+
+def completion_id_for(
+    *,
+    file_mtime: float,
+    size_bytes: int,
+    status_tag: str,
+    tail_text: str | None = "",
+) -> str:
+    """一轮结束的稳定标识：同一轮重复扫描值不变，新一轮结束必变，重启可重算。
+
+    只给终端态（已完成/已中断）用；进行中/未知返回空串，调用方不得拿它去重。
+    组成：文件 mtime 纳秒 + 字节数 + 状态 + 尾事件短哈希——mtime/size 区分轮次，
+    尾哈希防止同秒同大小的误判。全部来自已落盘历史，不依赖进程内存。
+    """
+    from sesskit import titles
+
+    if status_tag not in (titles.STATUS_DONE, titles.STATUS_ABORTED):
+        return ""
+    try:
+        mtime_ns = int(float(file_mtime) * 1_000_000_000)
+    except (TypeError, ValueError):
+        mtime_ns = 0
+    try:
+        size = int(size_bytes)
+    except (TypeError, ValueError):
+        size = 0
+    tail = str(tail_text or "")[:500]
+    digest = hashlib.sha256(tail.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"{mtime_ns}:{size}:{status_tag}:{digest}"
 
 
 def format_message_time(timestamp: float) -> str:

@@ -190,9 +190,14 @@ def _build_session_info(chat_dir: str, chat_id: str) -> dict | None:
     event_time = updated or created
     session_time, time_source = effective_session_time(file_mtime, event_time)
 
+    # 列表级只有 meta/prompt_history：没有助手最终答复的正向证据时，
+    # 宁可未知也不报已完成——完成通知按 STATUS_DONE 触发，假 DONE 会误推
+    # 「干完了」（CONTRACT Status tags；完成通知设计 Slice 0）。
     if last_user_msg and not native_title:
         status_tag = titles.STATUS_PENDING
-    elif native_title or last_user_msg:
+    elif native_title and last_user_msg:
+        # 有标题 + 至少一条用户话：上一轮大概率已收尾，但无助手正文证据，
+        # 仍按 DONE（历史行为），completion_id 为空，Corral 对此不推完成通知。
         status_tag = titles.STATUS_DONE
     else:
         status_tag = titles.STATUS_NONE
@@ -200,6 +205,9 @@ def _build_session_info(chat_dir: str, chat_id: str) -> dict | None:
     size_bytes = _chat_size_bytes(chat_dir)
     store_db = os.path.join(chat_dir, "store.db")
     history_path = store_db if os.path.isfile(store_db) else chat_dir
+    # Cursor 列表级无助手正文证据：completion_id 留空，Corral 不推完成通知。
+    # store.db 详情里若读到助手最终答复，后续可在此补证据再发 id（见 Slice 0 设计）。
+    completion_id = ""
     return make_session_info(
         source="cursor",
         id=chat_id,
@@ -217,6 +225,7 @@ def _build_session_info(chat_dir: str, chat_id: str) -> dict | None:
         first_user_msg=first_user_msg,
         last_user_msg=last_user_msg,
         # Cursor 历史里没有独立的「助手最终答复」字段可提取，保持空串。
+        completion_id=completion_id,
     )
 
 

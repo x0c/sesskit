@@ -147,6 +147,7 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
     first_user = last_user = last_agent = None
     last_role = None
     last_stop_reason: str | None = None
+    leaf_id: str | None = None
     event_time = parse_timestamp(header.get("timestamp"))
     for item in branch:
         message = item["message"]
@@ -155,6 +156,9 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
         timestamp = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
         if timestamp is not None:
             event_time = timestamp
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id:
+            leaf_id = item_id
         if role == "user" and text:
             first_user = first_user or text
             last_user = text
@@ -193,12 +197,22 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
     else:
         status = titles.STATUS_NONE
     created = parse_timestamp(header.get("timestamp")) or 0.0
+    from sesskit.models import completion_id_for
+
+    # 尾指纹：分支叶子 id + stopReason。同一轮重扫不变，新一轮必变。
+    tail_text = f"{leaf_id or ''}:{(last_stop_reason or '')}:{(last_agent or '')[:120]}"
     info = make_session_info(
         source="pi", id=session_id, short_id=session_id[:12], cwd=cwd, mtime=mtime,
         time_source=time_source, event_time=event_time, file_mtime=stat.st_mtime,
         size_bytes=stat.st_size, native_title=native_title,
         fallback_title=(native_title or first_user)[:60], status_tag=status, path=path,
         first_user_msg=first_user, last_user_msg=last_user, last_agent_msg=last_agent,
+        completion_id=completion_id_for(
+            file_mtime=stat.st_mtime,
+            size_bytes=stat.st_size,
+            status_tag=status,
+            tail_text=tail_text,
+        ),
     )
     return info, created
 
