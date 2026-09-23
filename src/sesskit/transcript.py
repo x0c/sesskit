@@ -601,6 +601,18 @@ def _parse_cursor(session: dict) -> list[dict]:
 def _parse_pi(session: dict) -> list[dict]:
     path = str(session.get("path") or "")
     sink = _Sink()
+    # 与 load_conversation / Claude 同口径：报错重试连击只留最后一条；真实正文
+    # 出现即恢复。tool_call/thinking 照常落盘，不触发落盘也不清空攒的报错。
+    pending_error: str | None = None
+    pending_error_ts: float | None = None
+
+    def flush_error() -> None:
+        nonlocal pending_error, pending_error_ts
+        if pending_error and not _adjacent_dup(sink, "assistant_message", pending_error):
+            sink.add("assistant_message", pending_error_ts, text=pending_error)
+        pending_error = None
+        pending_error_ts = None
+
     for item in scan_pi.active_messages(scan_pi.read_entries(path)):
         message = item.get("message")
         if not isinstance(message, dict):
@@ -608,6 +620,7 @@ def _parse_pi(session: dict) -> list[dict]:
         ts = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
         role = message.get("role")
         if role == "user":
+            flush_error()
             sink.add("user_message", ts, text=scan_pi.message_text(message.get("content")))
             continue
         if role == "toolResult":
@@ -630,6 +643,8 @@ def _parse_pi(session: dict) -> list[dict]:
         if isinstance(content, str):
             text = content.strip()
             if text:
+                pending_error = None
+                pending_error_ts = None
                 sink.add("assistant_message", ts, text=text)
                 emitted = True
         elif isinstance(content, list):
@@ -645,6 +660,8 @@ def _parse_pi(session: dict) -> list[dict]:
                 elif part_type == "text":
                     text = str(part.get("text") or "").strip()
                     if text:
+                        pending_error = None  # 真实正文落地=本轮已恢复
+                        pending_error_ts = None
                         sink.add("assistant_message", ts, text=text)
                         emitted = True
                 elif part_type == "toolCall":
@@ -662,7 +679,9 @@ def _parse_pi(session: dict) -> list[dict]:
             stop_reason = str(message.get("stopReason") or "").strip()
             error_text = str(message.get("errorMessage") or "").strip()
             if error_text and (stop_reason in {"error", "aborted"} or error_text):
-                sink.add("assistant_message", ts, text=error_text)
+                pending_error = error_text
+                pending_error_ts = ts
+    flush_error()
     return sink.events
 
 

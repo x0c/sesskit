@@ -287,20 +287,50 @@ def scan_sessions(
 
 
 def load_conversation(path: str) -> list[ConversationMessage]:
+    """按时间顺序读取真实用户消息和 Pi 的助手文本回复。
+
+    与 Claude 同口径：上游报错（连接失败/超时）重试连记多条时只保留最后一条；
+    之后若出现真实助手正文说明已恢复，丢弃之前攒的报错；新用户消息或文件结束
+    才落盘它。工具调用本身无文本（thinking/toolCall），不触发落盘，纯报错连击
+    （中间只隔着不可见的工具轮次）仍折成一条。
+    """
     result: list[ConversationMessage] = []
+    pending_error: str | None = None
+    pending_error_ts: float | None = None
+
+    def flush_error() -> None:
+        nonlocal pending_error, pending_error_ts
+        if pending_error and (
+            not result or result[-1].role != "assistant" or result[-1].text != pending_error
+        ):
+            result.append(ConversationMessage("assistant", pending_error, pending_error_ts))
+        pending_error = None
+        pending_error_ts = None
+
     for item in _active_messages(_read_entries(path)):
         message = item["message"]
         role = message.get("role")
         text = _text(message.get("content"))
+        timestamp = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
         if role == "assistant" and not text:
             stop_reason = str(message.get("stopReason") or "").strip()
             error_text = str(message.get("errorMessage") or "").strip()
             if error_text and (stop_reason in {"error", "aborted"} or error_text):
-                text = error_text
+                # 重试连击只留最后一条：覆盖，不立即落盘。
+                pending_error = error_text
+                pending_error_ts = timestamp
+            continue
         if role not in ("user", "assistant") or not text:
             continue
-        timestamp = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
+        if role == "user":
+            flush_error()
+            result.append(ConversationMessage(role, text, timestamp))
+            continue
+        # 真实助手正文落地=本轮已恢复，丢掉之前攒的报错。
+        pending_error = None
+        pending_error_ts = None
         result.append(ConversationMessage(role, text, timestamp))
+    flush_error()
     return result
 
 

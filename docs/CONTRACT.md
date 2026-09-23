@@ -99,7 +99,7 @@ Previously confirmed failures, now covered by parser fixes + `tests/test_abnorma
 1. **Codex usage limit:** `task_complete` + `error.usage_limit_exceeded` → `STATUS_ABORTED`; error message fills `last_agent_msg` / `load_events` when `last_agent_message` is null. Same path covers 401 / provider `other` errors (non-empty `error.message`).
 2. **OpenCode provider/abort errors:** `message.error` (`APIError` with `data.message` + `statusCode`, `MessageAbortedError`) → `STATUS_ABORTED`; error text fills `last_agent_msg` / `load_conversation` / `load_events` even when the turn has zero text parts (previously the turn was user-only on mobile).
 3. **Claude 2.1+ upstream errors:** `system`-type entries carrying `error.formatted` / `error.status` (401, ECONNRESET connection drops — reproduced live 2026-09-23 with a dummy key, no account needed) → `STATUS_ABORTED`; retry bursts collapse to one trailing assistant error; titles still use the real prompt, never the error text.
-2. **Pi weekly rate limit:** `stopReason=error` + `errorMessage` → `STATUS_ABORTED`; error text retained in list, plain conversation, and `load_events` (no longer user-only).
+2. **Pi weekly rate limit:** `stopReason=error` + `errorMessage` → `STATUS_ABORTED`; error text retained in list, plain conversation, and `load_events` (no longer user-only); retry bursts collapse to one trailing assistant error (same as Claude).
 3. **Pi / OpenCode success paths** remain `STATUS_DONE` with the assistant reply.
 
 Until consumers migrate, prefer `status_tag` + `last_agent_msg` together: do not treat `STATUS_DONE` alone as “notify job finished” without confirming the sample is not an older SessKit build.

@@ -142,6 +142,110 @@ class PiAbnormalEndingTests(unittest.TestCase):
             self.assertEqual([e["type"] for e in events], ["user_message", "assistant_message"])
             self.assertIn("weekly usage limit", events[-1]["text"])
 
+    def test_connection_error_burst_collapses_to_one(self) -> None:
+        """Pi 重试连击只留最后一条（与 Claude 同口径）；真实正文出现即恢复。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "2026-09-23T13-15-47-097Z_a3aeb26b.jsonl"
+            lines = [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "a3aeb26b",
+                    "timestamp": "2026-09-23T13:15:47.097Z",
+                    "cwd": "/tmp/demo",
+                },
+                {
+                    "type": "message",
+                    "id": "m1",
+                    "parentId": None,
+                    "timestamp": "2026-09-23T13:16:07.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "hi"}],
+                    },
+                },
+            ]
+            parent = "m1"
+            for index, err in enumerate(
+                ["Connection error.", "Connection error.", "Request timed out."]
+            ):
+                mid = f"e{index}"
+                lines.append(
+                    {
+                        "type": "message",
+                        "id": mid,
+                        "parentId": parent,
+                        "timestamp": f"2026-09-23T13:17:0{index}.000Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [],
+                            "stopReason": "error",
+                            "errorMessage": err,
+                        },
+                    }
+                )
+                parent = mid
+            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            conversation = pi.load_conversation(str(path))
+            assistants = [m for m in conversation if m.role == "assistant"]
+            self.assertEqual([m.role for m in conversation], ["user", "assistant"])
+            self.assertEqual(len(assistants), 1)
+            self.assertEqual(assistants[0].text, "Request timed out.")
+            events = load_events({"source": "pi", "path": str(path), "id": "a3aeb26b"})
+            assistant_events = [e for e in events if e["type"] == "assistant_message"]
+            self.assertEqual(len(assistant_events), 1)
+            self.assertEqual(assistant_events[0]["text"], "Request timed out.")
+
+    def test_real_text_after_error_discards_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "2026-09-23T13-16-35-317Z_df6c33a0.jsonl"
+            lines = [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "df6c33a0",
+                    "timestamp": "2026-09-23T13:16:35.317Z",
+                    "cwd": "/tmp/demo",
+                },
+                {
+                    "type": "message",
+                    "id": "m1",
+                    "parentId": None,
+                    "timestamp": "2026-09-23T13:16:36.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "hi"}],
+                    },
+                },
+                {
+                    "type": "message",
+                    "id": "e0",
+                    "parentId": "m1",
+                    "timestamp": "2026-09-23T13:17:00.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [],
+                        "stopReason": "error",
+                        "errorMessage": "Connection error.",
+                    },
+                },
+                {
+                    "type": "message",
+                    "id": "m2",
+                    "parentId": "e0",
+                    "timestamp": "2026-09-23T13:17:01.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "PONG"}],
+                        "stopReason": "stop",
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            conversation = pi.load_conversation(str(path))
+            self.assertEqual([m.role for m in conversation], ["user", "assistant"])
+            self.assertEqual(conversation[-1].text, "PONG")
+
     def test_successful_stop_still_done(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "2026-09-15T08-35-29-851Z_01a0a434-f7bb-73dc-b002-6fa2dfac6efc.jsonl"
