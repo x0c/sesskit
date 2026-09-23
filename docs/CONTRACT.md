@@ -89,14 +89,16 @@ Use these when implementing or reviewing parsers (not an event-bus API — SessK
 | Pi | assistant `stopReason` in `{stop, …}` with content | `stopReason` in `{error, aborted, …}` plus `errorMessage` (e.g. weekly 429) |
 | OpenCode | assistant `finish=stop`, no `error` | Non-empty message `error` → aborted (existing parser rule) |
 | Cursor | Prefer transcript / store tail; list `status_tag` is weak today | Prefer unknown over false done when terminal reason is unclear |
-| Claude | Stop / transcript end without interrupt markers | Interrupt markers / failure ends (see Claude parser) |
+| Claude | Stop / transcript end without interrupt markers | `system` entries with `error` (`formatted` human text + `status` HTTP code; 2.1+ live shape) → aborted; `[Request interrupted by user]` → aborted |
 | Kimi | Stable `step.end` / assistant tail | Cancel / failure markers in wire history |
 
 ### Verified gaps closed (2026-09-15 live Mac runs)
 
 Previously confirmed failures, now covered by parser fixes + `tests/test_abnormal_endings.py` and re-checked on the original live history files:
 
-1. **Codex usage limit:** `task_complete` + `error.usage_limit_exceeded` → `STATUS_ABORTED`; error message fills `last_agent_msg` / `load_events` when `last_agent_message` is null.
+1. **Codex usage limit:** `task_complete` + `error.usage_limit_exceeded` → `STATUS_ABORTED`; error message fills `last_agent_msg` / `load_events` when `last_agent_message` is null. Same path covers 401 / provider `other` errors (non-empty `error.message`).
+2. **OpenCode provider/abort errors:** `message.error` (`APIError` with `data.message` + `statusCode`, `MessageAbortedError`) → `STATUS_ABORTED`; error text fills `last_agent_msg` / `load_conversation` / `load_events` even when the turn has zero text parts (previously the turn was user-only on mobile).
+3. **Claude 2.1+ upstream errors:** `system`-type entries carrying `error.formatted` / `error.status` (401, ECONNRESET connection drops — reproduced live 2026-09-23 with a dummy key, no account needed) → `STATUS_ABORTED`; retry bursts collapse to one trailing assistant error; titles still use the real prompt, never the error text.
 2. **Pi weekly rate limit:** `stopReason=error` + `errorMessage` → `STATUS_ABORTED`; error text retained in list, plain conversation, and `load_events` (no longer user-only).
 3. **Pi / OpenCode success paths** remain `STATUS_DONE` with the assistant reply.
 

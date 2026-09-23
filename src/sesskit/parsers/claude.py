@@ -122,6 +122,24 @@ def _read_tail(path: str, max_bytes: int = 65536) -> list[dict]:
 INTERRUPTED_MARKER = "[Request interrupted by user]"
 _INTERRUPTED_MARKER = INTERRUPTED_MARKER  # 旧私有名兼容：模块内部仍引用
 
+
+def system_error_text(entry: object) -> str:
+    """Claude 2.1+ `system` 条目里的上游报错（401/504/连接失败…）。
+
+    真机实采（假 key 跑出 401、代理掐出 ECONNRESET）：`error` 对象自带
+    `formatted` 人话（`'401 API key is invalid.'` / `'Connection dropped …'`）
+    与 `status` HTTP 码；重试会连记多条，调用方取最后一条为准。
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "system":
+        return ""
+    err = entry.get("error")
+    if not isinstance(err, dict):
+        return ""
+    formatted = str(err.get("formatted") or "").strip()
+    if formatted:
+        return formatted
+    return str(err.get("message") or "").strip()
+
 _LOW_VALUE_PROMPTS = {
     "继续",
     "继续吧",
@@ -291,8 +309,12 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
     last_agent_msg = None
     last_was_user = None
     event_time = None
+    # 报错只属于当前未收束的一轮：新用户消息/助手正文之后才算，旧轮的残留不算。
+    last_content_idx = -1
+    last_error_text = ""
+    last_error_idx = -1
 
-    for e in tail_entries:
+    for idx, e in enumerate(tail_entries):
         entry_time = _entry_time(e)
         if entry_time is not None:
             event_time = entry_time
@@ -306,10 +328,12 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
             text = _extract_text(e.get("message", {}).get("content", ""))
             if text == _INTERRUPTED_MARKER:
                 last_was_user = "aborted"  # 用户主动中断当前轮次，不是真实用户消息
+                last_content_idx = idx
             elif text:
                 last_user_msg = text
                 title_candidates.append(("last_user", text))
                 last_was_user = True
+                last_content_idx = idx
         elif t == "assistant":
             content = e.get("message", {}).get("content", [])
             if isinstance(content, list):
@@ -320,7 +344,13 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
                         last_agent_msg = part["text"]
                         title_candidates.append(("last_agent", last_agent_msg))
                         last_was_user = False
+                        last_content_idx = idx
                         break
+        elif t == "system":
+            err_text = system_error_text(e)
+            if err_text:
+                last_error_text = err_text
+                last_error_idx = idx
 
     stat = os.stat(fpath)
     for e in head_entries:
@@ -330,7 +360,12 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
     session_time, time_source = effective_session_time(stat.st_mtime, event_time)
     fallback = _choose_claude_fallback_title(title_candidates)
 
-    if last_was_user == "aborted":
+    if last_error_text and last_error_idx > last_content_idx:
+        # 上游报错（401/504/连接失败）且之后没有新的正文：本轮死在报错上。
+        # 报错不进标题候选（标题仍用真实提问），但列表与通知要看到人话。
+        status_tag = titles.STATUS_ABORTED
+        last_agent_msg = last_error_text
+    elif last_was_user == "aborted":
         status_tag = titles.STATUS_ABORTED
     elif last_was_user is True:
         status_tag = titles.STATUS_PENDING
@@ -609,6 +644,10 @@ def load_conversation(path: str) -> list[ConversationMessage]:
     messages: list[ConversationMessage] = []
     pending_legacy_answer: str | None = None
     pending_legacy_ts: float | None = None
+    # 上游报错（401/504/连接失败）：重试连记多条，只保留最后一条；之后若出现
+    # 真实助手正文说明已恢复，丢弃它；新用户消息或文件结束才落盘它。
+    pending_error: str | None = None
+    pending_error_ts: float | None = None
 
     def flush_legacy_answer() -> None:
         nonlocal pending_legacy_answer, pending_legacy_ts
@@ -618,6 +657,15 @@ def load_conversation(path: str) -> list[ConversationMessage]:
             messages.append(ConversationMessage("assistant", pending_legacy_answer, pending_legacy_ts))
         pending_legacy_answer = None
         pending_legacy_ts = None
+
+    def flush_error() -> None:
+        nonlocal pending_error, pending_error_ts
+        if pending_error and (
+            not messages or messages[-1].role != "assistant" or messages[-1].text != pending_error
+        ):
+            messages.append(ConversationMessage("assistant", pending_error, pending_error_ts))
+        pending_error = None
+        pending_error_ts = None
 
     try:
         with open(path, encoding="utf-8", errors="replace") as file:
@@ -634,6 +682,13 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                 if not isinstance(message, dict):
                     continue
 
+                if entry_type == "system":
+                    err_text = system_error_text(entry)
+                    if err_text:
+                        pending_error = err_text
+                        pending_error_ts = _entry_time(entry)
+                    continue
+
                 if entry_type == "user":
                     origin = entry.get("origin")
                     origin_kind = origin.get("kind") if isinstance(origin, dict) else None
@@ -644,6 +699,7 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                     text = _extract_text(message.get("content", ""))
                     if text and text != _INTERRUPTED_MARKER:
                         flush_legacy_answer()
+                        flush_error()
                         messages.append(ConversationMessage("user", text, _entry_time(entry)))
                     continue
 
@@ -669,10 +725,13 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                     elif not messages or messages[-1].role != "assistant" or messages[-1].text != text:
                         pending_legacy_answer = None
                         pending_legacy_ts = None
+                        pending_error = None  # 真实正文落地=本轮已恢复，丢掉之前攒的报错
+                        pending_error_ts = None
                         messages.append(ConversationMessage("assistant", text, _entry_time(entry)))
     except OSError:
         return []
     flush_legacy_answer()
+    flush_error()
     return messages
 
 

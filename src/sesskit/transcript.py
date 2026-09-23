@@ -158,6 +158,17 @@ def _adjacent_dup(sink: _Sink, event_type: str, text: str) -> bool:
 def _parse_claude(session: dict) -> list[dict]:
     path = str(session.get("path") or "")
     sink = _Sink()
+    # 与 load_conversation 同口径：重试多条报错只留最后一条；真实正文出现即恢复。
+    pending_error: str | None = None
+    pending_error_ts: float | None = None
+
+    def flush_error() -> None:
+        nonlocal pending_error, pending_error_ts
+        if pending_error and not _adjacent_dup(sink, "assistant_message", pending_error):
+            sink.add("assistant_message", pending_error_ts, text=pending_error)
+        pending_error = None
+        pending_error_ts = None
+
     try:
         handle = open(path, encoding="utf-8", errors="replace")
     except OSError:
@@ -169,6 +180,12 @@ def _parse_claude(session: dict) -> list[dict]:
             except (json.JSONDecodeError, ValueError):
                 continue
             if not isinstance(entry, dict) or entry.get("isMeta") or entry.get("isSidechain"):
+                continue
+            if entry.get("type") == "system":
+                err_text = scan_claude.system_error_text(entry)
+                if err_text:
+                    pending_error = err_text
+                    pending_error_ts = scan_claude.entry_time(entry)
                 continue
             message = entry.get("message")
             if not isinstance(message, dict):
@@ -194,6 +211,7 @@ def _parse_claude(session: dict) -> list[dict]:
                     continue
                 text = scan_claude.extract_text(content or "")
                 if text and text != scan_claude.INTERRUPTED_MARKER:
+                    flush_error()
                     sink.add("user_message", ts, text=text)
                 continue
             if entry_type != "assistant" or not isinstance(content, list):
@@ -205,7 +223,11 @@ def _parse_claude(session: dict) -> list[dict]:
                 if part_type == "thinking":
                     sink.add("thinking", ts, text=str(part.get("thinking") or part.get("text") or "").strip())
                 elif part_type == "text":
-                    sink.add("assistant_message", ts, text=str(part.get("text") or "").strip())
+                    text = str(part.get("text") or "").strip()
+                    if text:
+                        pending_error = None  # 真实正文落地=本轮已恢复
+                        pending_error_ts = None
+                    sink.add("assistant_message", ts, text=text)
                 elif part_type == "tool_use":
                     sink.add(
                         "tool_call",
@@ -214,6 +236,7 @@ def _parse_claude(session: dict) -> list[dict]:
                         name=str(part.get("name") or "tool"),
                         input=_json_args(part.get("input")),
                     )
+    flush_error()
     return sink.events
 
 
@@ -376,7 +399,7 @@ def _parse_kimi(session: dict) -> list[dict]:
 _OPENCODE_TRANSCRIPT_SQL = """
 SELECT m.id AS message_id, m.time_created, m.data AS msg_data,
        p.id AS part_id, p.time_created AS part_time, p.data AS part_data
-FROM message m JOIN part p ON p.message_id = m.id
+FROM message m LEFT JOIN part p ON p.message_id = m.id
 WHERE m.session_id = ?
 ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC, p.id ASC
 """
@@ -396,6 +419,8 @@ def _parse_opencode(session: dict) -> list[dict]:
     finally:
         conn.close()
 
+    error_emitted: set[str] = set()
+    assistant_text_seen: set[str] = set()
     for row in rows:
         try:
             msg = json.loads(row["msg_data"] or "{}") or {}
@@ -403,8 +428,18 @@ def _parse_opencode(session: dict) -> list[dict]:
             continue
         if not isinstance(msg, dict):
             continue
+        raw_part = row["part_data"] if "part_data" in row.keys() else None
+        if raw_part is None:
+            # LEFT JOIN miss: message has no parts (typical for error turns).
+            if msg.get("role") == "assistant" and str(row["message_id"] or "") not in error_emitted:
+                err_text = scan_opencode.error_text_from_msg(msg)
+                if err_text:
+                    created = (msg.get("time") or {}).get("created") if isinstance(msg.get("time"), dict) else None
+                    sink.add("assistant_message", _opencode_ts(created), text=err_text)
+                    error_emitted.add(str(row["message_id"] or ""))
+            continue
         try:
-            part = json.loads(row["part_data"] or "{}") or {}
+            part = json.loads(raw_part or "{}") or {}
         except (json.JSONDecodeError, ValueError):
             continue
         if not isinstance(part, dict) or part.get("synthetic") in (True, 1):
@@ -419,6 +454,8 @@ def _parse_opencode(session: dict) -> list[dict]:
                 sink.add("user_message", ts, text=text)
             elif role == "assistant":
                 sink.add("assistant_message", ts, text=text)
+                if text:
+                    assistant_text_seen.add(str(row["message_id"] or ""))
         elif part_type == "reasoning":
             sink.add("thinking", ts, text=str(part.get("text") or "").strip())
         elif part_type == "compaction":
@@ -446,6 +483,25 @@ def _parse_opencode(session: dict) -> list[dict]:
                     status="error" if status == "error" else "ok",
                     output=output,
                 )
+    # Error turns with parts but no assistant text (e.g. only reasoning/tools):
+    # surface the provider error once per message so the turn isn't user-only.
+    seen_msgs: dict[str, dict] = {}
+    for row in rows:
+        try:
+            msg = json.loads(row["msg_data"] or "{}") or {}
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("error"):
+            mid = str(row["message_id"] or "")
+            if mid and mid not in seen_msgs:
+                seen_msgs[mid] = msg
+    for mid, msg in seen_msgs.items():
+        if mid in assistant_text_seen or mid in error_emitted:
+            continue
+        err_text = scan_opencode.error_text_from_msg(msg)
+        if err_text:
+            created = (msg.get("time") or {}).get("created") if isinstance(msg.get("time"), dict) else None
+            sink.add("assistant_message", _opencode_ts(created), text=err_text)
     return sink.events
 
 

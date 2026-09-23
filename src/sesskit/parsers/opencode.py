@@ -356,6 +356,39 @@ def _status_tag(last_msg_data: str | None) -> str:
     return titles.STATUS_NONE
 
 
+def error_text_from_msg(msg: object) -> str:
+    """Human-readable provider/turn error from an OpenCode message dict.
+
+    Shapes seen live (``message.data.error``):
+    ``{"name": "APIError", "data": {"message": ..., "statusCode": 404}}`` and
+    ``{"name": "MessageAbortedError", "data": {"message": "The operation was aborted."}}``.
+    Returns ``""`` when there is no error so callers can fall back to text parts.
+    """
+    if not isinstance(msg, dict):
+        return ""
+    err = msg.get("error")
+    if not err:
+        return ""
+    if isinstance(err, str):
+        return err.strip()
+    if not isinstance(err, dict):
+        return ""
+    data = err.get("data")
+    if isinstance(data, dict):
+        message = str(data.get("message") or "").strip()
+        if message:
+            status_code = data.get("statusCode")
+            if isinstance(status_code, int) and 100 <= status_code <= 599:
+                return f"{status_code}: {message}"
+            return message
+    for key in ("message", "text"):
+        value = err.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    name = err.get("name")
+    return str(name or "").strip()
+
+
 
 def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
     cwd = row["directory"] or ""
@@ -375,9 +408,16 @@ def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
     status = _status_tag(row["last_msg_data"])
     from sesskit.models import completion_id_for
 
+    last_agent_text = str(row["last_agent_text"] or "")
+    if not last_agent_text and status == titles.STATUS_ABORTED:
+        try:
+            last_msg = json.loads(row["last_msg_data"] or "{}")
+        except (json.JSONDecodeError, ValueError):
+            last_msg = {}
+        last_agent_text = error_text_from_msg(last_msg)
     tail_text = (
         f"{str(row['last_user_text'] or '')[:120]}\n"
-        f"{str(row['last_agent_text'] or '')[:120]}"
+        f"{last_agent_text[:120]}"
     )
     return make_session_info(
         source="opencode",
@@ -395,7 +435,7 @@ def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
         path=db_path,
         first_user_msg=first_user,
         last_user_msg=str(row["last_user_text"] or ""),
-        last_agent_msg=str(row["last_agent_text"] or ""),
+        last_agent_msg=last_agent_text,
         completion_id=completion_id_for(
             file_mtime=mtime,
             size_bytes=size_bytes,
@@ -526,6 +566,19 @@ def load_conversation(db_path: str, session_id: str) -> list[ConversationMessage
         rows = conn.execute(_CONVERSATION_SQL, (session_id,)).fetchall()
     except sqlite3.Error:
         return []
+    # Error turns often have zero text parts, so the text-only JOIN above
+    # misses them entirely. Fetch assistant error messages separately.
+    try:
+        err_rows = conn.execute(
+            "SELECT id, time_created, data FROM message WHERE session_id = ? "
+            "AND json_extract(data, '$.role') = 'assistant' "
+            "AND json_extract(data, '$.error') IS NOT NULL "
+            "AND json_extract(data, '$.error') != '' "
+            "ORDER BY time_created ASC, id ASC",
+            (session_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        err_rows = []
     finally:
         conn.close()
 
@@ -552,12 +605,42 @@ def load_conversation(db_path: str, session_id: str) -> list[ConversationMessage
             if text:
                 texts.append(text)
         text = "\n\n".join(texts)
+        if not text and role == "assistant":
+            # Provider/turn errors carry no text parts; keep the error visible
+            # instead of dropping the turn so only the user line remains.
+            text = error_text_from_msg(msg)
         if not text:
             continue
 
         created = (msg.get("time") or {}).get("created")
         timestamp = created / 1000 if isinstance(created, (int, float)) else None
         messages.append(ConversationMessage(role, text, timestamp))
+    # Merge error-only turns (no text parts) in time order without duplicating
+    # turns that already surfaced their error via the text-part path above.
+    existing_texts = {m.text for m in messages if m.role == "assistant"}
+    pending: list[ConversationMessage] = []
+    for row in err_rows:
+        try:
+            msg = json.loads(row["data"] or "{}") or {}
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(msg, dict):
+            continue
+        err_text = error_text_from_msg(msg)
+        if not err_text or err_text in existing_texts:
+            continue
+        created = (msg.get("time") or {}).get("created")
+        ts = created / 1000 if isinstance(created, (int, float)) else None
+        if ts is None:
+            try:
+                ts = float(row["time_created"] or 0) / 1000 or None
+            except (TypeError, ValueError):
+                ts = None
+        pending.append(ConversationMessage("assistant", err_text, ts))
+        existing_texts.add(err_text)
+    if pending:
+        messages.extend(pending)
+        messages.sort(key=lambda m: (m.timestamp or 0, m.role != "user"))
     return messages
 
 

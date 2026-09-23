@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from sesskit import titles
-from sesskit.parsers import codex, pi
+from sesskit.parsers import claude, codex, opencode, pi
 from sesskit.transcript import load_events
 
 
@@ -180,6 +181,188 @@ class PiAbnormalEndingTests(unittest.TestCase):
             info, _created = built
             self.assertEqual(info["status_tag"], titles.STATUS_DONE)
             self.assertEqual(info["last_agent_msg"], "PONG")
+
+
+def _claude_file_with_system_error(err: dict, follow_up_user: str | None = None) -> str:
+    """Claude 2.1+ 风格 JSONL：用户提问 + system 报错，可选后续追问。"""
+    import os
+
+    fd, path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    lines = [
+        {"type": "user", "cwd": "/tmp/demo", "timestamp": "2026-09-23T00:00:01.000Z",
+         "message": {"role": "user", "content": "Reply with exactly the word PONG"}},
+        {"type": "system", "timestamp": "2026-09-23T00:00:02.000Z", "isSidechain": False,
+         "error": err},
+    ]
+    if follow_up_user:
+        lines.append(
+            {"type": "user", "timestamp": "2026-09-23T00:00:03.000Z",
+             "message": {"role": "user", "content": follow_up_user}}
+        )
+    Path(path).write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+    return path
+
+
+class ClaudeAbnormalEndingTests(unittest.TestCase):
+    def test_401_system_error_is_aborted(self) -> None:
+        import os
+
+        err = {"message": '401 {"type":"error"}', "status": 401,
+               "formatted": "401 API key is invalid.", "connection": None}
+        path = _claude_file_with_system_error(err)
+        try:
+            info = claude._build_session_info(path, "proj")
+            assert info is not None
+            self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
+            self.assertIn("401", info["last_agent_msg"])
+            conversation = claude.load_conversation(path)
+            self.assertEqual([m.role for m in conversation], ["user", "assistant"])
+            self.assertIn("API key is invalid", conversation[-1].text)
+            events = load_events({"source": "claude", "path": path})
+            self.assertEqual([e["type"] for e in events], ["user_message", "assistant_message"])
+            self.assertIn("API key is invalid", events[-1]["text"])
+        finally:
+            os.unlink(path)
+
+    def test_connection_error_collapses_retries_to_one(self) -> None:
+        import os
+
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        rows = [
+            {"type": "user", "cwd": "/tmp/demo", "timestamp": "2026-09-23T00:00:01.000Z",
+             "message": {"role": "user", "content": "hi"}},
+        ]
+        for i in range(4):
+            rows.append({"type": "system", "timestamp": f"2026-09-23T00:00:0{i + 2}.000Z",
+                           "isSidechain": False,
+                           "error": {"message": "Connection error.",
+                                     "formatted": "Connection dropped (ECONNRESET)"}})
+        Path(path).write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        try:
+            conversation = claude.load_conversation(path)
+            assistants = [m for m in conversation if m.role == "assistant"]
+            self.assertEqual(len(assistants), 1)
+            self.assertIn("ECONNRESET", assistants[0].text)
+        finally:
+            os.unlink(path)
+
+    def test_old_error_before_new_prompt_is_not_aborted(self) -> None:
+        import os
+
+        err = {"message": "Connection error.", "formatted": "Connection dropped (ECONNRESET)"}
+        path = _claude_file_with_system_error(err, follow_up_user="are you back?")
+        try:
+            info = claude._build_session_info(path, "proj")
+            assert info is not None
+            # 新提问在后：上一轮的报错不算，当前是待回复。
+            self.assertEqual(info["status_tag"], titles.STATUS_PENDING)
+        finally:
+            os.unlink(path)
+
+
+def _opencode_db_with_error(err: dict) -> str:
+    """Temp opencode.db with one user turn + one error-only assistant turn."""
+    import os
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+            time_created INTEGER, time_updated INTEGER, parent_id TEXT, time_archived INTEGER);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+            session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+        """
+    )
+    conn.execute(
+        "INSERT INTO session VALUES (?,?,?,?,?,?,?)",
+        ("ses_err1", "/tmp/demo", "t", 1000, 2000, None, None),
+    )
+    conn.execute(
+        "INSERT INTO message VALUES (?,?,?,?,?)",
+        ("m1", "ses_err1", 1001, 1001, json.dumps({"role": "user", "time": {"created": 1001000}})),
+    )
+    conn.execute(
+        "INSERT INTO part VALUES (?,?,?,?,?,?)",
+        ("p1", "m1", "ses_err1", 1001, 1001, json.dumps({"type": "text", "text": "do thing"})),
+    )
+    conn.execute(
+        "INSERT INTO message VALUES (?,?,?,?,?)",
+        (
+            "m2",
+            "ses_err1",
+            1002,
+            1002,
+            json.dumps({"role": "assistant", "time": {"created": 1002000}, "error": err}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+class OpencodeAbnormalEndingTests(unittest.TestCase):
+    def test_api_error_surfaces_status_and_text(self) -> None:
+        import os
+
+        err = {
+            "name": "APIError",
+            "data": {
+                "message": "models/antigravity-gemini-3-pro-high is not found",
+                "statusCode": 404,
+                "isRetryable": False,
+            },
+        }
+        path = _opencode_db_with_error(err)
+        try:
+            conn = opencode.connect_ro(path)
+            assert conn is not None
+            try:
+                row = list(conn.execute(opencode._SCAN_SQL, (10,)).fetchall())[0]
+            finally:
+                conn.close()
+            info = opencode._build_session_info(row, path)
+            assert info is not None
+            self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
+            self.assertIn("not found", info["last_agent_msg"])
+            self.assertIn("404", info["last_agent_msg"])
+            conversation = opencode.load_conversation(path, "ses_err1")
+            self.assertEqual([m.role for m in conversation], ["user", "assistant"])
+            self.assertIn("not found", conversation[-1].text)
+            events = load_events({"source": "opencode", "path": path, "id": "ses_err1"})
+            self.assertEqual([e["type"] for e in events], ["user_message", "assistant_message"])
+            self.assertIn("not found", events[-1]["text"])
+        finally:
+            os.unlink(path)
+
+    def test_aborted_operation_surfaces_message(self) -> None:
+        import os
+
+        err = {"name": "MessageAbortedError", "data": {"message": "The operation was aborted."}}
+        path = _opencode_db_with_error(err)
+        try:
+            conn = opencode.connect_ro(path)
+            assert conn is not None
+            try:
+                row = list(conn.execute(opencode._SCAN_SQL, (10,)).fetchall())[0]
+            finally:
+                conn.close()
+            info = opencode._build_session_info(row, path)
+            assert info is not None
+            self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
+            self.assertIn("aborted", info["last_agent_msg"])
+            conversation = opencode.load_conversation(path, "ses_err1")
+            self.assertEqual(conversation[-1].role, "assistant")
+            events = load_events({"source": "opencode", "path": path, "id": "ses_err1"})
+            self.assertEqual(events[-1]["type"], "assistant_message")
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":
