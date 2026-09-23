@@ -136,115 +136,92 @@ class PiAbnormalEndingTests(unittest.TestCase):
             self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
             self.assertIn("weekly usage limit", info["last_agent_msg"])
             conversation = pi.load_conversation(str(path))
+            self.assertEqual([m.role for m in conversation], ["user"])
+            conversation = pi.load_conversation(str(path), include_errors=True)
             self.assertEqual([m.role for m in conversation], ["user", "assistant"])
             self.assertIn("RATE_LIMITED", conversation[-1].text)
             events = load_events({"source": "pi", "path": str(path), "id": info["id"]})
             self.assertEqual([e["type"] for e in events], ["user_message", "assistant_message"])
             self.assertIn("weekly usage limit", events[-1]["text"])
 
-    def test_connection_error_burst_collapses_to_one(self) -> None:
-        """Pi 重试连击只留最后一条（与 Claude 同口径）；真实正文出现即恢复。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "2026-09-23T13-15-47-097Z_a3aeb26b.jsonl"
-            lines = [
-                {
-                    "type": "session",
-                    "version": 3,
-                    "id": "a3aeb26b",
-                    "timestamp": "2026-09-23T13:15:47.097Z",
-                    "cwd": "/tmp/demo",
+    def _error_burst_file(self, tmp: str) -> Path:
+        """用户提问 + 三连纯报错 + 一条真实助手回复。"""
+        path = Path(tmp) / "2026-09-23T13-15-47-097Z_a3aeb26b.jsonl"
+        lines: list[dict] = [
+            {
+                "type": "session",
+                "version": 3,
+                "id": "a3aeb26b",
+                "timestamp": "2026-09-23T13:15:47.097Z",
+                "cwd": "/tmp/demo",
+            },
+            {
+                "type": "message",
+                "id": "m1",
+                "parentId": None,
+                "timestamp": "2026-09-23T13:16:07.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hi"}],
                 },
+            },
+        ]
+        parent = "m1"
+        for index, err in enumerate(
+            ["Connection error.", "Connection error.", "Request timed out."]
+        ):
+            mid = f"e{index}"
+            lines.append(
                 {
                     "type": "message",
-                    "id": "m1",
-                    "parentId": None,
-                    "timestamp": "2026-09-23T13:16:07.000Z",
-                    "message": {
-                        "role": "user",
-                        "content": [{"type": "text", "text": "hi"}],
-                    },
-                },
-            ]
-            parent = "m1"
-            for index, err in enumerate(
-                ["Connection error.", "Connection error.", "Request timed out."]
-            ):
-                mid = f"e{index}"
-                lines.append(
-                    {
-                        "type": "message",
-                        "id": mid,
-                        "parentId": parent,
-                        "timestamp": f"2026-09-23T13:17:0{index}.000Z",
-                        "message": {
-                            "role": "assistant",
-                            "content": [],
-                            "stopReason": "error",
-                            "errorMessage": err,
-                        },
-                    }
-                )
-                parent = mid
-            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
-            conversation = pi.load_conversation(str(path))
-            assistants = [m for m in conversation if m.role == "assistant"]
-            self.assertEqual([m.role for m in conversation], ["user", "assistant"])
-            self.assertEqual(len(assistants), 1)
-            self.assertEqual(assistants[0].text, "Request timed out.")
-            events = load_events({"source": "pi", "path": str(path), "id": "a3aeb26b"})
-            assistant_events = [e for e in events if e["type"] == "assistant_message"]
-            self.assertEqual(len(assistant_events), 1)
-            self.assertEqual(assistant_events[0]["text"], "Request timed out.")
-
-    def test_real_text_after_error_discards_pending(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "2026-09-23T13-16-35-317Z_df6c33a0.jsonl"
-            lines = [
-                {
-                    "type": "session",
-                    "version": 3,
-                    "id": "df6c33a0",
-                    "timestamp": "2026-09-23T13:16:35.317Z",
-                    "cwd": "/tmp/demo",
-                },
-                {
-                    "type": "message",
-                    "id": "m1",
-                    "parentId": None,
-                    "timestamp": "2026-09-23T13:16:36.000Z",
-                    "message": {
-                        "role": "user",
-                        "content": [{"type": "text", "text": "hi"}],
-                    },
-                },
-                {
-                    "type": "message",
-                    "id": "e0",
-                    "parentId": "m1",
-                    "timestamp": "2026-09-23T13:17:00.000Z",
+                    "id": mid,
+                    "parentId": parent,
+                    "timestamp": f"2026-09-23T13:17:0{index}.000Z",
                     "message": {
                         "role": "assistant",
                         "content": [],
                         "stopReason": "error",
-                        "errorMessage": "Connection error.",
+                        "errorMessage": err,
                     },
+                }
+            )
+            parent = mid
+        lines.append(
+            {
+                "type": "message",
+                "id": "m2",
+                "parentId": parent,
+                "timestamp": "2026-09-23T13:17:05.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "PONG"}],
+                    "stopReason": "stop",
                 },
-                {
-                    "type": "message",
-                    "id": "m2",
-                    "parentId": "e0",
-                    "timestamp": "2026-09-23T13:17:01.000Z",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "PONG"}],
-                        "stopReason": "stop",
-                    },
-                },
-            ]
-            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            }
+        )
+        path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_error_only_turns_hidden_by_default(self) -> None:
+        """默认预览只有真人真话：报错不出聊天，真实回复保留。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._error_burst_file(tmp)
             conversation = pi.load_conversation(str(path))
             self.assertEqual([m.role for m in conversation], ["user", "assistant"])
             self.assertEqual(conversation[-1].text, "PONG")
+
+    def test_include_errors_switch_brings_them_back(self) -> None:
+        """开 ``include_errors`` 则逐条保留纯报错；事件流里它们一直在。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._error_burst_file(tmp)
+            conversation = pi.load_conversation(str(path), include_errors=True)
+            assistants = [m for m in conversation if m.role == "assistant"]
+            self.assertEqual(len(assistants), 4)
+            self.assertEqual(assistants[-1].text, "PONG")
+            self.assertTrue(all(m.text for m in assistants))
+            events = load_events({"source": "pi", "path": str(path), "id": "a3aeb26b"})
+            assistant_events = [e for e in events if e["type"] == "assistant_message"]
+            self.assertEqual(len(assistant_events), 4)
 
     def test_successful_stop_still_done(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

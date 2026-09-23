@@ -20,12 +20,14 @@ class ConversationLoadError(RuntimeError):
     """History path missing / unreadable, or runtime loader rejected the session."""
 
 
-def load_session_conversation(session: dict) -> list[ConversationMessage]:
+def load_session_conversation(session: dict, *, include_errors: bool = False) -> list[ConversationMessage]:
     """Load plain user/assistant turns for a scanned session dict.
 
     Parser modules keep path-based (or OpenCode db+id) signatures for Corral and
     direct callers; this adapter is the public session-dict entry used by the CLI
-    and ``RuntimeParser.load_conversation``.
+    and ``RuntimeParser.load_conversation``. ``include_errors`` is currently
+    honored by the Pi loader only (error-only turns); other runtimes keep
+    their own error policy.
     """
     runtime_id = str(session.get("source") or "")
     path = str(session.get("path") or "")
@@ -58,6 +60,8 @@ def load_session_conversation(session: dict) -> list[ConversationMessage]:
     elif not os.path.exists(path):
         raise ConversationLoadError(f"history path not found: {path}")
 
+    if include_errors and runtime_id == "pi":
+        return loader(path, include_errors=True)
     return loader(path)
 
 
@@ -85,11 +89,12 @@ class RuntimeParser:
             kwargs["include_missing_cwd"] = True
         return self._scan(**kwargs)
 
-    def load_conversation(self, session: dict) -> list[ConversationMessage]:
+    def load_conversation(self, session: dict, *, include_errors: bool = False) -> list[ConversationMessage]:
         """Accept a session dict; adapt to path-based parser loaders.
 
         Test doubles may still register a ``_load(session)`` callable — detected by
-        the first parameter name so smoke tests stay simple.
+        the first parameter name so smoke tests stay simple. ``include_errors``
+        is forwarded to loaders that honor it (currently Pi only).
         """
         try:
             first = next(iter(inspect.signature(self._load).parameters))
@@ -103,7 +108,7 @@ class RuntimeParser:
         if self.id in {"claude", "codex", "opencode", "kimi", "cursor", "pi"}:
             # Keep source aligned with this parser when callers omit/mismatch it.
             payload = session if session.get("source") == self.id else {**session, "source": self.id}
-            return load_session_conversation(payload)
+            return load_session_conversation(payload, include_errors=include_errors)
 
         if self.id == "opencode" or len(inspect.signature(self._load).parameters) >= 2:
             return self._load(str(session.get("path") or ""), str(session.get("id") or ""))

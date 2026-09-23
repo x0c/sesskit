@@ -163,9 +163,9 @@ def _scan_map(registry: ParserRegistry, args, limit: int | None = None) -> dict:
     return registry.scan_all(depth, include_missing_cwd=include_missing)
 
 
-def _load_messages(runtime, session: dict):
+def _load_messages(runtime, session: dict, *, include_errors: bool = False):
     try:
-        return runtime.load_conversation(session)
+        return runtime.load_conversation(session, include_errors=include_errors)
     except ConversationLoadError as exc:
         raise ApiError(
             "not_found",
@@ -376,7 +376,7 @@ def cmd_show(args, registry: ParserRegistry) -> dict:
     fields = _parse_fields(getattr(args, "fields", None), DEFAULT_SHOW_FIELDS if compact else None)
     runtime = registry.get(str(session.get("source") or ""))
     payload = session_payload(session)
-    messages = _load_messages(runtime, session)
+    messages = _load_messages(runtime, session, include_errors=bool(getattr(args, "include_errors", False)))
     total_messages = len(messages)
     if not args.full:
         n = args.messages if args.messages else 20
@@ -465,10 +465,11 @@ def cmd_export(args, registry: ParserRegistry) -> dict:
     candidates.sort(key=lambda item: item[1].get("mtime") or 0)
     sessions = []
     load_errors = []
+    include_errors = bool(getattr(args, "include_errors", False))
     for runtime, session in candidates:
         payload = session_payload(session)
         try:
-            messages = _load_messages(runtime, session)
+            messages = _load_messages(runtime, session, include_errors=include_errors)
         except ApiError as exc:
             load_errors.append({"id": session.get("id"), "runtime": runtime.id, "error": exc.message})
             continue
@@ -644,6 +645,7 @@ COMMANDS = [
         "handler": cmd_show,
         "args": [
             {"flags": ["session"], "kwargs": {"help": "id, prefix, or runtime:id"}},
+            {"flags": ["--include-errors"], "kwargs": {"action": "store_true", "help": "also show error-only assistant turns (Pi); default hides them from the chat view"}},
             {"flags": ["--messages"], "kwargs": {"type": int, "default": None}},
             {"flags": ["--full"], "kwargs": {"action": "store_true"}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": _RESOLVE_SCAN_LIMIT}},
@@ -666,6 +668,7 @@ COMMANDS = [
             {"flags": ["--cwd"], "kwargs": {}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": 200}},
             {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
+            {"flags": ["--include-errors"], "kwargs": {"action": "store_true", "help": "also include error-only assistant turns (Pi); default hides them from the chat view"}},
             {"flags": ["--out"], "kwargs": {}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
         ],

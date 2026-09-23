@@ -286,51 +286,29 @@ def scan_sessions(
     return results
 
 
-def load_conversation(path: str) -> list[ConversationMessage]:
+def load_conversation(path: str, *, include_errors: bool = False) -> list[ConversationMessage]:
     """按时间顺序读取真实用户消息和 Pi 的助手文本回复。
 
-    与 Claude 同口径：上游报错（连接失败/超时）重试连记多条时只保留最后一条；
-    之后若出现真实助手正文说明已恢复，丢弃之前攒的报错；新用户消息或文件结束
-    才落盘它。工具调用本身无文本（thinking/toolCall），不触发落盘，纯报错连击
-    （中间只隔着不可见的工具轮次）仍折成一条。
+    纯报错轮次（空正文 + errorMessage，如连接失败/超时重试）默认不进对话：
+    它们是传输噪声，不是聊天内容。异常收尾照样经 ``status_tag``（已中断）与
+    列表 ``last_agent_msg`` / ``load_events`` 保留，可查不进聊。工具调用本身
+    无文本（thinking/toolCall），同样不占一条。``include_errors=True`` 则把
+    每条纯报错也当作助手消息逐条保留，供需要看报错的人用。
     """
     result: list[ConversationMessage] = []
-    pending_error: str | None = None
-    pending_error_ts: float | None = None
-
-    def flush_error() -> None:
-        nonlocal pending_error, pending_error_ts
-        if pending_error and (
-            not result or result[-1].role != "assistant" or result[-1].text != pending_error
-        ):
-            result.append(ConversationMessage("assistant", pending_error, pending_error_ts))
-        pending_error = None
-        pending_error_ts = None
-
     for item in _active_messages(_read_entries(path)):
         message = item["message"]
         role = message.get("role")
         text = _text(message.get("content"))
-        timestamp = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
-        if role == "assistant" and not text:
+        if role == "assistant" and not text and include_errors:
             stop_reason = str(message.get("stopReason") or "").strip()
             error_text = str(message.get("errorMessage") or "").strip()
             if error_text and (stop_reason in {"error", "aborted"} or error_text):
-                # 重试连击只留最后一条：覆盖，不立即落盘。
-                pending_error = error_text
-                pending_error_ts = timestamp
-            continue
+                text = error_text
         if role not in ("user", "assistant") or not text:
             continue
-        if role == "user":
-            flush_error()
-            result.append(ConversationMessage(role, text, timestamp))
-            continue
-        # 真实助手正文落地=本轮已恢复，丢掉之前攒的报错。
-        pending_error = None
-        pending_error_ts = None
+        timestamp = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
         result.append(ConversationMessage(role, text, timestamp))
-    flush_error()
     return result
 
 
