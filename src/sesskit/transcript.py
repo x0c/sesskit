@@ -404,10 +404,147 @@ WHERE m.session_id = ?
 ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC, p.id ASC
 """
 
+_OPENCODE_TRANSCRIPT_SQL_V2 = """
+SELECT type, seq, time_created, id, data
+FROM session_message
+WHERE session_id = ?
+ORDER BY seq ASC, time_created ASC, id ASC
+"""
+
+
+def _opencode_use_v2(db_path: str, session_id: str) -> bool:
+    """该会话是否走 v2 事件流。落在 v1 session 表里的 id（含双表并存的迁移行）
+    永远走 v1；只有 v1 表里没有、session_message 里有行时才走 v2。探针失败
+    （缺表、打不开）一律回落 v1，保持原有行为。"""
+    conn = scan_opencode.connect_ro(db_path)
+    if conn is None:
+        return False
+    try:
+        try:
+            hit = conn.execute(
+                "SELECT 1 FROM session WHERE id = ?", (session_id,)
+            ).fetchone()
+        except sqlite3.Error:
+            hit = None
+        if hit is not None:
+            return False
+        try:
+            hit = conn.execute(
+                "SELECT 1 FROM session_message WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return hit is not None
+    finally:
+        conn.close()
+
+
+def _parse_opencode_v2(db_path: str, session_id: str) -> list[dict]:
+    """v2 会话事件流：逐行读 session_message（seq 排序）。
+
+    - user 行 → user_message（data.text）。
+    - assistant 行展开 content[]：type='text' → assistant_message；
+      type='tool' → tool_call（item.id/.name，input=state.input）+ 状态为
+      completed/error 时跟 tool_result（completed 的 output 取
+      state.content[] 文本拼接，error 的 output 取原始 state.error）；
+      type='reasoning' 跳过（多为空串 + 密文，无事件价值）。
+    - compaction 行 → thinking（summary；与 v1 compaction 进 thinking 同口径）。
+    - system/synthetic/idle 一律不出事件（idle outcome 只定 status_tag）。
+    - assistant 行无文本但带 error → assistant_message 填 error 文本，不丢轮。
+    事件类型/字段沿用本模块现有体系，不新增类型。
+    """
+    sink = _Sink()
+    conn = scan_opencode.connect_ro(db_path)
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(_OPENCODE_TRANSCRIPT_SQL_V2, (session_id,)).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+    for row in rows:
+        try:
+            data = json.loads(row["data"] or "{}") or {}
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        row_type = str(row["type"] or "")
+        created = data.get("time").get("created") if isinstance(data.get("time"), dict) else None
+        ts = _opencode_ts(created) or _opencode_ts(row["time_created"])
+        if row_type == "user":
+            text = data.get("text")
+            sink.add("user_message", ts, text=text if isinstance(text, str) else "")
+        elif row_type == "assistant":
+            content = data.get("content")
+            items = content if isinstance(content, list) else []
+            text_seen = False
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "text":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        text_seen = True
+                    sink.add("assistant_message", ts, text=text if isinstance(text, str) else "")
+                elif item_type == "tool":
+                    state = item.get("state") if isinstance(item.get("state"), dict) else {}
+                    call_id = str(item.get("id") or "")
+                    sink.add(
+                        "tool_call",
+                        ts,
+                        id=call_id,
+                        name=str(item.get("name") or "tool"),
+                        input=_json_args(state.get("input")),
+                    )
+                    status = str(state.get("status") or "")
+                    if status == "completed":
+                        out_texts = []
+                        state_content = state.get("content")
+                        if isinstance(state_content, list):
+                            for out_item in state_content:
+                                if (
+                                    isinstance(out_item, dict)
+                                    and out_item.get("type") == "text"
+                                    and isinstance(out_item.get("text"), str)
+                                    and out_item["text"].strip()
+                                ):
+                                    out_texts.append(out_item["text"].strip())
+                        sink.add(
+                            "tool_result",
+                            ts,
+                            call_id=call_id,
+                            status="ok",
+                            output="\n\n".join(out_texts),
+                        )
+                    elif status == "error":
+                        sink.add(
+                            "tool_result",
+                            ts,
+                            call_id=call_id,
+                            status="error",
+                            output=state.get("error"),
+                        )
+                # reasoning：跳过（见 docstring）。
+            if not text_seen and data.get("error"):
+                err_text = scan_opencode.error_text_from_msg(data)
+                sink.add("assistant_message", ts, text=err_text)
+        elif row_type == "compaction":
+            summary = data.get("summary")
+            sink.add("thinking", ts, text=summary if isinstance(summary, str) else "")
+        # system / synthetic / idle / 未知 type：不出事件。
+    return sink.events
+
 
 def _parse_opencode(session: dict) -> list[dict]:
     db_path = str(session.get("path") or "")
     session_id = str(session.get("id") or "")
+    if _opencode_use_v2(db_path, session_id):
+        return _parse_opencode_v2(db_path, session_id)
     sink = _Sink()
     conn = scan_opencode.connect_ro(db_path)
     if conn is None:

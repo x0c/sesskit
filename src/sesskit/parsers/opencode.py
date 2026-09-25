@@ -4,6 +4,11 @@
 OpenCode v1.2.0 起把历史存进单个 SQLite 数据库（session/message/part 三表，
 WAL 模式），更早版本的 JSON 文件存储不做兼容——官方升级会自动迁移，遗留用户
 极少；本机没有 opencode.db 时该运行时的会话列表就是空的，不报错。
+
+v2（2.x）新增 session_v2/session_message 两表：老会话会被迁移进 session_v2
+（故 version 列不能区分新老），新会话只落 v2 表。本模块双表分支：v1 表逻辑
+原样保留（落在 v1 表里的老会话仍走 v1 查询，行为零变化），v2 表只收编 v1
+表里没有的 id（``NOT EXISTS`` 去重，避免迁移行在列表里出现两次）。
 """
 
 from __future__ import annotations
@@ -93,6 +98,117 @@ WHERE m.session_id = ?
   AND json_extract(p.data, '$.synthetic') IS NOT 1
 ORDER BY m.time_created ASC, m.id ASC, p.id ASC
 """
+
+# --- v2（session_v2 / session_message）---------------------------------------
+#
+# session_v2 列：cwd 只用非空的 directory（path 列可空且有相对路径形态，禁用）；
+# title 可空（空标题走 fallback，只有“无标题 + 无用户正文”才丢弃）；version 列
+# 里混有大量 1.x 迁移行，不能用来区分新老，以表名分支为准。过滤沿用
+# parent_id IS NULL AND time_archived IS NULL，并用 NOT EXISTS 排除已落在 v1
+# session 表里的迁移行（老会话行为零变化，新表只收编 v2 专属会话）。
+_SCAN_SQL_V2 = """
+SELECT s.id, s.directory, s.title, s.time_created, s.time_updated
+FROM session_v2 s
+WHERE s.parent_id IS NULL
+  AND s.time_archived IS NULL
+  AND NOT EXISTS (SELECT 1 FROM session old WHERE old.id = s.id)
+ORDER BY s.time_updated DESC
+LIMIT ?
+"""
+
+# session_message 列：id/session_id/type/seq/time_created/time_updated/data，
+# UNIQUE(session_id, seq)。seq 不连续（4,5,12 这类跳号），只做排序键。
+_V2_MESSAGES_SQL = """
+SELECT type, seq, time_created, id, data
+FROM session_message
+WHERE session_id = ?
+ORDER BY seq ASC, time_created ASC, id ASC
+"""
+
+_V2_SIZE_SQL = """
+SELECT COALESCE(SUM(LENGTH(data)), 0) FROM session_message WHERE session_id = ?
+"""
+
+# 非对话行：tail/状态判定与正文提取一律跳过这些 type。
+_V2_SKIP_TYPES = frozenset({"system", "synthetic", "compaction", "idle"})
+
+
+def _v2_json_dict(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw or "{}")
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _v2_user_text(data: dict) -> str:
+    """user 正文：data.text 字符串原样返回（含用户自己打的外层引号，不剥离）。"""
+    text = data.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def _v2_assistant_text(data: dict) -> str:
+    """assistant 正文：只取 content[] 里 type='text' 的 .text 拼接。
+
+    type='reasoning'（常为空串 + reasoningEncryptedContent 密文）绝不计入对话；
+    type='tool' 项是内联调用 + 结果（.name/.state.status/.state.input/
+    .state.content[].text，供 transcript 层展开），纯文本对话（list 预览、
+    load_conversation）不相关的工具输入输出不混入正文——与 v1 只取 text part
+    的口径一致。v1 那种“独立 part 行存调用/结果”的假设在 v2 作废。
+    """
+    content = data.get("content")
+    if not isinstance(content, list):
+        return ""
+    texts = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            texts.append(text.strip())
+    return "\n\n".join(texts)
+
+
+def _v2_msg_time_ms(data: dict) -> float | None:
+    """data.time.created（毫秒）→ 秒；缺失返回 None。"""
+    time_obj = data.get("time")
+    if isinstance(time_obj, dict):
+        created = time_obj.get("created")
+        if isinstance(created, (int, float)) and not isinstance(created, bool):
+            return created / 1000
+    return None
+
+
+def _status_tag_v2(typed_rows: list[tuple[str, dict]]) -> str:
+    """v2 末轮状态判定：倒序跳过 system/synthetic/compaction/idle 后首行定状态。
+
+    - user → PENDING；assistant + 非空 error → ABORTED（带 error 永不判 DONE）；
+    - finish='stop'（且无 error）→ DONE；tool-calls/缺失/unknown 等 → NONE；
+    - 跳过的尾部里若有 idle outcome=failed（异常信号），把 PENDING/NONE 翻成
+      ABORTED；已成立的 DONE 不翻（bookkeeping 不推翻无 error 的成功轮）。
+    """
+    idle_failed = False
+    for row_type, data in reversed(typed_rows):
+        if row_type in _V2_SKIP_TYPES:
+            if (
+                row_type == "idle"
+                and isinstance(data, dict)
+                and data.get("outcome") == "failed"
+            ):
+                idle_failed = True
+            continue
+        if row_type == "user":
+            return titles.STATUS_ABORTED if idle_failed else titles.STATUS_PENDING
+        if row_type == "assistant":
+            if isinstance(data, dict) and data.get("error"):
+                return titles.STATUS_ABORTED
+            if isinstance(data, dict) and data.get("finish") == "stop":
+                return titles.STATUS_DONE
+            return titles.STATUS_ABORTED if idle_failed else titles.STATUS_NONE
+        return titles.STATUS_ABORTED if idle_failed else titles.STATUS_NONE
+    return titles.STATUS_ABORTED if idle_failed else titles.STATUS_NONE
 
 
 def _cmdline_parts_before_prompt(cmdline: str) -> list[str]:
@@ -362,7 +478,9 @@ def error_text_from_msg(msg: object) -> str:
     Shapes seen live (``message.data.error``):
     ``{"name": "APIError", "data": {"message": ..., "statusCode": 404}}`` and
     ``{"name": "MessageAbortedError", "data": {"message": "The operation was aborted."}}``.
-    Returns ``""`` when there is no error so callers can fall back to text parts.
+    v2 (``session_message.data.error``): ``{"type": ..., "message": ...}`` with
+    an optional numeric ``status`` (e.g. 429 quota). Returns ``""`` when there
+    is no error so callers can fall back to text parts.
     """
     if not isinstance(msg, dict):
         return ""
@@ -384,7 +502,16 @@ def error_text_from_msg(msg: object) -> str:
     for key in ("message", "text"):
         value = err.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            message = value.strip()
+            for status_key in ("statusCode", "status"):
+                code = err.get(status_key)
+                if (
+                    isinstance(code, int)
+                    and not isinstance(code, bool)
+                    and 100 <= code <= 599
+                ):
+                    return f"{code}: {message}"
+            return message
     name = err.get("name")
     return str(name or "").strip()
 
@@ -435,6 +562,82 @@ def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
         path=db_path,
         first_user_msg=first_user,
         last_user_msg=str(row["last_user_text"] or ""),
+        last_agent_msg=last_agent_text,
+        completion_id=completion_id_for(
+            file_mtime=mtime,
+            size_bytes=size_bytes,
+            status_tag=status,
+            tail_text=tail_text,
+        ),
+    )
+
+
+def _build_session_info_v2(
+    conn: sqlite3.Connection, row: sqlite3.Row, db_path: str
+) -> dict | None:
+    """v2 单会话列表项：预览/状态/大小全部从 session_message 现算。
+
+    first/last_user_msg 取 type='user' 按 seq 首/尾行的 data.text；
+    last_agent_msg 取尾部 assistant 行的 text 拼接（0 文本但有 error 时填
+    error 文本）；size 取 SUM(LENGTH(session_message.data))——v1 的 part 源
+    在此表没有对应物，沿用它会恒为 0 并让 completion_id 尾哈希退化；
+    fallback_title 取首条 user 正文首行 60 字；title 为空是正常态，只有
+    “无标题 + 无用户正文”才丢弃（与 v1 相同的空会话规则）。
+    """
+    session_id = str(row["id"])
+    msg_rows = conn.execute(_V2_MESSAGES_SQL, (session_id,)).fetchall()
+    typed_rows: list[tuple[str, dict]] = []
+    user_texts: list[str] = []
+    assistant_datas: list[dict] = []
+    for msg_row in msg_rows:
+        data = _v2_json_dict(msg_row["data"])
+        row_type = str(msg_row["type"] or "")
+        typed_rows.append((row_type, data))
+        if row_type == "user":
+            user_texts.append(_v2_user_text(data))
+        elif row_type == "assistant":
+            assistant_datas.append(data)
+    first_user = user_texts[0] if user_texts else ""
+    last_user = user_texts[-1] if user_texts else ""
+    last_agent_text = (
+        _v2_assistant_text(assistant_datas[-1]) if assistant_datas else ""
+    )
+    status = _status_tag_v2(typed_rows)
+    if not last_agent_text and status == titles.STATUS_ABORTED and assistant_datas:
+        last_agent_text = error_text_from_msg(assistant_datas[-1])
+
+    cwd = row["directory"] or ""
+    native_title = row["title"] or None
+    fallback = first_user.split("\n")[0].strip()
+    if len(fallback) > 60:
+        fallback = fallback[:60] + "…"
+    if not fallback:
+        fallback = "(无消息)"
+    if not native_title and fallback == "(无消息)":
+        return None  # 既无原生标题也无用户正文的空会话，无展示价值
+
+    mtime = row["time_updated"] / 1000
+    size_row = conn.execute(_V2_SIZE_SQL, (session_id,)).fetchone()
+    size_bytes = int(size_row[0] or 0) if size_row else 0
+    from sesskit.models import completion_id_for
+
+    tail_text = f"{last_user[:120]}\n{last_agent_text[:120]}"
+    return make_session_info(
+        source="opencode",
+        id=session_id,
+        short_id=session_id[:12],
+        cwd=cwd,
+        mtime=mtime,
+        time_source="db_time_updated",
+        event_time=mtime,
+        file_mtime=mtime,
+        size_bytes=size_bytes,
+        native_title=native_title,
+        fallback_title=fallback,
+        status_tag=status,
+        path=db_path,
+        first_user_msg=first_user,
+        last_user_msg=last_user,
         last_agent_msg=last_agent_text,
         completion_id=completion_id_for(
             file_mtime=mtime,
@@ -520,6 +723,43 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
             results.append(info)
             created_ms[str(info["id"])] = int(row["time_created"] or 0)
 
+    # v2 分支：只收编 v1 表里没有的会话（迁移行去重靠 _SCAN_SQL_V2 里的
+    # NOT EXISTS）。单库 v2 查询失败（比如 v2 之前的老库根本没有这两张表）
+    # 只跳过该库的 v2 部分，不影响 v1 结果；是否 raise 仍看双分支合计。
+    for db_path in db_paths:
+        conn = _connect_ro(db_path)
+        if conn is None:
+            continue
+        try:
+            v2_rows = conn.execute(_SCAN_SQL_V2, (query_limit,)).fetchall()
+        except sqlite3.Error:
+            conn.close()
+            continue
+        successful_queries += 1
+        try:
+            for row in v2_rows:
+                try:
+                    info = _build_session_info_v2(conn, row, db_path)
+                except sqlite3.Error:
+                    continue  # 单会话预览失败只跳过该会话，不连累同库其它 v2 行
+                if info is None:
+                    continue
+                first_user = str(info.get("first_user_msg") or "")
+                fallback = str(info.get("fallback_title") or "")
+                native = str(info.get("native_title") or "")
+                if (
+                    titles.is_title_generation_prompt(first_user)
+                    or titles.is_title_generation_prompt(fallback)
+                    or titles.is_title_generation_prompt(native)
+                ):
+                    continue
+                if cwd_filter and not info["cwd"].startswith(cwd_filter):
+                    continue
+                results.append(info)
+                created_ms[str(info["id"])] = int(row["time_created"] or 0)
+        finally:
+            conn.close()
+
     if db_paths and successful_queries == 0:
         # “库里确实没有会话”和“所有库都暂时打不开”必须区分；后者抛给 registry，
         # 由它保留最后一次成功缓存，不能把瞬时故障误当成全量删除。
@@ -531,7 +771,31 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
     return results
 
 
-def delete_session(db_path: str, session_id: str) -> None:
+def _is_v1_session(db_path: str, session_id: str) -> bool:
+    """id 是否落在 v1 session 表里。双表并存的迁移行必须走 v1 删除，否则遗留
+    message/part 孤儿行；v1 探针失败时再看 session_v2 是否有该 id（面向未来
+    纯 v2 库的前向兼容），两边都探不到默认走 v1，保持原有行为。"""
+    conn = _connect_ro(db_path)
+    if conn is None:
+        return True
+    try:
+        hit = conn.execute(
+            "SELECT 1 FROM session WHERE id = ?", (session_id,)
+        ).fetchone()
+        return hit is not None
+    except sqlite3.Error:
+        try:
+            hit = conn.execute(
+                "SELECT 1 FROM session_v2 WHERE id = ?", (session_id,)
+            ).fetchone()
+            return hit is None
+        except sqlite3.Error:
+            return True
+    finally:
+        conn.close()
+
+
+def _delete_session_v1(db_path: str, session_id: str) -> None:
     """彻底删除单个 OpenCode 会话，不可恢复。
 
     OpenCode 所有会话共享一个 SQLite 库，删除必须按 session_id 精确删行，不能
@@ -557,8 +821,97 @@ def delete_session(db_path: str, session_id: str) -> None:
         conn.close()
 
 
+def _delete_session_v2(db_path: str, session_id: str) -> None:
+    """删除单个 v2 会话（只落在 session_v2 / session_message 里的新会话）。
+
+    同一事务内按 session_message → instruction_entry → instruction_state →
+    session_pending → session_inbox → session_v2 有序删除：SQLite 默认没开
+    外键约束，不依赖 ON DELETE CASCADE；commit/rollback 口径与 v1 一致。
+    """
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        conn.execute(
+            "DELETE FROM session_message WHERE session_id = ?", (session_id,)
+        )
+        conn.execute(
+            "DELETE FROM instruction_entry WHERE session_id = ?", (session_id,)
+        )
+        conn.execute(
+            "DELETE FROM instruction_state WHERE session_id = ?", (session_id,)
+        )
+        conn.execute(
+            "DELETE FROM session_pending WHERE session_id = ?", (session_id,)
+        )
+        conn.execute(
+            "DELETE FROM session_inbox WHERE session_id = ?", (session_id,)
+        )
+        conn.execute("DELETE FROM session_v2 WHERE id = ?", (session_id,))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_session(db_path: str, session_id: str) -> None:
+    """彻底删除单个 OpenCode 会话，不可恢复（v1/v2 双表分发）。
+
+    id 落在 v1 session 表里（含双表并存的迁移行）走 v1 删除，原样保留；
+    否则走 v2 删除。不存在 id 的两条路径都是无操作提交，与原有行为一致。
+    """
+    if _is_v1_session(db_path, session_id):
+        _delete_session_v1(db_path, session_id)
+    else:
+        _delete_session_v2(db_path, session_id)
+
+
+def _load_conversation_v2(db_path: str, session_id: str) -> list[ConversationMessage]:
+    """v2 会话按 seq 顺序读用户正文与助手 text 拼接；只认 user/assistant 行。
+
+    system/synthetic/compaction/idle 直接跳过；assistant 空文本但带 error 时
+    用 error 文本占位（0 文本 error 轮不丢，尾部 idle/system 不干扰排序——
+    它们根本不进列表）。
+    """
+    conn = _connect_ro(db_path)
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(_V2_MESSAGES_SQL, (session_id,)).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+    messages: list[ConversationMessage] = []
+    for row in rows:
+        row_type = str(row["type"] or "")
+        if row_type not in ("user", "assistant"):
+            continue
+        data = _v2_json_dict(row["data"])
+        if row_type == "user":
+            text = _v2_user_text(data).strip()
+        else:
+            text = _v2_assistant_text(data)
+            if not text:
+                text = error_text_from_msg(data)
+        if not text:
+            continue
+        messages.append(
+            ConversationMessage(row_type, text, _v2_msg_time_ms(data))  # type: ignore[arg-type]
+        )
+    return messages
+
+
 def load_conversation(db_path: str, session_id: str) -> list[ConversationMessage]:
-    """按时间顺序读取用户消息和助手最终答复；同一消息的多个 text part 合并为一条。"""
+    """按时间顺序读取用户消息和助手最终答复；同一消息的多个 text part 合并为一条。
+
+    v1/v2 双表分发：id 落在 v1 session 表里（含双表并存的迁移行）走 v1 查询，
+    原样保留；v2 专属会话走 session_message 查询。不存在 id 的两条路径都返回
+    空列表，与原有行为一致。
+    """
+    if not _is_v1_session(db_path, session_id):
+        return _load_conversation_v2(db_path, session_id)
     conn = _connect_ro(db_path)
     if conn is None:
         return []
