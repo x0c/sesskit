@@ -119,6 +119,41 @@ def _read_tail(path: str, max_bytes: int = 65536) -> list[dict]:
     return entries
 
 
+_BACKFILL_WINDOWS = (512 * 1024, 4 * 1024 * 1024)
+
+
+def _last_texts(entries: list[dict]) -> tuple[str | None, str | None]:
+    """Newest real user text and newest assistant text, same rules as the tail loop."""
+    user = agent = None
+    for e in reversed(entries):
+        t = e.get("type")
+        if user is None and t == "user":
+            text = _extract_text(e.get("message", {}).get("content", ""))
+            if text and text != INTERRUPTED_MARKER:
+                user = text
+        elif agent is None and t == "assistant":
+            content = e.get("message", {}).get("content", [])
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text" and (part.get("text") or "").strip():
+                        agent = part["text"]
+                        break
+        if user is not None and agent is not None:
+            break
+    return user, agent
+
+
+def _backfill_excerpts(fpath: str) -> tuple[str | None, str | None]:
+    """Long tool-heavy turns leave no text in the 64 KB tail; read further back, bounded."""
+    user = agent = None
+    size = os.path.getsize(fpath)
+    for window in _BACKFILL_WINDOWS:
+        user, agent = _last_texts(_read_tail(fpath, max_bytes=window))
+        if agent or window >= size:
+            break
+    return user, agent
+
+
 INTERRUPTED_MARKER = "[Request interrupted by user]"
 _INTERRUPTED_MARKER = INTERRUPTED_MARKER  # 旧私有名兼容：模块内部仍引用
 
@@ -377,6 +412,11 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
     from sesskit.models import completion_id_for
 
     tail_text = f"{(last_user_msg or '')[:120]}\n{(last_agent_msg or '')[:120]}"
+    if not last_agent_msg:
+        # List excerpts only; status and completion_id above stay on the 64 KB window.
+        wider_user, wider_agent = _backfill_excerpts(fpath)
+        last_user_msg = last_user_msg or wider_user
+        last_agent_msg = last_agent_msg or wider_agent
     return make_session_info(
         source="claude",
         id=session_id,

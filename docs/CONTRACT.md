@@ -34,6 +34,7 @@ Legacy Corral share payloads used `corral.share/v1`; readers should accept both 
 ## Listing modes
 
 - List `first_user_msg` / `last_user_msg` / `last_agent_msg` stay at most 300 characters. When the text is a Corral handoff wrapper, extract the inherited `Task:` line and the conversation digest **before** clipping; otherwise the 300-char window is consumed by pickup boilerplate and title generation never sees the real request. Nested pickups flatten an earlier wrapper into `[Original request]` / `【原始需求】` on one line — peel inward (inner task wins) and drop leftover `You are picking up` on that line. Do not raise the raw slice to recover those bytes.
+- **List excerpts must not go blank in long tool-heavy turns.** Claude reads a bounded tail (64 KB) for status; when that window holds no user or assistant text (only tool calls/results), backfill `last_user_msg` / `last_agent_msg` from a wider backward read (bounded). Status, `status_tag` and `completion_id` stay computed from the original window only — widening them would turn a mid-turn assistant sentence into a false `STATUS_DONE` and a false completion notification.
 - Default scan drops sessions whose project `cwd` no longer exists (resume-oriented; **Corral must keep this default**).
 - Pass `--include-missing-cwd` (or `include_missing_cwd=True` on scanners) for archive/search when history files still exist.
 - Never turn `include_missing_cwd` on inside Corral’s recover / sidebar path.
