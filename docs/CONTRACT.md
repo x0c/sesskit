@@ -33,6 +33,8 @@ Legacy Corral share payloads used `corral.share/v1`; readers should accept both 
 
 ## Listing modes
 
+- Claude user prompts that begin with a rendered image marker such as `[Image #1]` and continue with human text are real sessions. Strip only leading image markers when choosing a fallback title; keep the original prompt in conversation/history. Do not classify that marker as a JSON-array title or drop the session from scan results. Reparse cached Claude metadata with this formerly rejected shape, so an unchanged history file recovers immediately after update. Corral needs the scanned history path to replace its hosted placeholder and populate Your prompts. Bracketed JSON/array fragments still remain low-value title candidates.
+- Cursor sessions whose `store.db` is missing, unreadable, or contains no parseable message events can still have `prompt_history.json`. `load_events` must emit those prompts oldest-first as `user_message` events, matching `load_conversation`; do not append the fallback to a non-empty store event stream or duplicate users.
 - List `first_user_msg` / `last_user_msg` / `last_agent_msg` stay at most 300 characters. When the text is a Corral handoff wrapper, extract the inherited `Task:` line and the conversation digest **before** clipping; otherwise the 300-char window is consumed by pickup boilerplate and title generation never sees the real request. Nested pickups flatten an earlier wrapper into `[Original request]` / `【原始需求】` on one line — peel inward (inner task wins) and drop leftover `You are picking up` on that line. Do not raise the raw slice to recover those bytes.
 - **List excerpts must not go blank in long tool-heavy turns.** Claude reads a bounded tail (64 KB) for status; when that window holds no user or assistant text (only tool calls/results), backfill `last_user_msg` / `last_agent_msg` from a wider backward read (bounded). Status, `status_tag` and `completion_id` stay computed from the original window only — widening them would turn a mid-turn assistant sentence into a false `STATUS_DONE` and a false completion notification.
 - Default scan drops sessions whose project `cwd` no longer exists (resume-oriented; **Corral must keep this default**).
@@ -91,7 +93,7 @@ Use these when implementing or reviewing parsers (not an event-bus API — SessK
 | Pi | assistant `stopReason` in `{stop, …}` with content | `stopReason` in `{error, aborted, …}` plus `errorMessage` (e.g. weekly 429) |
 | OpenCode | assistant `finish=stop`, no `error` | Non-empty message `error` → aborted (existing parser rule) |
 | Cursor | Prefer transcript / store tail; list `status_tag` is weak today | Prefer unknown over false done when terminal reason is unclear |
-| Claude | Stop / transcript end without interrupt markers | `system` entries with `error` (`formatted` human text + `status` HTTP code; 2.1+ live shape) → aborted; `[Request interrupted by user]` → aborted |
+| Claude | Stop / transcript end without interrupt markers | `system` entries with `error` (`formatted` human text + `status` HTTP code; 2.1+ live shape) → aborted; `[Request interrupted by user]` → aborted; final assistant text beginning `You've hit your session limit` → aborted |
 | Kimi | Stable `step.end` / assistant tail | Cancel / failure markers in wire history |
 
 ### Verified gaps closed (2026-09-15 live Mac runs)

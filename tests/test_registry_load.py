@@ -12,7 +12,6 @@ from sesskit.parsers import claude, pi
 from sesskit.registry import ConversationLoadError, default_registry, load_session_conversation
 from sesskit.transcript import load_events
 
-
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
@@ -79,6 +78,51 @@ def test_registry_loads_claude_fixture(tmp_path, monkeypatch):
     registry = default_registry()
     via_registry = registry.get("claude").load_conversation(session)
     assert [(m.role, m.text) for m in via_registry] == [(m.role, m.text) for m in messages]
+
+
+def test_claude_image_first_prompt_is_scanned_with_history_path(tmp_path, monkeypatch):
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = "ea65960d-6d06-486d-9daa-e55b2ea668ca"
+    prompt = "[Image #1]好像只有 Claude 会话才能看到提问和选项"
+    path = tmp_path / "projects" / "-tmp-project" / f"{session_id}.jsonl"
+    _write(
+        path,
+        json.dumps({
+            "type": "user",
+            "cwd": str(cwd),
+            "sessionId": session_id,
+            "timestamp": "2026-09-29T05:08:40.829Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        }) + "\n",
+    )
+    monkeypatch.setattr(claude, "PROJECTS_DIR", str(path.parent.parent))
+    monkeypatch.setattr(claude, "SESSIONS_DIR", str(tmp_path / "sessions"))
+
+    sessions = claude.scan_sessions(limit=10)
+    assert len(sessions) == 1
+    assert sessions[0]["path"] == str(path)
+    assert sessions[0]["fallback_title"].startswith("好像只有 Claude")
+    assert [(m.role, m.text) for m in load_session_conversation(sessions[0])] == [
+        ("user", prompt),
+    ]
+    assert claude._is_low_value_title('[{"key": "value"}]')
+
+    class OldCache:
+        def __init__(self):
+            self.info = dict(sessions[0], fallback_title="(仅本地命令)")
+
+        def get_session(self, runtime, source_path):
+            return self.info
+
+        def put_session(self, runtime, source_path, payload):
+            self.info = payload
+
+    old_cache = OldCache()
+    monkeypatch.setattr(claude, "get_cache", lambda: old_cache)
+    rescanned = claude.scan_sessions(limit=10)
+    assert rescanned[0]["path"] == str(path)
+    assert old_cache.info["fallback_title"].startswith("好像只有 Claude")
 
 
 def test_registry_rejects_missing_history():

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """扫描 Claude Code 会话历史（~/.claude/projects/），输出统一会话结构。
 
 相比 agentsync 的 claude-session-continue/scripts/list_sessions.py：
@@ -208,13 +207,20 @@ _NOISE_PROMPT_PREFIXES = (
     "你将看到一批编程助手会话的摘录",
 )
 
+_IMAGE_TITLE_PREFIX = re.compile(r"^(?:\[Image\s*#\d+\]\s*)+", re.IGNORECASE)
+_SESSION_LIMIT_PREFIX = "You've hit your session limit"
+
+
 def _title_line(text: str | None) -> str | None:
     if not text:
         return None
     for raw_line in str(text).splitlines():
         line = raw_line.strip()
-        if line.startswith("› ") or line.startswith("> "):
+        if line.startswith(("› ", "> ")):
             line = line[2:].strip()
+        # Claude renders attached images before the person's text. A leading
+        # image marker must not make a real prompt look like a JSON array.
+        line = _IMAGE_TITLE_PREFIX.sub("", line).strip()
         if not line:
             continue
         if line.startswith(("http://", "https://")):
@@ -404,6 +410,8 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
         status_tag = titles.STATUS_ABORTED
     elif last_was_user is True:
         status_tag = titles.STATUS_PENDING
+    elif last_was_user is False and (last_agent_msg or "").startswith(_SESSION_LIMIT_PREFIX):
+        status_tag = titles.STATUS_ABORTED
     elif last_was_user is False:
         status_tag = titles.STATUS_DONE
     else:
@@ -639,6 +647,18 @@ def scan_sessions(
 
         cache = get_cache()
         info = cache.get_session("claude", fpath)
+        if info is not None and (
+            (
+                info.get("fallback_title") == "(仅本地命令)"
+                and _IMAGE_TITLE_PREFIX.match(str(info.get("first_user_msg") or ""))
+            )
+            or (
+                info.get("status_tag") == titles.STATUS_DONE
+                and str(info.get("last_agent_msg") or "").startswith(_SESSION_LIMIT_PREFIX)
+            )
+        ):
+            # Reparse older cached image-first sessions and quota endings.
+            info = None
         if info is None:
             try:
                 info = _build_session_info(fpath, proj)

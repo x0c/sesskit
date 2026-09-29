@@ -279,6 +279,23 @@ class OpenCodeTranscriptTests(unittest.TestCase):
 
 
 class CursorTranscriptTests(unittest.TestCase):
+    def test_prompt_history_fallback_when_store_has_no_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            chat_dir = Path(directory)
+            store = chat_dir / "store.db"
+            conn = sqlite3.connect(store)
+            conn.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+            conn.close()
+            (chat_dir / "prompt_history.json").write_text(
+                json.dumps(["Second prompt", "First prompt"]), encoding="utf-8"
+            )
+            events = load_events(_session("cursor", store))
+            self.assertEqual(_types(events), ["user_message", "user_message"])
+            self.assertEqual([event["text"] for event in events], ["First prompt", "Second prompt"])
+            _assert_seq(self, events)
+            store.unlink()
+            self.assertEqual(load_events(_session("cursor", store)), events)
+
     def test_reasoning_tool_call_result_and_user_query(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "store.db"

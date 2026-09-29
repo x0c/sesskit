@@ -649,17 +649,26 @@ def _parse_cursor(session: dict) -> list[dict]:
     path = str(session.get("path") or "")
     store_path = path if path.endswith("store.db") else os.path.join(path, "store.db")
     sink = _Sink()
+
+    def fallback_prompts() -> list[dict]:
+        # Cursor's plain conversation falls back to prompt_history.json when
+        # the store has no readable messages. The event stream must agree.
+        for message in scan_cursor.load_conversation(store_path):
+            if message.role == "user":
+                sink.add("user_message", text=message.text)
+        return sink.events
+
     if not os.path.isfile(store_path):
-        return []
+        return fallback_prompts()
     conn = scan_cursor.connect_store_ro(store_path)
     if conn is None:
-        return []
+        return fallback_prompts()
     try:
         rows = conn.execute(
             "SELECT rowid, data FROM blobs WHERE substr(data, 1, 1) = X'7B' ORDER BY rowid"
         ).fetchall()
     except sqlite3.Error:
-        return []
+        return fallback_prompts()
     finally:
         conn.close()
 
@@ -729,7 +738,7 @@ def _parse_cursor(session: dict) -> list[dict]:
                 emit_result(str(part.get("toolCallId") or ""), result, _failed(result))
     for held in pending_results.values():
         sink.add("tool_result", **held)
-    return sink.events
+    return sink.events or fallback_prompts()
 
 
 # --- Pi ---------------------------------------------------------------------

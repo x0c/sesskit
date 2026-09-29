@@ -286,6 +286,29 @@ def _claude_file_with_system_error(err: dict, follow_up_user: str | None = None)
 
 
 class ClaudeAbnormalEndingTests(unittest.TestCase):
+    def test_assistant_session_limit_text_is_aborted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            rows = [
+                {
+                    "type": "user", "cwd": tmp, "timestamp": "2026-09-29T05:08:40.829Z",
+                    "message": {"role": "user", "content": "Please check this session"},
+                },
+                {
+                    "type": "assistant", "timestamp": "2026-09-29T05:14:43.785Z",
+                    "message": {"role": "assistant", "content": [
+                        {"type": "text", "text": "You've hit your session limit · resets 3:20pm"}
+                    ]},
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            info = claude._build_session_info(str(path), "proj")
+            assert info is not None
+            self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
+            self.assertTrue(info["last_agent_msg"].startswith("You've hit your session limit"))
+            events = load_events({"source": "claude", "path": str(path)})
+            self.assertEqual(events[-1]["type"], "assistant_message")
+
     def test_401_system_error_is_aborted(self) -> None:
         import os
 
@@ -405,7 +428,7 @@ class OpencodeAbnormalEndingTests(unittest.TestCase):
             conn = opencode.connect_ro(path)
             assert conn is not None
             try:
-                row = list(conn.execute(opencode._SCAN_SQL, (10,)).fetchall())[0]
+                row = next(iter(conn.execute(opencode._SCAN_SQL, (10,)).fetchall()))
             finally:
                 conn.close()
             info = opencode._build_session_info(row, path)
@@ -431,7 +454,7 @@ class OpencodeAbnormalEndingTests(unittest.TestCase):
             conn = opencode.connect_ro(path)
             assert conn is not None
             try:
-                row = list(conn.execute(opencode._SCAN_SQL, (10,)).fetchall())[0]
+                row = next(iter(conn.execute(opencode._SCAN_SQL, (10,)).fetchall()))
             finally:
                 conn.close()
             info = opencode._build_session_info(row, path)
