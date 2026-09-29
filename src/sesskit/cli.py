@@ -17,6 +17,7 @@ import time
 from datetime import datetime
 
 from sesskit import titles
+from sesskit.adapters import list_adapters
 from sesskit.envelope import (
     EXIT_AMBIGUOUS,
     EXIT_ERROR,
@@ -28,7 +29,7 @@ from sesskit.envelope import (
     ok,
     print_envelope,
 )
-from sesskit.hosted import cache_dir
+from sesskit.cache import cache_dir
 from sesskit.models import format_message_time, session_key
 from sesskit.paths import assert_not_history_path, atomic_write_json
 from sesskit.registry import ConversationLoadError, ParserRegistry, default_registry
@@ -598,6 +599,26 @@ def cmd_share(args, registry: ParserRegistry) -> dict:
     return ok(summary)
 
 
+def cmd_verify(args, registry: ParserRegistry):
+    """Run the conformance suite over local real sessions.
+
+    Prints counts and timings only, never content or paths. Returns a
+    ``(envelope, exit_code)`` pair so failures surface as non-zero exits
+    while keeping the standard envelope.
+    """
+    from sesskit import conformance as _conformance
+    from sesskit.envelope import EXIT_ERROR as _EXIT_ERROR
+    from sesskit.envelope import EXIT_OK as _EXIT_OK
+
+    requested = getattr(args, "runtime", None) or []
+    runtime_ids = list(requested) if isinstance(requested, list) else [requested]
+    runtime_ids = [r for r in runtime_ids if r] or list(registry.ids)
+    sample = getattr(args, "sample", 200) or 200
+    report = _conformance.verify_all(registry, runtime_ids, max(1, int(sample)))
+    code = _EXIT_OK if report["passed"] else _EXIT_ERROR
+    return ok(report), code
+
+
 COMMANDS = [
     {
         "name": "list",
@@ -645,7 +666,7 @@ COMMANDS = [
         "handler": cmd_show,
         "args": [
             {"flags": ["session"], "kwargs": {"help": "id, prefix, or runtime:id"}},
-            {"flags": ["--include-errors"], "kwargs": {"action": "store_true", "help": "also show error-only assistant turns (Pi); default hides them from the chat view"}},
+            {"flags": ["--include-errors"], "kwargs": {"action": "store_true", "help": "also show error-only assistant turns; default hides them from the chat view"}},
             {"flags": ["--messages"], "kwargs": {"type": int, "default": None}},
             {"flags": ["--full"], "kwargs": {"action": "store_true"}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": _RESOLVE_SCAN_LIMIT}},
@@ -668,7 +689,7 @@ COMMANDS = [
             {"flags": ["--cwd"], "kwargs": {}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": 200}},
             {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
-            {"flags": ["--include-errors"], "kwargs": {"action": "store_true", "help": "also include error-only assistant turns (Pi); default hides them from the chat view"}},
+            {"flags": ["--include-errors"], "kwargs": {"action": "store_true", "help": "also include error-only assistant turns; default hides them from the chat view"}},
             {"flags": ["--out"], "kwargs": {}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
         ],
@@ -688,11 +709,23 @@ COMMANDS = [
         "returns": {"schema": SCHEMA_ID, "events": "event array"},
     },
     {
+        "name": "verify",
+        "help": "Run conformance + real-history parity checks over local sessions (counts/timings only)",
+        "handler": cmd_verify,
+        "args": [
+            {"flags": ["--runtime"], "kwargs": {"action": "append", "default": None, "help": "runtime id, repeatable; default all"}},
+            {"flags": ["--sample"], "kwargs": {"type": int, "default": 200, "help": "recent sessions per runtime"}},
+            {"flags": ["--json"], "kwargs": {"action": "store_true", "help": "single-line JSON output (same as --compact)"}},
+            {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
+        ],
+        "returns": {"passed": "bool", "runtimes": "per-runtime counts", "totals": "aggregate counts"},
+    },
+    {
         "name": "describe",
         "help": "Machine-readable command/argument descriptions",
         "handler": None,
         "args": [{"flags": ["command"], "kwargs": {"nargs": "?", "default": None}}],
-        "returns": {"commands": "specs"},
+        "returns": {"commands": "specs", "runtimes": "adapter ids with capabilities"},
     },
 ]
 
@@ -704,7 +737,20 @@ def cmd_describe(args, _registry: ParserRegistry) -> dict:
         if spec is None:
             raise ApiError("not_found", f"unknown command: {target}", EXIT_NOT_FOUND)
         return ok(_describe_command(spec, full=True))
-    return ok({"commands": [_describe_command(spec, full=False) for spec in COMMANDS]})
+    return ok({
+        "commands": [_describe_command(spec, full=False) for spec in COMMANDS],
+        "runtimes": [_describe_adapter(adapter) for adapter in list_adapters()],
+    })
+
+
+def _describe_adapter(adapter) -> dict:
+    from dataclasses import asdict
+
+    return {
+        "id": adapter.id,
+        "display_name": adapter.display_name,
+        "capabilities": asdict(adapter.capabilities),
+    }
 
 
 def _describe_command(spec: dict, full: bool) -> dict:
@@ -737,20 +783,26 @@ def build_parser() -> JSONArgumentParser:
 def dispatch(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    compact = bool(getattr(args, "compact", False))
+    compact = bool(getattr(args, "compact", False) or getattr(args, "json", False))
     registry = default_registry()
     try:
         runtime_filter = getattr(args, "runtime", None)
-        if runtime_filter:
-            registry.get(runtime_filter)
+        filters = runtime_filter if isinstance(runtime_filter, list) else [runtime_filter]
+        for runtime_id in filters:
+            if runtime_id:
+                registry.get(runtime_id)
     except KeyError as exc:
         print_envelope(err(ApiError("not_found", str(exc), EXIT_NOT_FOUND)), compact=compact)
         return EXIT_NOT_FOUND
     try:
         handler = args._handler
-        payload = handler(args, registry)
+        result = handler(args, registry)
+        if isinstance(result, tuple):
+            payload, code = result
+        else:
+            payload, code = result, EXIT_OK
         print_envelope(payload, compact=compact)
-        return EXIT_OK
+        return code
     except ApiError as exc:
         print_envelope(err(exc), compact=compact)
         return exc.exit_code

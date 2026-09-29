@@ -20,11 +20,14 @@ import sys
 from itertools import groupby
 
 from sesskit import titles
-from sesskit.hosted import hosted_session_id
 from sesskit.models import ConversationMessage, SessionInfo, make_session_info
 from sesskit.parsers.common import (
+    HostExtension,
+    ephemeral_prefixes_for,
+    host_session_ident,
     is_ephemeral_agent_cwd,
     live_processes,
+    preprocess_excerpt,
     process_command_line,
     process_environ,
     process_start_time,
@@ -284,8 +287,8 @@ def _mark_live(session: dict, pid: int) -> bool:
     return True
 
 
-def _session_for_corral_ident(by_id: dict[str, dict], ident: str) -> dict | None:
-    """托管注入的 CORRAL_SESSION_ID 只有完整会话 ID 才绑定。
+def _session_for_host_ident(by_id: dict[str, dict], ident: str) -> dict | None:
+    """宿主注入的会话标识只有完整会话 ID 才绑定。
 
     空白新建注入的是 8 位临时标识，与 ``ses_…`` 无对应关系，不得前缀猜测。
     """
@@ -302,7 +305,11 @@ def _session_for_corral_ident(by_id: dict[str, dict], ident: str) -> dict | None
     return None
 
 
-def _apply_live_flags(sessions: list[dict], created_ms: dict[str, int]) -> None:
+def _apply_live_flags(
+    sessions: list[dict],
+    created_ms: dict[str, int],
+    host: HostExtension | None = None,
+) -> None:
     """给 OpenCode 会话列表就地标注 live/pid。
 
     同一工作目录常会同时跑多个 TUI（空白新建 + 原生恢复 + 另一格新建）。
@@ -311,7 +318,7 @@ def _apply_live_flags(sessions: list[dict], created_ms: dict[str, int]) -> None:
 
     绑定优先级（正向证据优先，禁止「同目录只留最新一条」）：
     1. 命令行 ``-s`` / ``--session``（原生恢复）；
-    2. 环境变量 ``CORRAL_SESSION_ID`` / ``SC_SESSION_ID``（仅完整会话 id）；
+    2. 宿主注入的会话标识（仅完整会话 id，由扩展提供）；
     3. ``-c`` / ``--continue`` → 该 cwd 尚未标记的最新一条；
     4. 其余 TUI：同一 cwd 里，把会话认领给「启动时间不晚于创建时间」且
        启动最晚的那个进程（进程先到、会话随后落盘）。
@@ -342,9 +349,9 @@ def _apply_live_flags(sessions: list[dict], created_ms: dict[str, int]) -> None:
                 _mark_live(by_id[session_id], pid)
             bound_pids.add(pid)
             return
-        env = process_environ(pid)
-        ident = hosted_session_id(env)
-        session = _session_for_corral_ident(by_id, ident)
+        env = process_environ(pid, extra_keys=host.env_keys if host is not None else ())
+        ident = host_session_ident(env, host)
+        session = _session_for_host_ident(by_id, ident)
         if session is not None:
             _mark_live(session, pid)
             bound_pids.add(pid)
@@ -518,7 +525,11 @@ def error_text_from_msg(msg: object) -> str:
 
 
 
-def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
+def _build_session_info(
+    row: sqlite3.Row,
+    db_path: str,
+    host: HostExtension | None = None,
+) -> dict | None:
     cwd = row["directory"] or ""
     first_user = str(row["first_user_text"] or "")
     native_title = row["title"] or None
@@ -561,9 +572,9 @@ def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
         fallback_title=fallback,
         status_tag=status,
         path=db_path,
-        first_user_msg=first_user,
-        last_user_msg=str(row["last_user_text"] or ""),
-        last_agent_msg=last_agent_text,
+        first_user_msg=preprocess_excerpt(first_user, host),
+        last_user_msg=preprocess_excerpt(str(row["last_user_text"] or ""), host),
+        last_agent_msg=preprocess_excerpt(last_agent_text, host),
         completion_id=completion_id_for(
             file_mtime=mtime,
             size_bytes=size_bytes,
@@ -574,7 +585,10 @@ def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
 
 
 def _build_session_info_v2(
-    conn: sqlite3.Connection, row: sqlite3.Row, db_path: str
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    db_path: str,
+    host: HostExtension | None = None,
 ) -> dict | None:
     """v2 单会话列表项：预览/状态/大小全部从 session_message 现算。
 
@@ -637,9 +651,9 @@ def _build_session_info_v2(
         fallback_title=fallback,
         status_tag=status,
         path=db_path,
-        first_user_msg=first_user,
-        last_user_msg=last_user,
-        last_agent_msg=last_agent_text,
+        first_user_msg=preprocess_excerpt(first_user, host),
+        last_user_msg=preprocess_excerpt(last_user, host),
+        last_agent_msg=preprocess_excerpt(last_agent_text, host),
         completion_id=completion_id_for(
             file_mtime=mtime,
             size_bytes=size_bytes,
@@ -679,7 +693,12 @@ def scan_signature() -> tuple | None:
     return (tuple(file_signature), live_signature)
 
 
-def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[SessionInfo]:
+def scan_sessions(
+    cwd_filter: str | None = None,
+    limit: int = 50,
+    *,
+    host: HostExtension | None = None,
+) -> list[SessionInfo]:
     """扫描所有 OpenCode 数据目录下的会话，返回统一结构列表，按 mtime 降序。
 
     每个数据目录一条 SQL 拿候选（已过滤子代理会话和已归档会话），条数按
@@ -687,6 +706,13 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
     会占满 SQL 窗口，真实会话在边界进进出出，侧边栏自己乱跳。实测单条 SQL
     （含四个预览子查询）仍是个位数到几十毫秒，远在首屏 ≤1s 预算内。
     """
+    db_paths = _db_paths()
+    successful_queries = 0
+    results: list[dict] = []
+    created_ms: dict[str, int] = {}
+    host_marker = host.title_prompt_marker if host is not None else None
+    host_prefixes = ephemeral_prefixes_for(host)
+    query_limit = max(limit * _SCAN_OVERFETCH, _SCAN_OVERFETCH_MIN, limit)
     db_paths = _db_paths()
     successful_queries = 0
     results: list[dict] = []
@@ -704,22 +730,22 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
             conn.close()
         successful_queries += 1
         for row in rows:
-            info = _build_session_info(row, db_path)
+            info = _build_session_info(row, db_path, host)
             if info is None:
                 continue
-            # 标题生成用 `opencode run` 会真实落盘会话；用固定前缀拦掉自产噪音。
+            # 标题生成用 `opencode run` 会真实落盘会话；用宿主标记拦掉自产噪音。
             # 原生标题也要查：OpenCode 常把生成结果写成 `{"runtime:id": "标题"}`，
             # 或把被总结的那条会话的标题套到这条一次性任务上。
             first_user = str(info.get("first_user_msg") or "")
             fallback = str(info.get("fallback_title") or "")
             native = str(info.get("native_title") or "")
             if (
-                titles.is_title_generation_prompt(first_user)
-                or titles.is_title_generation_prompt(fallback)
-                or titles.is_title_generation_prompt(native)
+                titles.is_title_generation_prompt(first_user, marker=host_marker)
+                or titles.is_title_generation_prompt(fallback, marker=host_marker)
+                or titles.is_title_generation_prompt(native, marker=host_marker)
             ):
                 continue
-            if is_ephemeral_agent_cwd(info["cwd"]):
+            if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
                 continue
             if cwd_filter and not info["cwd"].startswith(cwd_filter):
                 continue
@@ -742,7 +768,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
         try:
             for row in v2_rows:
                 try:
-                    info = _build_session_info_v2(conn, row, db_path)
+                    info = _build_session_info_v2(conn, row, db_path, host)
                 except sqlite3.Error:
                     continue  # 单会话预览失败只跳过该会话，不连累同库其它 v2 行
                 if info is None:
@@ -751,12 +777,12 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
                 fallback = str(info.get("fallback_title") or "")
                 native = str(info.get("native_title") or "")
                 if (
-                    titles.is_title_generation_prompt(first_user)
-                    or titles.is_title_generation_prompt(fallback)
-                    or titles.is_title_generation_prompt(native)
+                    titles.is_title_generation_prompt(first_user, marker=host_marker)
+                    or titles.is_title_generation_prompt(fallback, marker=host_marker)
+                    or titles.is_title_generation_prompt(native, marker=host_marker)
                 ):
                     continue
-                if is_ephemeral_agent_cwd(info["cwd"]):
+                if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
                     continue
                 if cwd_filter and not info["cwd"].startswith(cwd_filter):
                     continue
@@ -772,7 +798,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
     results = results[:limit]
-    _apply_live_flags(results, created_ms)
+    _apply_live_flags(results, created_ms, host)
     return results
 
 

@@ -2,7 +2,7 @@
 """扫描 Codex 会话历史（~/.codex/sessions/），输出统一会话结构。
 
 移植自 agentsync 的 codex-session-continue/scripts/list_sessions.py，
-去掉了 CLI/表格输出，只保留 scan_sessions() 供 corral.py 消费。
+去掉了 CLI/表格输出，只保留 scan_sessions() 供调用方消费。
 """
 
 from __future__ import annotations
@@ -12,13 +12,21 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable, Mapping
 from datetime import datetime
 
 from sesskit import titles
 from sesskit.cache import file_signature, get_cache
-from sesskit.codex_claims import live_claims
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
-from sesskit.parsers.common import is_ephemeral_agent_cwd, live_pid_snapshot, stat_signature
+from sesskit.parsers.common import (
+    HostExtension,
+    ephemeral_prefixes_for,
+    host_cache_tag,
+    is_ephemeral_agent_cwd,
+    live_pid_snapshot,
+    preprocess_excerpt,
+    stat_signature,
+)
 from sesskit.parsers.common import parse_timestamp as _parse_timestamp
 
 SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
@@ -223,7 +231,11 @@ def task_complete_error_text(payload: dict) -> str:
 _task_complete_error_text = task_complete_error_text
 
 
-def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
+def _build_session_info(
+    path: str,
+    index: dict[str, str],
+    host: HostExtension | None = None,
+) -> dict | None:
     """从一个 session 文件中提取统一结构。"""
     uuid = _extract_uuid_from_filename(path)
     if not uuid:
@@ -320,9 +332,9 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         fallback_title=fallback,
         status_tag=status,
         path=path,
-        first_user_msg=first_user_msg,
-        last_user_msg=last_user_msg,
-        last_agent_msg=last_agent_msg,
+        first_user_msg=preprocess_excerpt(first_user_msg, host),
+        last_user_msg=preprocess_excerpt(last_user_msg, host),
+        last_agent_msg=preprocess_excerpt(last_agent_msg, host),
         thread_source=thread_source,  # 运行时私有字段，见 SessionInfo 的 total=False 部分
         completion_id=completion_id_for(
             file_mtime=mtime,
@@ -429,6 +441,8 @@ def scan_sessions(
     limit: int = 50,
     *,
     include_missing_cwd: bool = False,
+    host_claim_provider: Callable[[str], Mapping[str, int]] | None = None,
+    host: HostExtension | None = None,
 ) -> list[SessionInfo]:
     """扫描 Codex 会话，返回统一结构列表，按 mtime 降序。
 
@@ -449,9 +463,12 @@ def scan_sessions(
     index_version = repr((file_signature(SESSION_INDEX), "response-item-v2"))
     all_files = _find_all_session_files()
     live_ids = _live_session_ids()
-    # 启动包装器已从 app-server 得到真实 thread id 时，回执优先于 lsof：
-    # 回执 pid 正是 tmux pane 顶层，避免多层 Codex 子进程带来的祖先链歧义。
-    live_ids.update(live_claims(SESSIONS_DIR))
+    provider = host_claim_provider
+    if provider is None and host is not None:
+        provider = host.codex_claim_provider
+    if provider is not None:
+        # Explicit host ownership is more precise than the native process probe.
+        live_ids.update(provider(SESSIONS_DIR))
 
     candidates: list[tuple[float, str]] = []
     for path in all_files:
@@ -471,16 +488,20 @@ def scan_sessions(
         return cached
 
     results: list[dict] = []
+    host_marker = host.title_prompt_marker if host is not None else None
+    host_prefixes = ephemeral_prefixes_for(host)
+    session_cache = host.cache if (host is not None and host.cache is not None) else get_cache()
+    cache_version = index_version + host_cache_tag(host)
     for _, path in candidates:
-        cache = get_cache()
-        info = cache.get_session("codex", path, index_version)
+        cache = session_cache
+        info = cache.get_session("codex", path, cache_version)
         if info is None:
             try:
-                info = _build_session_info(path, index)
+                info = _build_session_info(path, index, host)
             except OSError:
                 continue
             if info is not None:
-                cache.put_session("codex", path, info, index_version)
+                cache.put_session("codex", path, info, cache_version)
         if info is None:
             continue
         if info["thread_source"] == "subagent":
@@ -493,10 +514,10 @@ def scan_sessions(
         if not info["first_user_msg"] and info["fallback_title"] == "(无消息)":
             # 派生缓存可能来自更新前；让已有运行中空会话也立即获得可读标题。
             info["fallback_title"] = "Codex 新会话"
-        if titles.is_title_generation_prompt(info["first_user_msg"]):
-            continue  # 后台标题生成自产的噪音会话,和 Claude 侧同一套 PROMPT_MARKER 过滤
-        if is_ephemeral_agent_cwd(info["cwd"]):
-            continue  # OpenConductor 管家等 /tmp/oc-manager-* 自动任务，目录复活会刷屏
+        if titles.is_title_generation_prompt(info["first_user_msg"], marker=host_marker):
+            continue  # host's own background title-generation noise, filtered per scan
+        if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
+            continue  # host-declared automation workspaces whose dirs resurrect
         if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
             continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
         if cwd_filter and not info["cwd"].startswith(cwd_filter):

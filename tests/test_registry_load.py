@@ -125,6 +125,82 @@ def test_claude_image_first_prompt_is_scanned_with_history_path(tmp_path, monkey
     assert old_cache.info["fallback_title"].startswith("好像只有 Claude")
 
 
+def test_claude_midturn_queued_prompts_appear_in_conversation(tmp_path, monkeypatch):
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    session_id = "ea65960d-6d06-486d-9daa-e55b2ea668ca"
+    path = tmp_path / "projects" / "-tmp-project" / f"{session_id}.jsonl"
+    _write(
+        path,
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "cwd": str(cwd),
+                        "sessionId": session_id,
+                        "timestamp": "2026-09-29T05:08:40.829Z",
+                        "message": {"role": "user", "content": [{"type": "text", "text": "first prompt"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "attachment",
+                        "sessionId": session_id,
+                        "timestamp": "2026-09-29T05:10:24.263Z",
+                        "attachment": {
+                            "type": "queued_command",
+                            "prompt": "second prompt typed mid-turn",
+                            "origin": {"kind": "human"},
+                            "humanTurn": True,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "queue-operation",
+                        "operation": "enqueue",
+                        "sessionId": session_id,
+                        "timestamp": "2026-09-29T05:10:24.263Z",
+                        "content": "second prompt typed mid-turn",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "attachment",
+                        "sessionId": session_id,
+                        "timestamp": "2026-09-29T05:10:58.986Z",
+                        "attachment": {
+                            "type": "queued_command",
+                            "prompt": "third prompt typed mid-turn",
+                            "origin": {"kind": "human"},
+                            "humanTurn": True,
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+    )
+    monkeypatch.setattr(claude, "PROJECTS_DIR", str(path.parent.parent))
+    monkeypatch.setattr(claude, "SESSIONS_DIR", str(tmp_path / "sessions"))
+
+    sessions = claude.scan_sessions(limit=10)
+    assert len(sessions) == 1
+    assert sessions[0]["last_user_msg"] == "third prompt typed mid-turn"
+    assert [(m.role, m.text) for m in load_session_conversation(sessions[0])] == [
+        ("user", "first prompt"),
+        ("user", "second prompt typed mid-turn"),
+        ("user", "third prompt typed mid-turn"),
+    ]
+    events = load_events(dict(sessions[0]))
+    assert [e["text"] for e in events if e["type"] == "user_message"] == [
+        "first prompt",
+        "second prompt typed mid-turn",
+        "third prompt typed mid-turn",
+    ]
+
+
 def test_registry_rejects_missing_history():
     with pytest.raises(ConversationLoadError):
         load_session_conversation({"source": "claude", "id": "x", "path": "/no/such/file.jsonl"})

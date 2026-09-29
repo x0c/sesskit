@@ -175,6 +175,25 @@ class CodexTranscriptTests(unittest.TestCase):
             self.assertEqual(next(e for e in events if e.get("call_id") == "shell-1")["status"], "error")
             self.assertEqual(_assistant_texts(events), ["已经改好"])
 
+    def test_question_tool_kinds_cover_codex_async_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            _write_jsonl(path, [
+                {"type": "response_item", "payload": {
+                    "type": "function_call", "name": "request_user_input", "call_id": "q-1",
+                    "arguments": json.dumps({"questions": []}),
+                }},
+                {"type": "response_item", "payload": {
+                    "type": "function_call", "name": "request_user_input_async", "call_id": "q-2",
+                    "arguments": json.dumps({"questions": []}),
+                }},
+            ])
+            events = load_events(_session("codex", path))
+
+            self.assertEqual(_types(events), ["tool_call", "tool_call"])
+            self.assertEqual(next(e for e in events if e.get("id") == "q-1")["kind"], "question")
+            self.assertEqual(next(e for e in events if e.get("id") == "q-2")["kind"], "question")
+
 
 class KimiTranscriptTests(unittest.TestCase):
     def test_think_tool_args_result_note_and_origin_filter(self) -> None:
@@ -390,6 +409,60 @@ class PiTranscriptTests(unittest.TestCase):
             self.assertEqual(_thinking_texts(events), ["该读文件"])
             self.assertEqual(events[3]["input"]["path"], "/tmp/a.py")
             self.assertEqual(events[4]["output"], "print(1)")
+            self.assertEqual(events[0]["message_id"], "pi:session-1:entry:u1")
+            self.assertEqual(
+                {event["message_id"] for event in events[1:4]},
+                {"pi:session-1:entry:new"},
+            )
+            self.assertEqual(events[4]["message_id"], "pi:session-1:entry:tr")
+
+    def test_message_ids_group_parts_error_only_turn_and_question_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pi.jsonl"
+            _write_jsonl(path, [
+                {"type": "session", "id": "pi-questions"},
+                {"type": "message", "id": "ask-user", "parentId": None,
+                 "message": {"role": "assistant", "content": [
+                     {"type": "text", "text": "我需要确认一下"},
+                     {"type": "toolCall", "id": "ask-1", "name": "question",
+                      "arguments": {"question": "选哪个？", "options": ["A", "B"]}},
+                 ]}},
+                {"type": "message", "id": "tool-answer", "parentId": "ask-user",
+                 "message": {"role": "toolResult", "toolCallId": "ask-1", "content": "A"}},
+                {"type": "message", "id": "failed-turn", "parentId": "tool-answer",
+                 "message": {"role": "assistant", "stopReason": "error",
+                             "errorMessage": "Provider unavailable", "content": []}},
+            ])
+            events = load_events(_session("pi", path, "pi-questions"))
+            self.assertEqual(_types(events), [
+                "assistant_message", "tool_call", "tool_result", "assistant_message",
+            ])
+            self.assertEqual(events[0]["message_id"], events[1]["message_id"])
+            self.assertEqual(events[1]["input"], {"question": "选哪个？", "options": ["A", "B"]})
+            self.assertEqual(events[2]["call_id"], events[1]["id"])
+            self.assertEqual(events[2]["message_id"], "pi:pi-questions:entry:tool-answer")
+            self.assertEqual(events[3]["text"], "Provider unavailable")
+            self.assertEqual(events[3]["message_id"], "pi:pi-questions:entry:failed-turn")
+
+    def test_missing_native_message_ids_have_deterministic_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pi-v1.jsonl"
+            entries = [
+                {"type": "message", "message": {"role": "user", "content": "hello"}},
+                {"type": "message", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"},
+                ]}},
+            ]
+            _write_jsonl(path, entries)
+            session = _session("pi", path, "legacy-pi")
+            first = load_events(session)
+            second = load_events(session)
+            ids = [event["message_id"] for event in first]
+            self.assertEqual(ids, [
+                "pi:legacy-pi:message:1", "pi:legacy-pi:message:2", "pi:legacy-pi:message:2",
+            ])
+            self.assertEqual([event["message_id"] for event in second], ids)
 
 
 class RealHistoryPairingTests(unittest.TestCase):

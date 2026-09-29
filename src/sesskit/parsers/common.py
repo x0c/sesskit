@@ -11,9 +11,156 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
-from sesskit.hosted import PROCESS_ENV_KEYS
+GENERIC_ENV_KEYS: tuple[str, ...] = (
+    "SESSKIT_SESSION_ID",
+    "SESSKIT_RUNTIME",
+    "PI_CODING_AGENT_SESSION_DIR",
+)
+"""Process-environment keys SessKit reads without any host extension.
+
+Runtime-native or library-owned settings only. Host-specific keys (a host's
+session/claim identifiers) are supplied per scan via :class:`HostExtension`.
+"""
+
+GENERIC_SESSION_ID_KEYS: tuple[str, ...] = ("SESSKIT_SESSION_ID",)
+
+LEGACY_EPHEMERAL_PREFIXES: tuple[str, ...] = ("oc-manager-",)
+"""Automation-specific workspace prefix kept as the compat default.
+
+This exception exists for one downstream automation family, not as generic
+policy. New scan paths pass explicit prefixes per call (empty without a host);
+the legacy default only stays so older direct callers keep their behavior.
+"""
+
+
+@dataclass(frozen=True)
+class HostExtension:
+    """Optional per-scan host context. Absent by default, never process-global.
+
+    With ``host=None`` scanners use only native history plus generic process
+    evidence. A host supplies its own environment keys, claim providers,
+    isolation-directory predicate, title marker, excerpt transform, ephemeral
+    prefixes, and cache implementation. The extension must not alter native
+    parsing, manufacture evidence, mutate history, or add host fields to the
+    stable v1 payload.
+    """
+
+    name: str = ""
+    env_keys: tuple[str, ...] = ()
+    session_id_from_env: Callable[[dict[str, str]], str] | None = None
+    is_isolation_dir: Callable[[str], bool] | None = None
+    isolation_dirname: Callable[[str], str] | None = None
+    codex_claim_provider: Callable[[str], Mapping[str, int]] | None = None
+    pi_claims_provider: Callable[[], list[dict]] | None = None
+    pi_instance_env_key: str = ""
+    pi_live_map_dir: str | None = None
+    title_prompt_marker: str | None = None
+    title_noise_prefixes: tuple[str, ...] = ()
+    ephemeral_prefixes: tuple[str, ...] = ()
+    excerpt_preprocess: Callable[[str], str] | None = None
+    legacy_schema_ids: tuple[str, ...] = ()
+    cache: Any | None = None
+
+
+def native_session_id(env: dict[str, str] | None) -> str:
+    """Host-neutral session ident from generic keys only (``SESSKIT_*``)."""
+    if not env:
+        return ""
+    for key in GENERIC_SESSION_ID_KEYS:
+        value = env.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def host_session_ident(
+    env: dict[str, str] | None,
+    host: HostExtension | None,
+) -> str:
+    """Native ident first, then the host's own interpretation of the same env.
+
+    With no host (or no host callback) only generic keys bind. Host keys are
+    read from the process but never interpreted without an extension.
+    """
+    ident = native_session_id(env)
+    if ident:
+        return ident
+    if host is not None and host.session_id_from_env is not None and env:
+        try:
+            return str(host.session_id_from_env(dict(env)) or "")
+        except Exception:  # noqa: BLE001 — a host callback must never break a scan
+            return ""
+    return ""
+
+
+def resolve_scan_cache(host: HostExtension | None) -> Any:
+    """Per-scan cache: the host's implementation wins, else the shared default.
+
+    The process-global setter in ``sesskit.cache`` remains only for backward
+    compatibility; two hosts in one process must each pass their own cache.
+    """
+    if host is not None and host.cache is not None:
+        return host.cache
+    from sesskit.cache import get_cache
+
+    return get_cache()
+
+
+def ephemeral_prefixes_for(host: HostExtension | None) -> tuple[str, ...]:
+    """Automation prefixes for this scan: the host's own, else none (neutral)."""
+    if host is None:
+        return ()
+    return tuple(host.ephemeral_prefixes)
+
+
+def host_cache_tag(host: HostExtension | None) -> str:
+    """Cache-version tag isolating host-transformed records per extension.
+
+    Excerpts may carry the host's transform, so cached records must never be
+    shared between different extensions (or between hosted and neutral scans).
+    Empty for ``host=None`` so neutral scans keep the existing cache keys.
+    """
+    if host is None:
+        return ""
+    return repr((
+        "host",
+        host.name,
+        bool(host.excerpt_preprocess),
+        host.title_prompt_marker,
+        tuple(host.ephemeral_prefixes),
+        tuple(host.title_noise_prefixes),
+    ))
+
+
+def preprocess_excerpt(text: str | None, host: HostExtension | None) -> str | None:
+    """Apply the host's excerpt transform (e.g. wrapper peeling), else as-is."""
+    if text is None:
+        return None
+    if host is not None and host.excerpt_preprocess is not None:
+        try:
+            return host.excerpt_preprocess(str(text))
+        except Exception:  # noqa: BLE001 — a host callback must never break a scan
+            return text
+    return text
+
+
+def title_noise_hit(texts: object, host: HostExtension | None) -> bool:
+    """True when any text carries the host's title-generation marker.
+
+    With no host (or no marker) this is always False: ordinary native prompts
+    stay listable. Legacy callers that omit the marker keep the old default
+    via ``titles.is_title_generation_prompt``.
+    """
+    if host is None or not host.title_prompt_marker:
+        return False
+    marker = host.title_prompt_marker
+    items = texts if isinstance(texts, (list, tuple)) else [texts]
+    return any(isinstance(item, str) and marker in item for item in items)
 
 
 def shorten_cwd(cwd: str) -> str:
@@ -27,16 +174,21 @@ def shorten_cwd(cwd: str) -> str:
 EPHEMERAL_MARKER = ".sesskit-ignore"
 
 
-def is_ephemeral_agent_cwd(cwd: str) -> bool:
+def is_ephemeral_agent_cwd(cwd: str, *, extra_prefixes: tuple[str, ...] | None = None) -> bool:
     """Disposable automation workspace whose sessions must never list.
 
     Two signals (see docs/CONTRACT.md "Listing modes"):
 
-    - a path segment starting with ``oc-manager-`` (OpenConductor manager jobs
-      under ``/tmp/oc-manager-*``; the dirs are deleted and recreated, so old
-      sessions would otherwise resurrect in bulk and flood the list);
+    - a path segment starting with one of ``extra_prefixes``;
     - a ``.sesskit-ignore`` file in the cwd or any ancestor, dropped by
       experiments / probes / evals that launch real agent sessions.
+
+    ``extra_prefixes=None`` keeps the legacy automation default
+    (``oc-manager-`` manager-job directories, deleted and recreated so old
+    sessions would otherwise resurrect in bulk). New scan paths pass explicit
+    prefixes per call — empty without a host extension — so the legacy
+    exception no longer leaks into neutral scans. Older direct callers that
+    omit the argument keep their behavior.
 
     A bare temp-directory prefix is deliberately not a signal: people also run
     real sessions from ``/tmp``. The automation that owns such a workspace can
@@ -47,7 +199,10 @@ def is_ephemeral_agent_cwd(cwd: str) -> bool:
         return False
     normalized = cwd.replace("\\", "/").rstrip("/")
     parts = [p for p in normalized.split("/") if p]
-    if any(p.startswith("oc-manager-") for p in parts):
+    prefixes = LEGACY_EPHEMERAL_PREFIXES if extra_prefixes is None else tuple(extra_prefixes)
+    if prefixes and any(
+        p.startswith(prefix) for p in parts for prefix in prefixes
+    ):
         return True
     return _has_ephemeral_marker(cwd)
 
@@ -113,6 +268,7 @@ _KIND_BY_NAME = {
     "askuserquestion": "question",
     "askquestion": "question",
     "request_user_input": "question",
+    "request_user_input_async": "question",
     "question": "question",
 }
 
@@ -519,17 +675,22 @@ def process_command_line(pid: int) -> str:
     return text
 
 
-def process_environ(pid: int) -> dict[str, str]:
+def process_environ(
+    pid: int,
+    *,
+    extra_keys: tuple[str, ...] | list[str] = (),
+) -> dict[str, str]:
     """读取进程环境变量；失败返回空字典。
 
-    供扫描器从托管注入的 ``CORRAL_SESSION_ID`` / ``SC_SESSION_ID`` /
-    ``PI_CODING_AGENT_SESSION_DIR`` 精确绑会话。
-    Linux 读 ``/proc/<pid>/environ``；macOS 用 ``ps eww``（输出混在命令行尾部）。
-    同一 pid 在仍存活期间复用上一轮结果。
+    始终读取通用键（``SESSKIT_*``、运行时原生目录键）；宿主键由调用方经
+    ``extra_keys``（来自其扩展）显式声明。Linux 读 ``/proc/<pid>/environ``
+    返回全量环境；macOS 用 ``ps eww``（输出混在命令行尾部）只提取所需键。
+    同一 pid 在仍存活期间复用上一轮结果（macOS 按已提取键集的并集缓存）。
     """
+    wanted = tuple(dict.fromkeys((*GENERIC_ENV_KEYS, *(extra_keys or ()))))
     cached = _PROC_ENVIRON_CACHE.get(pid)
-    if cached is not None:
-        return dict(cached)
+    if cached is not None and set(wanted) <= set(cached):
+        return {key: cached[key] for key in wanted if key in cached}
     try:
         if sys.platform.startswith("linux"):
             with open(f"/proc/{pid}/environ", "rb") as f:
@@ -552,9 +713,11 @@ def process_environ(pid: int) -> dict[str, str]:
     except (OSError, subprocess.CalledProcessError, FileNotFoundError):
         _PROC_ENVIRON_CACHE[pid] = {}
         return {}
-    env: dict[str, str] = {}
-    # ps eww 把环境变量拼在同一行；只提取我们关心的键，避免把命令参数误当环境。
-    for key in PROCESS_ENV_KEYS:
+    env = dict(cached) if cached is not None else {}
+    # ps eww 把环境变量拼在同一行；只提取调用方声明的键，避免把命令参数误当环境。
+    for key in wanted:
+        if key in env:
+            continue
         marker = f"{key}="
         start = out.find(marker)
         if start < 0:
@@ -565,7 +728,7 @@ def process_environ(pid: int) -> dict[str, str]:
             end += 1
         env[key] = out[start:end]
     _PROC_ENVIRON_CACHE[pid] = env
-    return dict(env)
+    return {key: env[key] for key in wanted if key in env}
 
 
 def open_file_paths(pids: list[int]) -> dict[int, list[str]]:

@@ -139,8 +139,11 @@ class CodexCompletionIdTests(unittest.TestCase):
 
 
 class PiCompletionIdTests(unittest.TestCase):
-    def _pi_session(self, path: Path, leaf_text: str, stop_reason: str = "stop") -> Path:
+    def _pi_session(self, path: Path, leaf_text: str, stop_reason: str | None = "stop") -> Path:
         # v1 风格：message 无 id/parentId，按文件顺序平铺为活动分支。
+        assistant = {"role": "assistant", "content": leaf_text}
+        if stop_reason is not None:
+            assistant["stopReason"] = stop_reason
         entries = [
             {
                 "type": "session",
@@ -156,11 +159,7 @@ class PiCompletionIdTests(unittest.TestCase):
             {
                 "type": "message",
                 "timestamp": "2026-09-15T08:33:05.000Z",
-                "message": {
-                    "role": "assistant",
-                    "content": leaf_text,
-                    "stopReason": stop_reason,
-                },
+                "message": assistant,
             },
         ]
         path.write_text("\n".join(json.dumps(row) for row in entries) + "\n", encoding="utf-8")
@@ -195,6 +194,16 @@ class PiCompletionIdTests(unittest.TestCase):
             self.assertEqual(err["status_tag"], titles.STATUS_ABORTED)
             self.assertTrue(err.get("completion_id"))
             self.assertNotEqual(ok["completion_id"], err["completion_id"])
+
+    def test_nonterminal_tail_has_no_completion_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, reason in enumerate(("toolUse", "length", "deferred", "pending", None)):
+                with self.subTest(stop_reason=reason):
+                    path = self._pi_session(Path(tmp) / f"unknown-{index}.jsonl", "not confirmed", reason)
+                    info, _ = pi._build_session_info(str(path))
+                    assert info is not None
+                    self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+                    self.assertEqual(info["completion_id"], "")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,14 @@ import sys
 from sesskit import titles
 from sesskit.cache import get_cache
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
-from sesskit.parsers.common import is_ephemeral_agent_cwd, stat_signature
+from sesskit.parsers.common import (
+    HostExtension,
+    ephemeral_prefixes_for,
+    host_cache_tag,
+    is_ephemeral_agent_cwd,
+    preprocess_excerpt,
+    stat_signature,
+)
 from sesskit.parsers.common import parse_timestamp as _parse_timestamp
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects/")
@@ -130,6 +137,10 @@ def _last_texts(entries: list[dict]) -> tuple[str | None, str | None]:
             text = _extract_text(e.get("message", {}).get("content", ""))
             if text and text != INTERRUPTED_MARKER:
                 user = text
+        elif user is None and t == "attachment":
+            text = queued_command_text(e)
+            if text:
+                user = text
         elif agent is None and t == "assistant":
             content = e.get("message", {}).get("content", [])
             if isinstance(content, list):
@@ -174,6 +185,45 @@ def system_error_text(entry: object) -> str:
         return formatted
     return str(err.get("message") or "").strip()
 
+
+def queued_command_text(entry: object) -> str | None:
+    """Claude 中途追问：用户在助手工作时 typed 的新消息。
+
+    这类输入不落成 `type == "user"` 行，而是 `type == "attachment"` +
+    `attachment.type == "queued_command"`，正文在 `attachment.prompt`。
+    同一条还会伴随 `queue-operation` enqueue/remove 行，那两行只管调度，
+    不在这里读，避免一条算两次。
+    """
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("type") != "attachment":
+        return None
+    if entry.get("isMeta") or entry.get("isSidechain"):
+        return None
+    attachment = entry.get("attachment")
+    if not isinstance(attachment, dict):
+        return None
+    if attachment.get("type") != "queued_command":
+        return None
+    origin = attachment.get("origin")
+    origin_kind = origin.get("kind") if isinstance(origin, dict) else None
+    # 必须是明确的人类证据：缺 origin 不能默认当人类。实测 hook 注入的
+    # <task-notification> 有的 origin.kind 就是 "task-notification"，
+    # 有的干脆没有 origin；两类都不能放行。
+    if origin_kind not in ("human", "user") and attachment.get("humanTurn") is not True:
+        return None
+    prompt = attachment.get("prompt")
+    if not isinstance(prompt, str):
+        return None
+    text = prompt.strip()
+    if not text or text == INTERRUPTED_MARKER:
+        return None
+    # 纵深防御：hook 通知正文本身就是系统标记，形状上直接排除。
+    lowered = text.lower()
+    if lowered.startswith("<task-notification") or "<task-notification" in lowered[:200]:
+        return None
+    return text
+
 _LOW_VALUE_PROMPTS = {
     "继续",
     "继续吧",
@@ -194,18 +244,25 @@ _LOW_VALUE_PROMPTS = {
     "noresponserequested",
 }
 
-_NOISE_PROMPT_PREFIXES = (
-    titles.PROMPT_MARKER,
+_GENERIC_NOISE_PROMPT_PREFIXES = (
     "API Error:",
     "Base directory for this skill:",
     "No response requested.",
     "This page isn't working",
     "This page isn’t working",
     "You've hit your session limit",
-    "你是 OpenConductor 的管理者 Agent",
-    "你是 OpenConductor 的聊天意图解析器",
-    "你将看到一批编程助手会话的摘录",
 )
+
+def _noise_prompt_prefixes(host: HostExtension | None) -> tuple[str, ...]:
+    if host is None:
+        return _GENERIC_NOISE_PROMPT_PREFIXES
+    extra: list[str] = []
+    if host.title_prompt_marker:
+        extra.append(host.title_prompt_marker)
+    extra.extend(host.title_noise_prefixes)
+    if not extra:
+        return _GENERIC_NOISE_PROMPT_PREFIXES
+    return _GENERIC_NOISE_PROMPT_PREFIXES + tuple(extra)
 
 _IMAGE_TITLE_PREFIX = re.compile(r"^(?:\[Image\s*#\d+\]\s*)+", re.IGNORECASE)
 _SESSION_LIMIT_PREFIX = "You've hit your session limit"
@@ -233,7 +290,7 @@ def _normalize_title_line(line: str | None) -> str | None:
     return titles._normalize_title(line)
 
 
-def _is_low_value_title(text: str | None) -> bool:
+def _is_low_value_title(text: str | None, host: HostExtension | None = None) -> bool:
     line = _title_line(text)
     if not line:
         return True
@@ -248,7 +305,7 @@ def _is_low_value_title(text: str | None) -> bool:
         return True
     if len(compact) <= 8 and compact.startswith(("继续", "快点")):
         return True
-    return any(line.startswith(prefix) for prefix in _NOISE_PROMPT_PREFIXES)
+    return any(line.startswith(prefix) for prefix in _noise_prompt_prefixes(host))
 
 
 def _short_title(text: str) -> str:
@@ -256,10 +313,13 @@ def _short_title(text: str) -> str:
     return line[:60] + "…" if len(line) > 60 else line
 
 
-def _choose_claude_fallback_title(candidates: list[tuple[str, str | None]]) -> str:
+def _choose_claude_fallback_title(
+    candidates: list[tuple[str, str | None]],
+    host: HostExtension | None = None,
+) -> str:
     scored: list[tuple[int, str]] = []
     for source, text in candidates:
-        if _is_low_value_title(text):
+        if _is_low_value_title(text, host):
             continue
         title = _short_title(str(text))
         if not title:
@@ -298,7 +358,7 @@ def _prefer_claude_native_title(current: str | None, incoming: str | None) -> st
     return incoming
 
 
-def _is_internal_claude_session(entries: list[dict]) -> bool:
+def _is_internal_claude_session(entries: list[dict], session_id: str | None = None) -> bool:
     """Teammates/subagent 会话：非用户直接发起的顶层 Claude 会话。
 
     只看会话开头的身份，见到首条非 meta 用户消息就停。Claude 2.1+ 会给
@@ -306,7 +366,19 @@ def _is_internal_claude_session(entries: list[dict]) -> bool:
     消息之后；若扫完整头部任意一处命中就当内部会话，正在用的真会话会
     从列表消失。Teammates 文件的 ``agent-name`` / ``isSidechain`` 出现在
     首条用户消息之前。
+
+    后台 continuation 文件（2.1.284 `continued-in`）开头是一段盖着新 id
+    的元数据块（ai-title/agent-name/last-prompt…），`agent-name` 落在首条
+    用户消息之前，不能只凭早 agent-name 判内部会话。这类文件的记录自带
+    蛇形 `session_id` 回指（与文件名 id 不同），见到即豁免。
     """
+    if session_id:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            back = entry.get("session_id")
+            if isinstance(back, str) and back.strip() and back.strip() != session_id:
+                return False
     for entry in entries:
         if entry.get("isSidechain"):
             return True
@@ -319,10 +391,14 @@ def _is_internal_claude_session(entries: list[dict]) -> bool:
     return False
 
 
-def _build_session_info(fpath: str, proj: str) -> dict | None:
+def _build_session_info(
+    fpath: str,
+    proj: str,
+    host: HostExtension | None = None,
+) -> dict | None:
     session_id = os.path.basename(fpath).replace(".jsonl", "")
     head_entries = _read_head(fpath)
-    if _is_internal_claude_session(head_entries):
+    if _is_internal_claude_session(head_entries, session_id):
         return None
     tail_entries = _read_tail(fpath)
 
@@ -375,6 +451,13 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
                 title_candidates.append(("last_user", text))
                 last_was_user = True
                 last_content_idx = idx
+        elif t == "attachment":
+            text = queued_command_text(e)
+            if text:
+                last_user_msg = text
+                title_candidates.append(("last_user", text))
+                last_was_user = True
+                last_content_idx = idx
         elif t == "assistant":
             content = e.get("message", {}).get("content", [])
             if isinstance(content, list):
@@ -399,7 +482,7 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
         if entry_time is not None and (event_time is None or entry_time > event_time):
             event_time = entry_time
     session_time, time_source = effective_session_time(stat.st_mtime, event_time)
-    fallback = _choose_claude_fallback_title(title_candidates)
+    fallback = _choose_claude_fallback_title(title_candidates, host)
 
     if last_error_text and last_error_idx > last_content_idx:
         # 上游报错（401/504/连接失败）且之后没有新的正文：本轮死在报错上。
@@ -439,9 +522,9 @@ def _build_session_info(fpath: str, proj: str) -> dict | None:
         fallback_title=fallback,
         status_tag=status_tag,
         path=fpath,
-        first_user_msg=first_user_msg,
-        last_user_msg=last_user_msg,
-        last_agent_msg=last_agent_msg,
+        first_user_msg=preprocess_excerpt(first_user_msg, host),
+        last_user_msg=preprocess_excerpt(last_user_msg, host),
+        last_agent_msg=preprocess_excerpt(last_agent_msg, host),
         completion_id=completion_id_for(
             file_mtime=stat.st_mtime,
             size_bytes=stat.st_size,
@@ -491,7 +574,7 @@ def _peek_head_meta(path: str, max_lines: int = 40) -> tuple[str | None, str | N
     """只读文件头部少量行，廉价探出 cwd、首条用户消息与 teammates/subagent 标记。
 
     对撞上首屏 1s 硬指标的两个根因做提前拦截：自产噪音会话（后台标题生成
-    调 claude/codex 留下的、以 PROMPT_MARKER 开头的会话）和 cwd 已删的会话，
+    留下的、以宿主标记开头的会话）和 cwd 已删的会话，
     不必等 _build_session_info 读完整 300 行头 + 64KB 尾才发现能丢弃。
     只要拿到 cwd 和首条用户消息就早停；两者任一没探到时上层不跳过，照常走
     完整解析（避免误杀头部很长的真实会话）。
@@ -499,6 +582,8 @@ def _peek_head_meta(path: str, max_lines: int = 40) -> tuple[str | None, str | N
     cwd: str | None = None
     first_user: str | None = None
     peeked: list[dict] = []
+    own_id = os.path.basename(path).replace(".jsonl", "")
+    foreign_pointer = False
     try:
         with open(path, errors="replace") as f:
             for i, line in enumerate(f):
@@ -512,17 +597,44 @@ def _peek_head_meta(path: str, max_lines: int = 40) -> tuple[str | None, str | N
                 except (json.JSONDecodeError, ValueError):
                     continue
                 peeked.append(obj)
+                back = obj.get("session_id")
+                if isinstance(back, str) and back.strip() and back.strip() != own_id:
+                    foreign_pointer = True
                 if cwd is None and obj.get("cwd"):
                     cwd = obj.get("cwd")
                 if obj.get("type") == "user" and first_user is None:
                     text = _extract_text(obj.get("message", {}).get("content", ""))
                     if text:
                         first_user = text
-                if cwd is not None and first_user is not None:
+                if cwd is not None and first_user is not None and (
+                    foreign_pointer or not _peek_internal_markers(peeked)
+                ):
                     break
     except OSError:
         pass
-    return cwd, first_user, _is_internal_claude_session(peeked)
+    return cwd, first_user, _is_internal_claude_session(peeked, own_id)
+
+
+def _peek_internal_markers(entries: list[dict]) -> bool:
+    """Whether the peeked prefix already shows teammates/subagent markers.
+
+    Only gates `_peek_head_meta`'s early exit: when markers are present but
+    no foreign `session_id` back-pointer has been seen yet, the peek keeps
+    reading (within its line budget) so a `continued-in` continuation file
+    is not misclassified as internal.
+    """
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("isSidechain"):
+            return True
+        if entry.get("type") == "agent-name" and entry.get("agentName"):
+            return True
+        if entry.get("type") == "user" and not entry.get("isMeta"):
+            text = _extract_text(entry.get("message", {}).get("content", ""))
+            if text and text.startswith(_TEAM_LEAD_DISPATCH_PREFIX):
+                return True
+    return False
 
 
 def _jsonl_stat_signature() -> tuple[tuple[str, int, int], ...]:
@@ -581,6 +693,7 @@ def scan_sessions(
     limit: int = 50,
     *,
     include_missing_cwd: bool = False,
+    host: HostExtension | None = None,
 ) -> list[SessionInfo]:
     """扫描所有项目下的 Claude Code 会话，返回统一结构列表，按 mtime 降序。
 
@@ -589,7 +702,7 @@ def scan_sessions(
     os.stat 按文件 mtime 排好序，只对最可能入选的候选文件做完整解析，凑够
     limit 条有效结果就停止。
 
-    ``include_missing_cwd=False``（默认）适合 Corral 恢复列表：项目目录已删的
+    ``include_missing_cwd=False``（默认）适合恢复列表：项目目录已删的
     会话无法原生 resume，直接丢掉。SessKit 归档/检索可传 True，只要历史文件
     仍在就保留。
 
@@ -631,6 +744,10 @@ def scan_sessions(
         return cached
 
     results: list[dict] = []
+    host_marker = host.title_prompt_marker if host is not None else None
+    host_prefixes = ephemeral_prefixes_for(host)
+    session_cache = host.cache if (host is not None and host.cache is not None) else get_cache()
+    cache_tag = host_cache_tag(host)
     for _mtime, fpath, proj in candidates:
         if len(results) >= limit:
             break
@@ -638,15 +755,18 @@ def scan_sessions(
         peek_cwd, peek_first_user, is_internal = _peek_head_meta(fpath)
         if is_internal:
             continue  # Teammates/subagent 内部会话，不是用户发起的顶层 chat
-        if titles.is_title_generation_prompt(peek_first_user):
+        if titles.is_title_generation_prompt(peek_first_user, marker=host_marker):
             continue  # 廉价探测已确认是自产噪音会话，跳过整文件解析
-        if peek_cwd and is_ephemeral_agent_cwd(peek_cwd):
-            continue  # OpenConductor 管家临时 cwd，目录复活会刷屏
+        if peek_cwd and is_ephemeral_agent_cwd(peek_cwd, extra_prefixes=host_prefixes):
+            continue  # 托管声明的临时 cwd，目录复活会刷屏
         if peek_cwd and not include_missing_cwd and not cached_isdir(peek_cwd):
             continue  # 廉价探测已确认 cwd 不存在，跳过整文件解析
 
-        cache = get_cache()
-        info = cache.get_session("claude", fpath)
+        cache = session_cache
+        if cache_tag:
+            info = cache.get_session("claude", fpath, cache_tag)
+        else:
+            info = cache.get_session("claude", fpath)
         if info is not None and (
             (
                 info.get("fallback_title") == "(仅本地命令)"
@@ -661,18 +781,35 @@ def scan_sessions(
             info = None
         if info is None:
             try:
-                info = _build_session_info(fpath, proj)
+                info = _build_session_info(fpath, proj, host)
             except OSError:
                 continue
             if info is not None:
-                cache.put_session("claude", fpath, info)
+                # Forward continuation pointer (`continued-in` may sit outside
+                # the head/tail windows, hence the dedicated full-file sweep
+                # with a substring pre-filter). Runs only on cache miss: the
+                # pointer arrives via a file write, which already invalidates
+                # this path's cache entry.
+                from sesskit.relations import claude_continuation_target
+
+                target = claude_continuation_target(fpath)
+                if (
+                    target
+                    and target != info["id"]
+                    and os.path.isfile(os.path.join(os.path.dirname(fpath), target + ".jsonl"))
+                ):
+                    info["superseded_by"] = target
+                if cache_tag:
+                    cache.put_session("claude", fpath, info, cache_tag)
+                else:
+                    cache.put_session("claude", fpath, info)
         if info is None:
             continue
         if not info["first_user_msg"] or info["fallback_title"] == "(仅本地命令)":
             continue  # 无用户消息的空会话
-        if titles.is_title_generation_prompt(info["first_user_msg"]):
-            continue  # sc 自己生成标题留下的噪音会话，跳过（廉价探测失手时的兜底）
-        if is_ephemeral_agent_cwd(info["cwd"]):
+        if titles.is_title_generation_prompt(info["first_user_msg"], marker=host_marker):
+            continue  # 自产标题噪音会话，跳过（廉价探测失手时的兜底）
+        if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
             continue
         if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
             continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
@@ -758,6 +895,14 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                         continue
                     text = _extract_text(message.get("content", ""))
                     if text and text != _INTERRUPTED_MARKER:
+                        flush_legacy_answer()
+                        flush_error()
+                        messages.append(ConversationMessage("user", text, _entry_time(entry)))
+                    continue
+
+                if entry_type == "attachment":
+                    text = queued_command_text(entry)
+                    if text:
                         flush_legacy_answer()
                         flush_error()
                         messages.append(ConversationMessage("user", text, _entry_time(entry)))

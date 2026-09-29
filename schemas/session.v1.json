@@ -58,7 +58,7 @@
     },
     "completion_id": {
       "type": "string",
-      "description": "Stable per-round completion identity; empty unless terminal (done/aborted). Used by Corral for dedup."
+      "description": "Stable per-round completion identity; empty unless terminal (done/aborted). Used by consumers for dedup."
     },
     "history_path": {
       "type": "string"

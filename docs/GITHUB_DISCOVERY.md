@@ -38,3 +38,5 @@ Do **not** copy their product claims (usage dashboards, Chrome exporters for cla
 ## About fields (separate from git)
 
 Pushing README does **not** update GitHub About. After changing description/topics, use the API (`gh api -X PATCH` / `PUT …/topics`). Keep Topics aligned with real platforms (no `windows` until Windows is supported).
+
+<!-- 该文档整理/压缩于 2026-09-29 -->

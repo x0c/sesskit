@@ -31,7 +31,10 @@ sesskit show <会话id或前缀> --full
 sesskit share <会话id> --out /tmp/share.json
 sesskit export --since 7d --out /tmp/week.json
 sesskit describe
+sesskit verify --sample 30
 ```
+
+修改解析器或加载链路后，`sesskit verify` 是必跑的真实历史门禁：各运行时加载计数、typed 与 v1 对等检查、不变量违反、事件/证据/结局分布，以及扫描与加载耗时——只输出计数与耗时，不输出内容与路径。对等或不变量失败时以非零退出码结束。
 
 命令均输出同一套 JSON envelope：
 

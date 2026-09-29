@@ -2,20 +2,43 @@
 
 Read, parse, and export local coding-agent session history into one schema.
 
-## Documentation navigation
+Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`, `opencode`, `kimi`, `cursor`, `pi`). No downstream-host coupling: no downstream product names, host-specific paths, or host-owned semantics belong in docs, code, or schemas.
 
-- `README.md` / `README.zh-CN.md`: **must read** before changing public CLI/API surface, install instructions, or open-source facade — wrong install channel (e.g. claiming PyPI while unpublished) breaks stranger onboarding.
-- `docs/GITHUB_DISCOVERY.md`: **must read** before changing GitHub About description, Topics, or the README first screen — skipping it reuses Corral TUI search queries, or describes SessKit as a session manager.
-- `schemas/*.json` and `src/sesskit/schemas/*.json`: **must read** before changing JSON envelope fields or transcript event types — keep both copies identical; breaking the contract breaks every language consumer and Corral Homebrew’s vendored sdist.
-- `docs/CONTRACT.md`: **must read** before adding a runtime parser, changing status/event enums, changing session-dict vs path load wiring, export/share write safety, listing filters (`include_missing_cwd`), Pi branch restore, **Cursor list `scan_signature` vs conversation WAL versioning**, error vs empty-transcript semantics, **`status_tag` / abnormal endings (rate limit, quota, provider error)**, designing Corral “job finished” notifications on SessKit fields, or verification of parse correctness — skipping it reintroduces “tests green / real show broken”, **false `STATUS_DONE` on usage-limit Codex**, **dropped Pi `errorMessage` rows in `load_events`**, history overwrite, system-noise in previews, Corral TUI full-rescan storms from list-level WAL, or Corral recover-list regressions.
+## 文档导航
+
+- Read the documents whose described content is relevant to the current task.
+
+- `README.md` / `README.zh-CN.md`: public CLI/API surface, install instructions, and open-source facade.
+- `docs/GITHUB_DISCOVERY.md`: About description, Topics, and README first-screen rules with need-query baselines; skipping it reuses session-manager search queries or misdescribes SessKit as a session manager.
+- `docs/CONTRACT.md`: session contract — envelope, schemas, load wiring, listing modes, write safety, status tags and abnormal endings, and verification.
+- `schemas/*.json` and `src/sesskit/schemas/*.json`: JSON envelope fields and transcript event types; both copies stay identical.
+- `docs/RUNTIME_PARSING_KNOWLEDGE_BASE.md`: Native history parsing for six runtimes: scan, plain-turn load, liveness, versioning, and per-runtime success versus abnormal signals.
+- `docs/UNIFIED_ABSTRACTION_KNOWLEDGE_BASE.md`: Unified abstraction over all runtimes: session and conversation models, transcript and typed activity events, outcomes, errors, tool results, evidence, and JSON Schemas.
+- `docs/ABSTRACTION_REDESIGN.md`: Target cross-runtime abstraction: current design problems, adapter/capability, turn, typed event and error-taxonomy design, invariants, staged migration, and research evidence.
+- `docs/LISTING_CLI_EXPORT_KNOWLEDGE_BASE.md`: Listing, search, show, export, share, and describe surface: JSON envelope, reference resolution, excerpt rules, and atomic write safety.
 
 ## Hard constraints (agent)
 
 - Public load for a scanned session goes through `load_session_conversation` / `RuntimeParser.load_conversation(session)`. Parser modules remain path-based (OpenCode: db + id).
 - Cursor list-level `scan_signature` must omit `store.db-wal`; conversation / `extra_version` must still include WAL (`docs/CONTRACT.md`).
-- When improving SessKit for Corral consumers, co-changing Corral is allowed and expected; keep Corral’s recover-list cwd filter and soft-fail-on-missing-history unless the product owner explicitly changes them.
+- Keep the default missing-`cwd` drop for resume-style listings and the missing-history error (`ConversationLoadError` → error envelope); never disguise unreadable history as an empty success.
 - After parser / load / transcript / status-inference changes: run real-wiring tests **and** fine-grained live checks per installed runtime — success path plus abnormal path when reproducible; assert `status_tag`, `last_agent_msg`, and `load_events` on the **exact** session file/id (`docs/CONTRACT.md` Verification + Status tags). Fixture-only or single-runtime sampling is not enough.
 - Abnormal endings that exist in native history (quota, rate limit, provider error, abort) must surface through SessKit; never map error-bearing “complete” markers to `STATUS_DONE`, and never drop error-only assistant turns from `load_events`.
+
+## 领域地图（doc-init）
+
+<!-- 覆盖度复核基线：2026-09-29 · 源码指纹 扫描 78 文件 / Python 38 / 0 子模块 · 基线提交 137946f -->
+
+| 领域 | 入口锚点 |
+|------|---------|
+| Runtime session parsing | src/sesskit/parsers/ |
+| Unified abstraction layer | src/sesskit/models.py, src/sesskit/registry.py, src/sesskit/transcript.py, src/sesskit/activity.py |
+| Listing, CLI and export surface | src/sesskit/cli.py, src/sesskit/registry.py, schemas/ |
+| Distribution and versioning | pyproject.toml, schemas/ |
+
+## 待补充知识库（doc-init backlog）
+
+- [待补充] Distribution versioning KB — Entry anchor: pyproject.toml; Content summary: Install channels, release sdist and dual-copy schema versioning, and the mandatory parser verification workflow.
 
 ## Remote
 

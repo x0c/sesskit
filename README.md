@@ -31,7 +31,14 @@ sesskit show <session-id-or-prefix> --full
 sesskit share <session-id> --out /tmp/share.json
 sesskit export --since 7d --out /tmp/week.json
 sesskit describe
+sesskit verify --sample 30
 ```
+
+After changing parsers or load wiring, `sesskit verify` is the required
+real-history gate: per-runtime load counts, typed-vs-v1 parity, invariant
+violations, event/evidence/outcome distributions, and scan/load timings —
+counts and timings only, never content or paths. It exits non-zero on
+parity or invariant failures.
 
 Every command prints one JSON envelope:
 

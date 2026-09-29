@@ -1,5 +1,5 @@
 from sesskit.models import effective_session_time, make_session_info, session_key
-from sesskit.transcript import SCHEMA_ID, LEGACY_SCHEMA_IDS
+from sesskit.transcript import SCHEMA_ID, accepted_schema_ids
 
 
 def test_effective_session_time_stale():
@@ -29,4 +29,8 @@ def test_session_key():
 
 def test_schema_id():
     assert SCHEMA_ID == "sesskit.transcript/v1"
-    assert "corral.share/v1" in LEGACY_SCHEMA_IDS
+    assert accepted_schema_ids() == (SCHEMA_ID,)
+    assert accepted_schema_ids(legacy_ids=("corral.share/v1",)) == (
+        SCHEMA_ID,
+        "corral.share/v1",
+    )

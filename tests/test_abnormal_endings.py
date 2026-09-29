@@ -263,6 +263,145 @@ class PiAbnormalEndingTests(unittest.TestCase):
             self.assertEqual(info["status_tag"], titles.STATUS_DONE)
             self.assertEqual(info["last_agent_msg"], "PONG")
 
+    def test_user_owned_tail_remains_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pending.jsonl"
+            lines = [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "pi-pending",
+                    "timestamp": "2026-09-29T08:00:00.000Z",
+                    "cwd": "/tmp/demo",
+                },
+                {
+                    "type": "message",
+                    "id": "u1",
+                    "parentId": None,
+                    "timestamp": "2026-09-29T08:00:01.000Z",
+                    "message": {"role": "user", "content": "waiting for a reply"},
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            built = pi._build_session_info(str(path))
+            assert built is not None
+            info, _created = built
+            self.assertEqual(info["status_tag"], titles.STATUS_PENDING)
+            self.assertEqual(info["completion_id"], "")
+
+    def test_nonterminal_or_missing_stop_reason_is_unknown(self) -> None:
+        cases = (
+            (
+                "toolUse",
+                [
+                    {"type": "text", "text": "Still working"},
+                    {"type": "toolCall", "id": "call1", "name": "bash", "arguments": {}},
+                ],
+                "Still working",
+            ),
+            ("length", [{"type": "text", "text": "Truncated answer"}], "Truncated answer"),
+            ("deferred", [{"type": "text", "text": "Deferred answer"}], "Deferred answer"),
+            ("pending", [{"type": "text", "text": "Partial answer"}], "Partial answer"),
+            ("futureReason", [{"type": "text", "text": "Unrecognized terminal"}], "Unrecognized terminal"),
+            (None, [{"type": "text", "text": "Unconfirmed answer"}], "Unconfirmed answer"),
+            ("stop", [], ""),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, (stop_reason, content, expected_agent_text) in enumerate(cases):
+                with self.subTest(stop_reason=stop_reason):
+                    path = Path(tmp) / f"case-{index}.jsonl"
+                    assistant = {"role": "assistant", "content": content}
+                    if stop_reason is not None:
+                        assistant["stopReason"] = stop_reason
+                    lines = [
+                        {
+                            "type": "session",
+                            "version": 3,
+                            "id": f"pi-{index}",
+                            "timestamp": "2026-09-29T08:00:00.000Z",
+                            "cwd": "/tmp/demo",
+                        },
+                        {
+                            "type": "message",
+                            "id": "u1",
+                            "parentId": None,
+                            "timestamp": "2026-09-29T08:00:01.000Z",
+                            "message": {"role": "user", "content": "do the thing"},
+                        },
+                        {
+                            "type": "message",
+                            "id": "a1",
+                            "parentId": "u1",
+                            "timestamp": "2026-09-29T08:00:02.000Z",
+                            "message": assistant,
+                        },
+                    ]
+                    path.write_text(
+                        "\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8",
+                    )
+                    built = pi._build_session_info(str(path))
+                    assert built is not None
+                    info, _created = built
+                    self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+                    self.assertEqual(info["last_agent_msg"] or "", expected_agent_text)
+                    self.assertEqual(info["completion_id"], "")
+
+    def test_status_uses_only_the_active_branch_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "branched.jsonl"
+            lines = [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "pi-branch",
+                    "timestamp": "2026-09-29T08:00:00.000Z",
+                    "cwd": "/tmp/demo",
+                },
+                {
+                    "type": "message",
+                    "id": "u1",
+                    "parentId": None,
+                    "timestamp": "2026-09-29T08:00:01.000Z",
+                    "message": {"role": "user", "content": "first prompt"},
+                },
+                {
+                    "type": "message",
+                    "id": "done-branch",
+                    "parentId": "u1",
+                    "timestamp": "2026-09-29T08:00:02.000Z",
+                    "message": {"role": "assistant", "content": "Finished", "stopReason": "stop"},
+                },
+                {
+                    "type": "message",
+                    "id": "u2",
+                    "parentId": "u1",
+                    "timestamp": "2026-09-29T08:00:03.000Z",
+                    "message": {"role": "user", "content": "continue differently"},
+                },
+                {
+                    "type": "message",
+                    "id": "tool-branch",
+                    "parentId": "u2",
+                    "timestamp": "2026-09-29T08:00:04.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Working"},
+                            {"type": "toolCall", "id": "call2", "name": "bash", "arguments": {}},
+                        ],
+                        "stopReason": "toolUse",
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            built = pi._build_session_info(str(path))
+            assert built is not None
+            info, _created = built
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info["last_user_msg"], "continue differently")
+            self.assertEqual(info["last_agent_msg"], "Working")
+            self.assertEqual(info["completion_id"], "")
+
 
 def _claude_file_with_system_error(err: dict, follow_up_user: str | None = None) -> str:
     """Claude 2.1+ 风格 JSONL：用户提问 + system 报错，可选后续追问。"""

@@ -3,21 +3,35 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 from typing import Any
 
-from sesskit.parsers import claude as scan_claude
-from sesskit.parsers import codex as scan_codex
-from sesskit.parsers import cursor as scan_cursor
+from sesskit.adapters import get_adapter
 from sesskit.parsers import kimi as scan_kimi
-from sesskit.parsers import opencode as scan_opencode
-from sesskit.parsers import pi as scan_pi
-from sesskit.parsers.common import classify_tool, parse_timestamp
+from sesskit.parsers.common import classify_tool
 
 SCHEMA_ID = "sesskit.transcript/v1"
-LEGACY_SCHEMA_IDS = ("corral.share/v1",)
+LEGACY_SCHEMA_IDS: tuple[str, ...] = ()
+"""Legacy wire identifiers accepted without a host: none.
+
+A host that must still read its own historical payloads supplies them per
+call via :func:`accepted_schema_ids` (or the host extension's
+``legacy_schema_ids``); neutral readers accept only :data:`SCHEMA_ID`.
+"""
+
+
+def accepted_schema_ids(
+    *,
+    legacy_ids: tuple[str, ...] | list[str] = (),
+) -> tuple[str, ...]:
+    """Schema ids a reader accepts: the neutral id plus host legacy ids."""
+    seen = [SCHEMA_ID]
+    for ident in legacy_ids or ():
+        text = str(ident or "")
+        if text and text not in seen:
+            seen.append(text)
+    return tuple(seen)
 EVENT_TYPES = (
     "user_message",
     "assistant_message",
@@ -28,18 +42,24 @@ EVENT_TYPES = (
 
 _CODEX_EXEC_CMD_RE = re.compile(
     r'exec_command\(\s*\{.*?"cmd"\s*:\s*"((?:[^"\\]|\\.)*)"',
-    re.S,
+    re.DOTALL,
 )
 
 
 def load_events(session: dict) -> list[dict]:
-    """按会话 ``source`` 解析原始历史，返回统一事件列表（seq 从 1 起、文件序）。"""
+    """按会话 ``source`` 解析原始历史，返回统一事件列表（seq 从 1 起、文件序）。
+
+    Dispatch goes through the runtime adapter registry; each adapter owns
+    its v1 projection. Unknown runtimes and unreadable histories yield an
+    empty list at this layer.
+    """
     runtime_id = str(session.get("source") or "")
-    parser = _PARSERS.get(runtime_id)
-    if parser is None:
+    try:
+        adapter = get_adapter(runtime_id)
+    except KeyError:
         return []
     try:
-        return parser(session)
+        return adapter.load_events(session)
     except (OSError, sqlite3.Error, ValueError, TypeError):
         return []
 
@@ -110,13 +130,6 @@ def _json_args(raw: object) -> dict | str | list | None:
     return raw
 
 
-def _opencode_ts(value: object) -> float | None:
-    """OpenCode 的 time_created / time.created 一律是毫秒。"""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value) / 1000
-
-
 def _text_of(value: object) -> str:
     if value is None:
         return ""
@@ -132,7 +145,7 @@ def _text_of(value: object) -> str:
 
 _FAILURE_RE = re.compile(
     r"^(?:exit code:?\s*[1-9]|error:|traceback \(most recent call last\)|command failed|fatal:)",
-    re.I | re.M,
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -145,99 +158,18 @@ def _failed(value: object, explicit: bool | None = None) -> str:
     return "error" if _FAILURE_RE.search(text[:600]) else "ok"
 
 
-def _adjacent_dup(sink: _Sink, event_type: str, text: str) -> bool:
-    if not sink.events:
-        return False
-    last = sink.events[-1]
-    return last.get("type") == event_type and last.get("text") == text
-
-
 # --- Claude -----------------------------------------------------------------
 
 
 def _parse_claude(session: dict) -> list[dict]:
-    path = str(session.get("path") or "")
-    sink = _Sink()
-    # 与 load_conversation 同口径：重试多条报错只留最后一条；真实正文出现即恢复。
-    pending_error: str | None = None
-    pending_error_ts: float | None = None
+    # 单一解析源：typed 快照是真相，v1 只是兼容投影。
+    # to_v1_dicts 对 Claude 事件不加 message_id，与旧发射完全一致。
+    from sesskit.activity import load_activity, to_v1_dicts
 
-    def flush_error() -> None:
-        nonlocal pending_error, pending_error_ts
-        if pending_error and not _adjacent_dup(sink, "assistant_message", pending_error):
-            sink.add("assistant_message", pending_error_ts, text=pending_error)
-        pending_error = None
-        pending_error_ts = None
-
-    try:
-        handle = open(path, encoding="utf-8", errors="replace")
-    except OSError:
+    snapshot = load_activity(session)
+    if snapshot.state != "available":
         return []
-    with handle:
-        for line in handle:
-            try:
-                entry = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(entry, dict) or entry.get("isMeta") or entry.get("isSidechain"):
-                continue
-            if entry.get("type") == "system":
-                err_text = scan_claude.system_error_text(entry)
-                if err_text:
-                    pending_error = err_text
-                    pending_error_ts = scan_claude.entry_time(entry)
-                continue
-            message = entry.get("message")
-            if not isinstance(message, dict):
-                continue
-            ts = scan_claude.entry_time(entry)
-            entry_type = entry.get("type")
-            content = message.get("content")
-            if entry_type == "user":
-                origin = entry.get("origin")
-                origin_kind = origin.get("kind") if isinstance(origin, dict) else None
-                if isinstance(content, list):
-                    for part in content:
-                        if not isinstance(part, dict) or part.get("type") != "tool_result":
-                            continue
-                        sink.add(
-                            "tool_result",
-                            ts,
-                            call_id=str(part.get("tool_use_id") or ""),
-                            status="error" if part.get("is_error") else "ok",
-                            output=part.get("content"),
-                        )
-                if origin_kind not in (None, "human"):
-                    continue
-                text = scan_claude.extract_text(content or "")
-                if text and text != scan_claude.INTERRUPTED_MARKER:
-                    flush_error()
-                    sink.add("user_message", ts, text=text)
-                continue
-            if entry_type != "assistant" or not isinstance(content, list):
-                continue
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                part_type = part.get("type")
-                if part_type == "thinking":
-                    sink.add("thinking", ts, text=str(part.get("thinking") or part.get("text") or "").strip())
-                elif part_type == "text":
-                    text = str(part.get("text") or "").strip()
-                    if text:
-                        pending_error = None  # 真实正文落地=本轮已恢复
-                        pending_error_ts = None
-                    sink.add("assistant_message", ts, text=text)
-                elif part_type == "tool_use":
-                    sink.add(
-                        "tool_call",
-                        ts,
-                        id=str(part.get("id") or ""),
-                        name=str(part.get("name") or "tool"),
-                        input=_json_args(part.get("input")),
-                    )
-    flush_error()
-    return sink.events
+    return to_v1_dicts(snapshot)
 
 
 # --- Codex ------------------------------------------------------------------
@@ -272,69 +204,14 @@ def _codex_reasoning_text(payload: dict) -> str:
 
 
 def _parse_codex(session: dict) -> list[dict]:
-    path = str(session.get("path") or "")
-    sink = _Sink()
-    try:
-        handle = open(path, encoding="utf-8", errors="replace")
-    except OSError:
+    # 单一解析源：typed 快照是真相，v1 只是兼容投影（199/199 真实历史一致后切换）。
+    from sesskit.activity import load_activity, to_v1_dicts
+
+    snapshot = load_activity(session)
+    if snapshot.state != "available":
         return []
-    with handle:
-        for line in handle:
-            try:
-                entry = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            payload = entry.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            ts = scan_codex.entry_time(entry)
-            kind = payload.get("type")
-            user_text = scan_codex.user_message_text(entry)
-            if user_text:
-                if not _adjacent_dup(sink, "user_message", user_text):
-                    sink.add("user_message", ts, text=user_text)
-                continue
-            assistant_text = scan_codex.assistant_message_text(entry)
-            if assistant_text:
-                if not _adjacent_dup(sink, "assistant_message", assistant_text):
-                    sink.add("assistant_message", ts, text=assistant_text)
-                continue
-            if kind == "reasoning":
-                sink.add("thinking", ts, text=_codex_reasoning_text(payload))
-            elif kind == "function_call":
-                sink.add(
-                    "tool_call",
-                    ts,
-                    id=str(payload.get("call_id") or payload.get("id") or ""),
-                    name=str(payload.get("name") or "tool"),
-                    input=_json_args(payload.get("arguments")),
-                )
-            elif kind == "custom_tool_call":
-                name = str(payload.get("name") or "tool")
-                raw_input = str(payload.get("input") or "")
-                sink.add(
-                    "tool_call",
-                    ts,
-                    id=str(payload.get("call_id") or payload.get("id") or ""),
-                    name=name,
-                    input=_codex_custom_input(raw_input),
-                )
-            elif kind in {"function_call_output", "custom_tool_call_output"}:
-                output = payload.get("output")
-                sink.add(
-                    "tool_result",
-                    ts,
-                    call_id=str(payload.get("call_id") or ""),
-                    status=_failed(output),
-                    output=output,
-                )
-            elif kind == "task_complete":
-                text = str(payload.get("last_agent_message") or "").strip()
-                if not text:
-                    text = scan_codex.task_complete_error_text(payload)
-                if text and not _adjacent_dup(sink, "assistant_message", text):
-                    sink.add("assistant_message", ts, text=text)
-    return sink.events
+    return to_v1_dicts(snapshot)
+
 
 
 # --- Kimi -------------------------------------------------------------------
@@ -344,479 +221,85 @@ def _parse_kimi(session: dict) -> list[dict]:
     path = str(session.get("path") or "")
     sink = _Sink()
     try:
-        handle = open(path, encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-    with handle:
-        for entry in scan_kimi.iter_message_entries(handle):
-            ts = scan_kimi.event_time(entry)
-            user_text = scan_kimi.user_text(entry)
-            if user_text is not None:
-                sink.add("user_message", ts, text=user_text)
-                continue
-            event = entry.get("event")
-            if not isinstance(event, dict):
-                continue
-            event_type = event.get("type")
-            if event_type == "content.part":
-                part = event.get("part")
-                if not isinstance(part, dict):
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for entry in scan_kimi.iter_message_entries(handle):
+                ts = scan_kimi.event_time(entry)
+                user_text = scan_kimi.user_text(entry)
+                if user_text is not None:
+                    sink.add("user_message", ts, text=user_text)
                     continue
-                if part.get("type") == "think":
-                    sink.add("thinking", ts, text=str(part.get("think") or part.get("text") or "").strip())
-                elif part.get("type") == "text":
-                    sink.add("assistant_message", ts, text=str(part.get("text") or "").strip())
-            elif event_type == "tool.call":
-                sink.add(
-                    "tool_call",
-                    ts,
-                    id=str(event.get("toolCallId") or event.get("uuid") or ""),
-                    name=str(event.get("name") or "tool"),
-                    input=_json_args(event.get("args") if event.get("args") is not None else event.get("arguments")),
-                    description=event.get("description"),
-                )
-            elif event_type == "tool.result":
-                result = event.get("result")
-                output: object = result
-                note = None
-                if isinstance(result, dict):
-                    output = result.get("output") if "output" in result else result
-                    note = result.get("note")
-                sink.add(
-                    "tool_result",
-                    ts,
-                    call_id=str(event.get("toolCallId") or ""),
-                    status=_failed(output),
-                    output=output,
-                    note=note,
-                )
-    return sink.events
-
-
-# --- OpenCode ---------------------------------------------------------------
-
-
-_OPENCODE_TRANSCRIPT_SQL = """
-SELECT m.id AS message_id, m.time_created, m.data AS msg_data,
-       p.id AS part_id, p.time_created AS part_time, p.data AS part_data
-FROM message m LEFT JOIN part p ON p.message_id = m.id
-WHERE m.session_id = ?
-ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC, p.id ASC
-"""
-
-_OPENCODE_TRANSCRIPT_SQL_V2 = """
-SELECT type, seq, time_created, id, data
-FROM session_message
-WHERE session_id = ?
-ORDER BY seq ASC, time_created ASC, id ASC
-"""
-
-
-def _opencode_use_v2(db_path: str, session_id: str) -> bool:
-    """该会话是否走 v2 事件流。落在 v1 session 表里的 id（含双表并存的迁移行）
-    永远走 v1；只有 v1 表里没有、session_message 里有行时才走 v2。探针失败
-    （缺表、打不开）一律回落 v1，保持原有行为。"""
-    conn = scan_opencode.connect_ro(db_path)
-    if conn is None:
-        return False
-    try:
-        try:
-            hit = conn.execute(
-                "SELECT 1 FROM session WHERE id = ?", (session_id,)
-            ).fetchone()
-        except sqlite3.Error:
-            hit = None
-        if hit is not None:
-            return False
-        try:
-            hit = conn.execute(
-                "SELECT 1 FROM session_message WHERE session_id = ? LIMIT 1",
-                (session_id,),
-            ).fetchone()
-        except sqlite3.Error:
-            return False
-        return hit is not None
-    finally:
-        conn.close()
-
-
-def _parse_opencode_v2(db_path: str, session_id: str) -> list[dict]:
-    """v2 会话事件流：逐行读 session_message（seq 排序）。
-
-    - user 行 → user_message（data.text）。
-    - assistant 行展开 content[]：type='text' → assistant_message；
-      type='tool' → tool_call（item.id/.name，input=state.input）+ 状态为
-      completed/error 时跟 tool_result（completed 的 output 取
-      state.content[] 文本拼接，error 的 output 取原始 state.error）；
-      type='reasoning' 跳过（多为空串 + 密文，无事件价值）。
-    - compaction 行 → thinking（summary；与 v1 compaction 进 thinking 同口径）。
-    - system/synthetic/idle 一律不出事件（idle outcome 只定 status_tag）。
-    - assistant 行无文本但带 error → assistant_message 填 error 文本，不丢轮。
-    事件类型/字段沿用本模块现有体系，不新增类型。
-    """
-    sink = _Sink()
-    conn = scan_opencode.connect_ro(db_path)
-    if conn is None:
-        return []
-    try:
-        rows = conn.execute(_OPENCODE_TRANSCRIPT_SQL_V2, (session_id,)).fetchall()
-    except sqlite3.Error:
-        return []
-    finally:
-        conn.close()
-
-    for row in rows:
-        try:
-            data = json.loads(row["data"] or "{}") or {}
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        row_type = str(row["type"] or "")
-        created = data.get("time").get("created") if isinstance(data.get("time"), dict) else None
-        ts = _opencode_ts(created) or _opencode_ts(row["time_created"])
-        if row_type == "user":
-            text = data.get("text")
-            sink.add("user_message", ts, text=text if isinstance(text, str) else "")
-        elif row_type == "assistant":
-            content = data.get("content")
-            items = content if isinstance(content, list) else []
-            text_seen = False
-            for item in items:
-                if not isinstance(item, dict):
+                event = entry.get("event")
+                if not isinstance(event, dict):
                     continue
-                item_type = item.get("type")
-                if item_type == "text":
-                    text = item.get("text")
-                    if isinstance(text, str) and text.strip():
-                        text_seen = True
-                    sink.add("assistant_message", ts, text=text if isinstance(text, str) else "")
-                elif item_type == "tool":
-                    state = item.get("state") if isinstance(item.get("state"), dict) else {}
-                    call_id = str(item.get("id") or "")
+                event_type = event.get("type")
+                if event_type == "content.part":
+                    part = event.get("part")
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "think":
+                        sink.add("thinking", ts, text=str(part.get("think") or part.get("text") or "").strip())
+                    elif part.get("type") == "text":
+                        sink.add("assistant_message", ts, text=str(part.get("text") or "").strip())
+                elif event_type == "tool.call":
                     sink.add(
                         "tool_call",
                         ts,
-                        id=call_id,
-                        name=str(item.get("name") or "tool"),
-                        input=_json_args(state.get("input")),
+                        id=str(event.get("toolCallId") or event.get("uuid") or ""),
+                        name=str(event.get("name") or "tool"),
+                        input=_json_args(event.get("args") if event.get("args") is not None else event.get("arguments")),
+                        description=event.get("description"),
                     )
-                    status = str(state.get("status") or "")
-                    if status == "completed":
-                        out_texts = []
-                        state_content = state.get("content")
-                        if isinstance(state_content, list):
-                            for out_item in state_content:
-                                if (
-                                    isinstance(out_item, dict)
-                                    and out_item.get("type") == "text"
-                                    and isinstance(out_item.get("text"), str)
-                                    and out_item["text"].strip()
-                                ):
-                                    out_texts.append(out_item["text"].strip())
-                        sink.add(
-                            "tool_result",
-                            ts,
-                            call_id=call_id,
-                            status="ok",
-                            output="\n\n".join(out_texts),
-                        )
-                    elif status == "error":
-                        sink.add(
-                            "tool_result",
-                            ts,
-                            call_id=call_id,
-                            status="error",
-                            output=state.get("error"),
-                        )
-                # reasoning：跳过（见 docstring）。
-            if not text_seen and data.get("error"):
-                err_text = scan_opencode.error_text_from_msg(data)
-                sink.add("assistant_message", ts, text=err_text)
-        elif row_type == "compaction":
-            summary = data.get("summary")
-            sink.add("thinking", ts, text=summary if isinstance(summary, str) else "")
-        # system / synthetic / idle / 未知 type：不出事件。
+                elif event_type == "tool.result":
+                    result = event.get("result")
+                    output: object = result
+                    note = None
+                    if isinstance(result, dict):
+                        output = result.get("output") if "output" in result else result
+                        note = result.get("note")
+                    sink.add(
+                        "tool_result",
+                        ts,
+                        call_id=str(event.get("toolCallId") or ""),
+                        status=_failed(output),
+                        output=output,
+                        note=note,
+                    )
+    except OSError:
+        return []
     return sink.events
+
+
+# --- Cursor / OpenCode -------------------------------------------------------
 
 
 def _parse_opencode(session: dict) -> list[dict]:
-    db_path = str(session.get("path") or "")
-    session_id = str(session.get("id") or "")
-    if _opencode_use_v2(db_path, session_id):
-        return _parse_opencode_v2(db_path, session_id)
-    sink = _Sink()
-    conn = scan_opencode.connect_ro(db_path)
-    if conn is None:
+    # The typed adapter is the sole raw-history interpretation source.
+    from sesskit.activity import load_activity, to_v1_dicts
+
+    snapshot = load_activity(session)
+    if snapshot.state != "available":
         return []
-    try:
-        rows = conn.execute(_OPENCODE_TRANSCRIPT_SQL, (session_id,)).fetchall()
-    except sqlite3.Error:
-        return []
-    finally:
-        conn.close()
-
-    error_emitted: set[str] = set()
-    assistant_text_seen: set[str] = set()
-    for row in rows:
-        try:
-            msg = json.loads(row["msg_data"] or "{}") or {}
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(msg, dict):
-            continue
-        raw_part = row["part_data"] if "part_data" in row.keys() else None
-        if raw_part is None:
-            # LEFT JOIN miss: message has no parts (typical for error turns).
-            if msg.get("role") == "assistant" and str(row["message_id"] or "") not in error_emitted:
-                err_text = scan_opencode.error_text_from_msg(msg)
-                if err_text:
-                    created = (msg.get("time") or {}).get("created") if isinstance(msg.get("time"), dict) else None
-                    sink.add("assistant_message", _opencode_ts(created), text=err_text)
-                    error_emitted.add(str(row["message_id"] or ""))
-            continue
-        try:
-            part = json.loads(raw_part or "{}") or {}
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(part, dict) or part.get("synthetic") in (True, 1):
-            continue
-        role = msg.get("role")
-        created = (msg.get("time") or {}).get("created") if isinstance(msg.get("time"), dict) else None
-        ts = _opencode_ts(created) or _opencode_ts(row["part_time"])
-        part_type = part.get("type")
-        if part_type == "text":
-            text = str(part.get("text") or "").strip()
-            if role == "user":
-                sink.add("user_message", ts, text=text)
-            elif role == "assistant":
-                sink.add("assistant_message", ts, text=text)
-                if text:
-                    assistant_text_seen.add(str(row["message_id"] or ""))
-        elif part_type == "reasoning":
-            sink.add("thinking", ts, text=str(part.get("text") or "").strip())
-        elif part_type == "compaction":
-            text = str(part.get("text") or "").strip()
-            if not text and isinstance(part.get("state"), dict):
-                text = str(part["state"].get("summary") or part["state"].get("text") or "").strip()
-            sink.add("thinking", ts, text=text)
-        elif part_type == "tool":
-            state = part.get("state") if isinstance(part.get("state"), dict) else {}
-            call_id = str(part.get("callID") or row["part_id"] or "")
-            sink.add(
-                "tool_call",
-                ts,
-                id=call_id,
-                name=str(part.get("tool") or "tool"),
-                input=_json_args(state.get("input")),
-            )
-            status = str(state.get("status") or "")
-            if status in {"completed", "error"}:
-                output = state.get("output") if status == "completed" else state.get("error")
-                sink.add(
-                    "tool_result",
-                    ts,
-                    call_id=call_id,
-                    status="error" if status == "error" else "ok",
-                    output=output,
-                )
-    # Error turns with parts but no assistant text (e.g. only reasoning/tools):
-    # surface the provider error once per message so the turn isn't user-only.
-    seen_msgs: dict[str, dict] = {}
-    for row in rows:
-        try:
-            msg = json.loads(row["msg_data"] or "{}") or {}
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("error"):
-            mid = str(row["message_id"] or "")
-            if mid and mid not in seen_msgs:
-                seen_msgs[mid] = msg
-    for mid, msg in seen_msgs.items():
-        if mid in assistant_text_seen or mid in error_emitted:
-            continue
-        err_text = scan_opencode.error_text_from_msg(msg)
-        if err_text:
-            created = (msg.get("time") or {}).get("created") if isinstance(msg.get("time"), dict) else None
-            sink.add("assistant_message", _opencode_ts(created), text=err_text)
-    return sink.events
-
-
-# --- Cursor -----------------------------------------------------------------
+    return to_v1_dicts(snapshot)
 
 
 def _parse_cursor(session: dict) -> list[dict]:
-    path = str(session.get("path") or "")
-    store_path = path if path.endswith("store.db") else os.path.join(path, "store.db")
-    sink = _Sink()
+    # The typed adapter is the sole raw-history interpretation source.
+    from sesskit.activity import load_activity, to_v1_dicts
 
-    def fallback_prompts() -> list[dict]:
-        # Cursor's plain conversation falls back to prompt_history.json when
-        # the store has no readable messages. The event stream must agree.
-        for message in scan_cursor.load_conversation(store_path):
-            if message.role == "user":
-                sink.add("user_message", text=message.text)
-        return sink.events
-
-    if not os.path.isfile(store_path):
-        return fallback_prompts()
-    conn = scan_cursor.connect_store_ro(store_path)
-    if conn is None:
-        return fallback_prompts()
-    try:
-        rows = conn.execute(
-            "SELECT rowid, data FROM blobs WHERE substr(data, 1, 1) = X'7B' ORDER BY rowid"
-        ).fetchall()
-    except sqlite3.Error:
-        return fallback_prompts()
-    finally:
-        conn.close()
-
-    pending_results: dict[str, dict] = {}
-    emitted_calls: set[str] = set()
-
-    def emit_call(ts, call_id: str, name: str, args) -> None:
-        sink.add("tool_call", ts, id=call_id, name=name, input=_json_args(args))
-        if call_id:
-            emitted_calls.add(call_id)
-            held = pending_results.pop(call_id, None)
-            if held is not None:
-                sink.add("tool_result", **held)
-
-    def emit_result(call_id: str, output, status: str) -> None:
-        payload = {"call_id": call_id, "status": status, "output": output}
-        if call_id and call_id not in emitted_calls:
-            pending_results[call_id] = payload
-            return
-        sink.add("tool_result", **payload)
-
-    for _rowid, data in rows:
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            continue
-        raw = bytes(data)
-        if not raw.startswith(b"{"):
-            continue
-        try:
-            obj = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-            continue
-        if not isinstance(obj, dict):
-            continue
-        role = obj.get("role")
-        content = obj.get("content")
-        if role == "user":
-            text = scan_cursor.user_text_from_blob(obj)
-            if text:
-                sink.add("user_message", text=text)
-            continue
-        if role == "assistant":
-            if not isinstance(content, list):
-                text = str(content).strip() if isinstance(content, str) else ""
-                sink.add("assistant_message", text=text)
-                continue
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                part_type = part.get("type")
-                if part_type in {"thinking", "reasoning"}:
-                    sink.add("thinking", text=str(part.get("text") or part.get("thinking") or "").strip())
-                elif part_type == "text":
-                    sink.add("assistant_message", text=str(part.get("text") or "").strip())
-                elif part_type == "tool-call":
-                    emit_call(
-                        None,
-                        str(part.get("toolCallId") or ""),
-                        str(part.get("toolName") or "tool"),
-                        part.get("args"),
-                    )
-            continue
-        if role == "tool" and isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict) or part.get("type") != "tool-result":
-                    continue
-                result = part.get("result")
-                emit_result(str(part.get("toolCallId") or ""), result, _failed(result))
-    for held in pending_results.values():
-        sink.add("tool_result", **held)
-    return sink.events or fallback_prompts()
+    snapshot = load_activity(session)
+    if snapshot.state != "available":
+        return []
+    return to_v1_dicts(snapshot)
 
 
 # --- Pi ---------------------------------------------------------------------
 
 
 def _parse_pi(session: dict) -> list[dict]:
-    path = str(session.get("path") or "")
-    sink = _Sink()
-    for item in scan_pi.active_messages(scan_pi.read_entries(path)):
-        message = item.get("message")
-        if not isinstance(message, dict):
-            continue
-        ts = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
-        role = message.get("role")
-        if role == "user":
-            sink.add("user_message", ts, text=scan_pi.message_text(message.get("content")))
-            continue
-        if role == "toolResult":
-            output = message.get("content")
-            explicit = message.get("isError")
-            if explicit is None and message.get("error"):
-                explicit = True
-            sink.add(
-                "tool_result",
-                ts,
-                call_id=str(message.get("toolCallId") or ""),
-                status="error" if explicit else _failed(output, explicit if isinstance(explicit, bool) else None),
-                output=output,
-            )
-            continue
-        if role != "assistant":
-            continue
-        content = message.get("content")
-        emitted = False
-        if isinstance(content, str):
-            text = content.strip()
-            if text:
-                sink.add("assistant_message", ts, text=text)
-                emitted = True
-        elif isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                part_type = part.get("type")
-                if part_type == "thinking":
-                    thinking = str(part.get("thinking") or part.get("text") or "").strip()
-                    if thinking:
-                        sink.add("thinking", ts, text=thinking)
-                        emitted = True
-                elif part_type == "text":
-                    text = str(part.get("text") or "").strip()
-                    if text:
-                        sink.add("assistant_message", ts, text=text)
-                        emitted = True
-                elif part_type == "toolCall":
-                    sink.add(
-                        "tool_call",
-                        ts,
-                        id=str(part.get("id") or ""),
-                        name=str(part.get("name") or "tool"),
-                        input=_json_args(
-                            part.get("arguments") if part.get("arguments") is not None else part.get("input")
-                        ),
-                    )
-                    emitted = True
-        if not emitted:
-            stop_reason = str(message.get("stopReason") or "").strip()
-            error_text = str(message.get("errorMessage") or "").strip()
-            if error_text and (stop_reason in {"error", "aborted"} or error_text):
-                sink.add("assistant_message", ts, text=error_text)
-    return sink.events
+    # 单一解析源：typed 快照是真相，v1 只是兼容投影（含 message_id 分组）。
+    from sesskit.activity import load_activity, to_v1_dicts
 
-
-_PARSERS = {
-    "claude": _parse_claude,
-    "codex": _parse_codex,
-    "kimi": _parse_kimi,
-    "opencode": _parse_opencode,
-    "cursor": _parse_cursor,
-    "pi": _parse_pi,
-}
+    snapshot = load_activity(session)
+    if snapshot.state != "available":
+        return []
+    return to_v1_dicts(snapshot)

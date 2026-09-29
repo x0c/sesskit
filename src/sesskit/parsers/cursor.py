@@ -30,12 +30,16 @@ import sys
 
 from sesskit import titles
 from sesskit.cache import file_signature, get_cache
-from sesskit.hosted import hosted_session_id
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
 from sesskit.parsers.common import (
+    HostExtension,
+    ephemeral_prefixes_for,
+    host_cache_tag,
+    host_session_ident,
     is_ephemeral_agent_cwd,
     live_pid_snapshot,
     live_processes,
+    preprocess_excerpt,
     process_command_line,
     process_environ,
     stat_signature,
@@ -159,7 +163,11 @@ def _chat_size_bytes(chat_dir: str) -> int:
     return total
 
 
-def _build_session_info(chat_dir: str, chat_id: str) -> dict | None:
+def _build_session_info(
+    chat_dir: str,
+    chat_id: str,
+    host: HostExtension | None = None,
+) -> dict | None:
     meta = _read_json(os.path.join(chat_dir, "meta.json"))
     if not isinstance(meta, dict):
         return None
@@ -192,12 +200,12 @@ def _build_session_info(chat_dir: str, chat_id: str) -> dict | None:
 
     # 列表级只有 meta/prompt_history：没有助手最终答复的正向证据时，
     # 宁可未知也不报已完成——完成通知按 STATUS_DONE 触发，假 DONE 会误推
-    # 「干完了」（CONTRACT Status tags；完成通知设计 Slice 0）。
+    # 「干完了」（CONTRACT Status tags）。
     if last_user_msg and not native_title:
         status_tag = titles.STATUS_PENDING
     elif native_title and last_user_msg:
         # 有标题 + 至少一条用户话：上一轮大概率已收尾，但无助手正文证据，
-        # 仍按 DONE（历史行为），completion_id 为空，Corral 对此不推完成通知。
+        # 仍按 DONE（历史行为），completion_id 为空，消费者不得据此推完成通知。
         status_tag = titles.STATUS_DONE
     else:
         status_tag = titles.STATUS_NONE
@@ -205,7 +213,7 @@ def _build_session_info(chat_dir: str, chat_id: str) -> dict | None:
     size_bytes = _chat_size_bytes(chat_dir)
     store_db = os.path.join(chat_dir, "store.db")
     history_path = store_db if os.path.isfile(store_db) else chat_dir
-    # Cursor 列表级无助手正文证据：completion_id 留空，Corral 不推完成通知。
+    # Cursor 列表级无助手正文证据：completion_id 留空；终端态才有值。
     # store.db 详情里若读到助手最终答复，后续可在此补证据再发 id（见 Slice 0 设计）。
     completion_id = ""
     return make_session_info(
@@ -222,8 +230,8 @@ def _build_session_info(chat_dir: str, chat_id: str) -> dict | None:
         fallback_title=_fallback_title(native_title, first_user_msg, last_user_msg),
         status_tag=status_tag,
         path=history_path,
-        first_user_msg=first_user_msg,
-        last_user_msg=last_user_msg,
+        first_user_msg=preprocess_excerpt(first_user_msg, host),
+        last_user_msg=preprocess_excerpt(last_user_msg, host),
         # Cursor 历史里没有独立的「助手最终答复」字段可提取，保持空串。
         completion_id=completion_id,
     )
@@ -263,6 +271,7 @@ def scan_sessions(
     limit: int = 50,
     *,
     include_missing_cwd: bool = False,
+    host: HostExtension | None = None,
 ) -> list[SessionInfo]:
     """扫描 Cursor CLI 会话，按 mtime 降序；只读 meta/prompt_history，不打开 store.db。"""
     if not os.path.isdir(CHATS_DIR):
@@ -304,6 +313,9 @@ def scan_sessions(
         return cached
 
     results: list[dict] = []
+    host_marker = host.title_prompt_marker if host is not None else None
+    host_prefixes = ephemeral_prefixes_for(host)
+    session_cache = host.cache if (host is not None and host.cache is not None) else get_cache()
     for _, chat_dir, chat_id in candidates:
         if len(results) >= limit:
             break
@@ -314,27 +326,27 @@ def scan_sessions(
             file_signature(store_db),
             # WAL 里的未 checkpoint 写入不会 bump 主库 mtime；签名必须带上。
             file_signature(store_db + "-wal"),
-        ))
-        cache = get_cache()
+        )) + host_cache_tag(host)
+        cache = session_cache
         info = cache.get_session("cursor", meta_path, extra_version)
         if info is None:
-            info = _build_session_info(chat_dir, chat_id)
+            info = _build_session_info(chat_dir, chat_id, host)
             if info is not None:
                 cache.put_session("cursor", meta_path, info, extra_version)
         if info is None:
             continue
-        # 标题生成用 `agent -p` 会落盘会话；用固定前缀拦掉自产噪音。
+        # 标题生成用 `agent -p` 会落盘会话；用宿主标记拦掉自产噪音。
         first_user = str(info.get("first_user_msg") or "")
         fallback = str(info.get("fallback_title") or "")
         native = str(info.get("native_title") or "")
         if (
-            titles.is_title_generation_prompt(first_user)
-            or titles.is_title_generation_prompt(fallback)
-            or titles.is_title_generation_prompt(native)
+            titles.is_title_generation_prompt(first_user, marker=host_marker)
+            or titles.is_title_generation_prompt(fallback, marker=host_marker)
+            or titles.is_title_generation_prompt(native, marker=host_marker)
         ):
             continue
-        if is_ephemeral_agent_cwd(info["cwd"]):
-            continue  # OpenConductor 管家临时 cwd，目录复活会刷屏
+        if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
+            continue  # 宿主声明的临时 cwd，目录复活会刷屏
         if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
             continue
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
@@ -346,7 +358,7 @@ def scan_sessions(
     if not results:
         return results
 
-    _apply_live_flags(results)
+    _apply_live_flags(results, host)
     return results
 
 
@@ -484,8 +496,8 @@ def _session_for_agent_chat(
     return by_id.get(parent_id)
 
 
-def _session_for_corral_ident(by_id: dict[str, dict], ident: str) -> dict | None:
-    """用托管注入的 CORRAL_SESSION_ID / SC_SESSION_ID 匹配会话。
+def _session_for_host_ident(by_id: dict[str, dict], ident: str) -> dict | None:
+    """用宿主注入的会话标识匹配会话（由扩展提供键名与解释）。
 
     原生恢复注入完整 chatId；空白新建/接力注入的是 8 位临时标识，
     与历史 chatId 无对应关系，不得拿来碰运气前缀匹配。
@@ -516,7 +528,10 @@ def _mark_live(session: dict, pid: int) -> bool:
     return True
 
 
-def _apply_live_flags(sessions: list[dict]) -> None:
+def _apply_live_flags(
+    sessions: list[dict],
+    host: HostExtension | None = None,
+) -> None:
     """给 Cursor 会话列表就地标注 live/pid。
 
     同一工作目录常会同时跑多个 `agent`（旧会话 `--resume`、空白新建、跨助手接力）。
@@ -526,15 +541,15 @@ def _apply_live_flags(sessions: list[dict]) -> None:
     绑定优先级（全部是正向证据，不再做 cwd 猜测）：
     1. 命令行 `--resume <chatId>`；
     2. 进程已打开的 `~/.cursor/chats/.../<chatId>/store.db`；
-    3. 环境变量 `CORRAL_SESSION_ID` / `SC_SESSION_ID`（仅完整会话 id）。
+    3. 宿主注入的会话标识（仅完整会话 id，由扩展提供）。
 
     以上 chatId 若是被过滤的 Task/subagent 会话，改绑到
     ``subagentInfo.rootParentAgentId``（否则 ``parentAgentId``）对应的父会话。
     父进程已空闲或不在跑、只剩子代理进程时，父会话仍须标 live。
 
     同一 chat 若同时有「无 --resume 的原托管进程」和后来的 ``--resume`` 进程，
-    必须优先绑前者：占位卡退役依赖 annotate 把真实会话标上原 tmux 名
-    （``corral-cursor-<临时8位>``）；若先绑到二次 resume，占位卡会残留成双卡。
+    必须优先绑前者：占位卡退役依赖宿主把真实会话标上原 pane 名
+    （如 ``<host>-cursor-<临时8位>``）；若先绑到二次 resume，占位卡会残留成双卡。
     """
     by_id = {str(session.get("id") or ""): session for session in sessions}
     agents = list(live_processes("agent"))
@@ -564,9 +579,9 @@ def _apply_live_flags(sessions: list[dict]) -> None:
             if session is not None and _mark_live(session, pid):
                 return
 
-        env = process_environ(pid)
-        ident = hosted_session_id(env)
-        session = _session_for_corral_ident(by_id, ident)
+        env = process_environ(pid, extra_keys=host.env_keys if host is not None else ())
+        ident = host_session_ident(env, host)
+        session = _session_for_host_ident(by_id, ident)
         if session is not None:
             _mark_live(session, pid)
 

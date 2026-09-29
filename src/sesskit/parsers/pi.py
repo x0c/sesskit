@@ -6,22 +6,18 @@ import json
 import os
 import re
 
-from sesskit import pi_claims as pi_identity, titles
-from sesskit.hosted import (
-    cache_dir as product_cache_dir,
-)
-from sesskit.hosted import (
-    hosted_isolation_dirname,
-    hosted_session_id,
-    is_hosted_isolation_dir,
-)
+from sesskit import titles
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
 from sesskit.parsers.common import (
+    HostExtension,
+    ephemeral_prefixes_for,
+    host_session_ident,
     is_ephemeral_agent_cwd,
     live_pid_snapshot,
     live_processes,
     open_file_paths,
     parse_timestamp,
+    preprocess_excerpt,
     process_command_line,
     process_environ,
     process_start_time,
@@ -31,7 +27,7 @@ from sesskit.parsers.common import (
 PI_HOME = os.path.expanduser("~/.pi/agent")
 SESSIONS_DIR = os.path.join(PI_HOME, "sessions")
 # Pi 官方环境变量，覆盖会话落盘目录；进程标题改写成「pi」后 cmdline 里看不到
-# `--session-dir`，判活只能靠这份初始 environ（与 CORRAL_SESSION_ID 同一条路）。
+# `--session-dir`，判活只能靠这份初始 environ（与宿主注入的会话标识同一条路）。
 PI_SESSION_DIR_ENV = "PI_CODING_AGENT_SESSION_DIR"
 # `{ISO时间戳把 :. 换成 -}_{sessionId}.jsonl`
 _SESSION_BASENAME_RE = re.compile(
@@ -135,7 +131,10 @@ _read_entries = read_entries
 _active_messages = active_messages
 
 
-def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
+def _build_session_info(
+    path: str,
+    host: HostExtension | None = None,
+) -> tuple[SessionInfo, float] | None:
     entries = _read_entries(path)
     if not entries or entries[0].get("type") != "session":
         return None
@@ -149,6 +148,7 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
     last_role = None
     last_stop_reason: str | None = None
     leaf_id: str | None = None
+    last_assistant_has_text = False
     event_time = parse_timestamp(header.get("timestamp"))
     for item in branch:
         message = item["message"]
@@ -168,15 +168,15 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
         elif role == "assistant":
             stop_reason = str(message.get("stopReason") or "").strip() or None
             error_text = str(message.get("errorMessage") or "").strip()
+            last_role = "assistant"
+            last_assistant_has_text = bool(text)
+            last_stop_reason = stop_reason
             if text:
                 last_agent = text
-                last_role = "assistant"
-                last_stop_reason = stop_reason
-            elif stop_reason in {"error", "aborted"} or error_text:
+            if stop_reason in {"error", "aborted"} or error_text:
                 # Empty-body failures (rate limit / abort) still own the turn.
-                last_role = "assistant"
-                last_stop_reason = stop_reason or "error"
-                if error_text:
+                last_stop_reason = stop_reason if stop_reason in {"error", "aborted"} else "error"
+                if not text and error_text:
                     last_agent = error_text
     if not first_user:
         return None
@@ -193,7 +193,7 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
         status = titles.STATUS_ABORTED
     elif last_role == "user":
         status = titles.STATUS_PENDING
-    elif last_role == "assistant":
+    elif last_role == "assistant" and last_stop_reason == "stop" and last_assistant_has_text:
         status = titles.STATUS_DONE
     else:
         status = titles.STATUS_NONE
@@ -207,7 +207,9 @@ def _build_session_info(path: str) -> tuple[SessionInfo, float] | None:
         time_source=time_source, event_time=event_time, file_mtime=stat.st_mtime,
         size_bytes=stat.st_size, native_title=native_title,
         fallback_title=(native_title or first_user)[:60], status_tag=status, path=path,
-        first_user_msg=first_user, last_user_msg=last_user, last_agent_msg=last_agent,
+        first_user_msg=preprocess_excerpt(first_user, host),
+        last_user_msg=preprocess_excerpt(last_user, host),
+        last_agent_msg=preprocess_excerpt(last_agent, host),
         completion_id=completion_id_for(
             file_mtime=stat.st_mtime,
             size_bytes=stat.st_size,
@@ -233,9 +235,18 @@ def scan_sessions(
     cwd_filter: str | None = None,
     limit: int = 50,
     keep_ids: set[str] | None = None,
+    *,
+    host: HostExtension | None = None,
 ) -> list[SessionInfo]:
     if not os.path.isdir(SESSIONS_DIR):
         return []
+    keep_ids = {str(item) for item in (keep_ids or ()) if item}
+    host_prefixes = ephemeral_prefixes_for(host)
+    is_isolation_dir = (
+        host.is_isolation_dir
+        if (host is not None and host.is_isolation_dir is not None)
+        else (lambda directory: False)
+    )
     keep_ids = {str(item) for item in (keep_ids or ()) if item}
     candidates: list[tuple[float, str]] = []
     for root, _dirs, names in os.walk(SESSIONS_DIR):
@@ -253,14 +264,14 @@ def scan_sessions(
     isolated_kept = 0
     seen_ids: set[str] = set()
     for _mtime, path in sorted(candidates, reverse=True):
-        isolated = is_hosted_isolation_dir(os.path.dirname(path))
+        isolated = bool(is_isolation_dir(os.path.dirname(path)))
         over_quota = isolated_kept >= limit if isolated else heap_kept >= limit
         file_id = _session_id_from_path(path) or ""
         if over_quota and file_id not in keep_ids:
             if heap_kept >= limit and isolated_kept >= limit and not keep_ids:
                 break
             continue
-        built = _build_session_info(path)
+        built = _build_session_info(path, host)
         if built is None:
             continue
         info, created = built
@@ -269,7 +280,7 @@ def scan_sessions(
             continue
         if over_quota and session_id not in keep_ids:
             continue
-        if is_ephemeral_agent_cwd(info["cwd"]):
+        if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
             continue
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue
@@ -285,7 +296,7 @@ def scan_sessions(
             heap_kept += 1
         if heap_kept >= limit and isolated_kept >= limit and not keep_ids:
             break
-    _apply_live_flags(results, created_ts)
+    _apply_live_flags(results, created_ts, host)
     return results
 
 
@@ -389,11 +400,6 @@ def encode_pi_session_cwd(cwd: str) -> str:
     return f"--{safe}--"
 
 
-def hosted_session_dir(cwd: str, ident: str) -> str:
-    """托管新建/接力专用目录：同 cwd 各 pane 各写各的 jsonl，不再挤进默认堆。"""
-    return os.path.join(SESSIONS_DIR, encode_pi_session_cwd(cwd), hosted_isolation_dirname(ident))
-
-
 def session_file_dir(path: str) -> str:
     """会话 jsonl 所在目录的 realpath；空路径返回空串。"""
     text = str(path or "")
@@ -426,7 +432,7 @@ def _is_continue_cmdline(cmdline: str) -> bool:
     return bool(set(_cmdline_parts_before_prompt(cmdline)).intersection({"-c", "--continue"}))
 
 
-# 命令行里把进程钉在某条会话上的旗标：corral 托管启动（--session-id / --session）
+# 命令行里把进程钉在某条会话上的旗标：宿主托管启动（--session-id / --session）
 # 与用户手动恢复（-c / --resume / --fork）都算；裸 `pi` 一个都没有。
 _SESSION_PIN_FLAGS = frozenset({
     "--session", "--session-id", "--session-dir", "--continue", "-c", "--resume", "-r", "--fork",
@@ -434,7 +440,7 @@ _SESSION_PIN_FLAGS = frozenset({
 
 
 def _cmdline_pins_session(cmdline: str) -> bool:
-    """该进程命令行是否钉住了会话（corral 托管或手动恢复都会带）。"""
+    """该进程命令行是否钉住了会话（宿主托管或手动恢复都会带）。"""
     return bool(_SESSION_PIN_FLAGS.intersection(_cmdline_parts_before_prompt(cmdline)))
 
 
@@ -477,9 +483,9 @@ def _mark_live(session: dict, pid: int) -> bool:
 
 
 # 进程内 ``/new`` / ``/resume`` / ``/fork`` 会换一份 jsonl，但启动时的
-# ``--session-id`` 与 ``CORRAL_SESSION_ID`` 仍指向旧 ident。Pi 用
+# ``--session-id`` 与宿主注入的会话标识仍指向旧 ident。Pi 用
 # ``appendFileSync`` 写完即关，扫描经常赶不上打开瞬间。记忆必须落到磁盘：
-# corral 一重启内存表是空的，否则侧栏标题停在旧卡、新历史被标成 Ended。
+# 宿主一重启内存表是空的，否则侧栏标题停在旧卡、新历史被标成 Ended。
 _pid_session_override: dict[int, str] = {}
 _pid_override_started: dict[int, float] = {}
 _prev_write_bytes: dict[int, int] = {}
@@ -492,12 +498,24 @@ _IDLE_NEW_MAX_GAP = 90 * 60
 _STALE_NEWER_SLACK = 60.0
 
 
-def _live_map_path() -> str:
-    return str(product_cache_dir() / _LIVE_MAP_NAME)
+def _default_live_map_base() -> str:
+    """Host-neutral live-map base dir: ``SESSKIT_CACHE_DIR``, XDG, or ``~/.cache/sesskit``."""
+    override = os.environ.get("SESSKIT_CACHE_DIR", "").strip()
+    if override:
+        return os.path.expanduser(override)
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    root = os.path.expanduser(xdg) if xdg else os.path.expanduser(os.path.join("~", ".cache"))
+    return os.path.join(root, "sesskit")
 
 
-def _read_live_map() -> dict[str, str]:
-    path = _live_map_path()
+def _live_map_path(host: HostExtension | None = None) -> str:
+    if host is not None and host.pi_live_map_dir:
+        return os.path.join(str(host.pi_live_map_dir), _LIVE_MAP_NAME)
+    return os.path.join(_default_live_map_base(), _LIVE_MAP_NAME)
+
+
+def _read_live_map(live_map: str | None = None) -> dict[str, str]:
+    path = live_map or _live_map_path()
     try:
         with open(path, encoding="utf-8") as file:
             data = json.load(file)
@@ -508,8 +526,8 @@ def _read_live_map() -> dict[str, str]:
     return {str(key): str(value) for key, value in data.items() if key and value}
 
 
-def _write_live_map(data: dict[str, str]) -> None:
-    path = _live_map_path()
+def _write_live_map(data: dict[str, str], live_map: str | None = None) -> None:
+    path = live_map or _live_map_path()
     directory = os.path.dirname(path)
     try:
         os.makedirs(directory, exist_ok=True)
@@ -604,7 +622,7 @@ def _session_cwd(session: dict) -> str:
         return cwd
 
 
-def _forget_live_session(pid: int) -> None:
+def _forget_live_session(pid: int, live_map: str | None = None) -> None:
     """彻底剔掉某进程的「正在写哪条会话」记忆（内存 + 磁盘两份）。
 
     只 pop 内存表的话，下一轮 `_load_persisted_overrides` 会把磁盘上的坏记忆
@@ -612,14 +630,19 @@ def _forget_live_session(pid: int) -> None:
     """
     _pid_session_override.pop(pid, None)
     _pid_override_started.pop(pid, None)
-    data = _read_live_map()
+    data = _read_live_map(live_map)
     prefix = f"{pid}:"
     if any(key.startswith(prefix) for key in data):
         data = {key: value for key, value in data.items() if not key.startswith(prefix)}
-        _write_live_map(data)
+        _write_live_map(data, live_map)
 
 
-def _remember_live_session(pid: int, session_id: str, started: float | None = None) -> None:
+def _remember_live_session(
+    pid: int,
+    session_id: str,
+    started: float | None = None,
+    live_map: str | None = None,
+) -> None:
     if not session_id:
         return
     _pid_session_override[pid] = session_id
@@ -630,17 +653,22 @@ def _remember_live_session(pid: int, session_id: str, started: float | None = No
     if started is None:
         return
     _pid_override_started[pid] = started
-    data = _read_live_map()
+    if live_map is None:
+        live_map = _live_map_path()
+    data = _read_live_map(live_map)
     prefix = f"{pid}:"
     data = {key: value for key, value in data.items() if not key.startswith(prefix)}
     data[_persist_key(pid, started)] = session_id
-    _write_live_map(data)
+    _write_live_map(data, live_map)
 
 
 def _load_persisted_overrides(
-    pids: list[int], starts: dict[int, float], created_ts: dict[str, float],
+    pids: list[int],
+    starts: dict[int, float],
+    created_ts: dict[str, float],
+    live_map: str | None = None,
 ) -> None:
-    data = _read_live_map()
+    data = _read_live_map(live_map)
     if not data:
         return
     live = set(pids)
@@ -670,7 +698,7 @@ def _load_persisted_overrides(
         for key in invalid_keys:
             data.pop(key, None)
         data.update(keep)
-        _write_live_map(data)
+        _write_live_map(data, live_map)
 
 
 def reset_live_session_overrides() -> None:
@@ -692,11 +720,11 @@ def _pending_owner_exists(
 ) -> bool:
     """这条未绑定会话是否还有更可能的属主：一个没被任何启动证据钉住的裸 TUI 进程。
 
-    真实事故：同目录先开了 corral 托管的 Pi 会话 A（空闲），用户又在别的终端裸
+    真实事故：同目录先开了宿主托管的 Pi 会话 A（空闲），用户又在别的终端裸
     `pi` 开了会话 B。B 的文件一出现，「空闲认领 / 相关性认领」就把 B 当成 A 进程
-    /new 的结果抢走，A 被摘掉 live、B 挂上 A 的 pid；随后 annotate 把 A 那格的
-    托管名贴到 B 头上，右栏 A 格的 Your prompts 小窗显示成 B 的提问。判定：一个
-    存活 TUI 进程若命令行不带任何会话旗标、也没有托管注入的环境 ident、还没被
+    /new 的结果抢走，A 被摘掉 live、B 挂上 A 的 pid；随后宿主把 A 那格的
+    托管名贴到 B 头上，右栏 A 格的提问小窗串台成 B 的提问。判定：一个
+    存活 TUI 进程若命令行不带任何会话旗标、也没有宿主注入的环境 ident、还没被
     记成在写别的会话，且早于该会话落盘启动，这条会话大概率是它自己的新会话。
     """
     created = created_ts.get(str(session.get("id") or ""), 0.0)
@@ -726,11 +754,11 @@ def _follow_switched_sessions(
 ) -> None:
     """启动 ident 绑上之后，把进程内 /new 换出来的新文件认领回来。
 
-    appendFileSync 太短，单轮经常看不到打开的 jsonl；corral 重启后内存表也是
+    appendFileSync 太短，单轮经常看不到打开的 jsonl；宿主重启后内存表也是
     空的。用三层不靠猜「同目录最新一条」的证据：跨轮写字节对上刚更新的文件、
     仍在跑 CPU 且旧 ident 已明显更旧、空闲进程在 90 分钟窗口内一对一认领。
 
-    带 ``corral-<ident>/`` 隔离目录的托管进程不走这里：它们的 /new 已经
+    带宿主隔离目录的进程不走这里：它们的 /new 已经
     由「该目录最新 jsonl」钉死，再认领会把别人默认目录里的新文件抢走。
     """
     session_dir_pids = session_dir_pids or set()
@@ -879,7 +907,37 @@ def _follow_switched_sessions(
         claimed.add(pid)
 
 
-def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> None:
+def _claim_pid(claim: dict) -> int:
+    try:
+        return int(claim.get("pid") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _claim_session_ref(claim: dict) -> str:
+    return str(claim.get("session") or claim.get("sessionId") or "").strip()
+
+
+def _claim_session_path(claim: dict) -> str:
+    return str(claim.get("session_path") or claim.get("sessionFile") or "").strip()
+
+
+def _claim_sequence(claim: dict) -> int:
+    try:
+        return int(claim.get("sequence", claim.get("seq", 0)) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _claim_instance(claim: dict) -> str:
+    return str(claim.get("instance") or claim.get("instanceId") or "").strip()
+
+
+def _apply_live_flags(
+    sessions: list[dict],
+    created_ts: dict[str, float],
+    host: HostExtension | None = None,
+) -> None:
     """给 Pi 会话列表就地标注 live/pid。
 
     裸 ``pi`` 不长期持有 jsonl、命令行也不带会话参数，旧实现四条正向路径
@@ -888,20 +946,25 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
 
     绑定优先级（正向证据优先，禁止「同目录只留最新一条」）：
 
-    0. 身份扩展 claim（``corral-session-identity``）：instance + 精确 session
-       id，第一权威；托管进程没有有效 claim 时保持 provisional，不猜；
+    0. 宿主身份 claim（由扩展提供，已是 live 过滤后的精确归属）：
+       instance + 精确 session id，第一权威；宿主进程没有有效 claim 时
+       保持 provisional，不猜；
     1. 进程正打开的 ``*.jsonl``（若该进程有 session-dir，打开的文件还须在该目录内）；
-    2. ``corral-<ident>/`` 隔离目录（``PI_CODING_AGENT_SESSION_DIR`` /
-       ``--session-dir``）：该目录里 mtime 最新的一条（托管 /new 的属主，
-       不再靠空闲认领）。指向 Pi 默认 cwd 堆的 session-dir 不算隔离，以免
-       把 ``--session`` 恢复改绑到堆里别人的新文件；
+    2. 宿主隔离目录（``PI_CODING_AGENT_SESSION_DIR`` /
+       ``--session-dir``，由扩展判定）：该目录里 mtime 最新的一条（托管 /new
+       的属主，不再靠空闲认领）。指向 Pi 默认 cwd 堆的 session-dir 不算隔离，
+       以免把 ``--session`` 恢复改绑到堆里别人的新文件；
     3. 本进程或磁盘记住的「该 pid 上次在写哪条」（目标须晚于进程启动才落盘）；
     4. ``--session <path|id>``（原生恢复）；
     5. ``--session-id <id>``（托管新建/分叉钉死的占位 ident）；
-    6. 环境变量 ``CORRAL_SESSION_ID`` / ``SC_SESSION_ID`` **精确**等于会话 id；
+    6. 宿主注入的会话标识（由扩展提供）**精确**等于会话 id；
     7. 无 session-dir 的进程才用跨轮写字节/CPU 与空闲窗口跟 /new；
     8. ``-c`` / ``--continue`` → 该 cwd 尚未标记的最新一条；
     9. 其余裸 TUI：同一 cwd 里，按「进程启动 ≤ 会话创建」一对一认领。
+
+    With no host extension there are no identity claims and no isolation
+    directories: binding uses only native evidence (open files, session-dir,
+    command line, generic session ident).
     """
     processes = list(live_processes("pi"))
     live_pid_set = {pid for pid, _cwd in processes}
@@ -934,25 +997,33 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
         for pid, started in ((pid, process_start_time(pid)) for pid, _cwd in tui_procs)
         if started is not None
     }
-    _load_persisted_overrides([pid for pid, _cwd in tui_procs], starts, created_ts)
+    live_map = _live_map_path(host)
+    _load_persisted_overrides([pid for pid, _cwd in tui_procs], starts, created_ts, live_map)
     open_paths = open_file_paths([pid for pid, _cwd in tui_procs])
-    envs = {pid: process_environ(pid) for pid, _cwd in tui_procs}
+    host_keys = tuple(host.env_keys) if host is not None else ()
+    if host is not None and host.pi_instance_env_key:
+        host_keys = (*host_keys, host.pi_instance_env_key)
+    envs = {pid: process_environ(pid, extra_keys=host_keys) for pid, _cwd in tui_procs}
 
-    # 身份桥 claim（corral-session-identity 扩展）：有效 claim 是 live 归属的
-    # 第一权威，按 claim 的精确 sessionId，对不上再按 sessionFile 路径绑定；
-    # 同一 pid 取 sequence 最大的一条。托管进程的 claim instance 必须与 env
-    # 注入值一致，裸 Pi 的 native claim 直接按 pid 对号。
+    # Host identity claims: the provider returns live claims only; SessKit binds
+    # by the exact session ref, then by the exact session path, newest first.
+    # Without a host extension there are no claims (native evidence only).
     claims_by_pid: dict[int, list[dict]] = {}
-    for claim in pi_identity.read_claims():
-        if not pi_identity.claim_is_live(claim):
-            continue
+    if host is not None and host.pi_claims_provider is not None:
         try:
-            claim_pid = int(claim.get("pid") or 0)
-        except (TypeError, ValueError):
-            continue
-        if claim_pid <= 0:
-            continue
-        claims_by_pid.setdefault(claim_pid, []).append(claim)
+            fetched = host.pi_claims_provider()
+        except Exception:  # noqa: BLE001 — a host callback must never break a scan
+            fetched = []
+        if isinstance(fetched, list):
+            for claim in fetched:
+                if not isinstance(claim, dict):
+                    continue
+                claim_pid = _claim_pid(claim)
+                if claim_pid <= 0:
+                    continue
+                if not _claim_session_ref(claim) and not _claim_session_path(claim):
+                    continue
+                claims_by_pid.setdefault(claim_pid, []).append(claim)
 
     def _proc_session_dir(pid: int) -> str:
         env = envs.get(pid) or {}
@@ -964,12 +1035,20 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
         for pid, directory in ((_pid, _proc_session_dir(_pid)) for _pid, _cwd in tui_procs)
         if directory
     }
-    # 只有 corral-<ident> 隔离目录是一对一属主；恢复旧文件时 --session-dir 可能
-    # 指向 Pi 默认 cwd 堆，那里挤着别人的 jsonl，不能按「目录最新一条」绑。
+    # 只有宿主隔离目录是一对一属主（由扩展判定）；恢复旧文件时 --session-dir
+    # 可能指向 Pi 默认 cwd 堆，那里挤着别人的 jsonl，不能按「目录最新一条」绑。
+    def _is_exclusive_dir(directory: str) -> bool:
+        if host is not None and host.is_isolation_dir is not None:
+            try:
+                return bool(host.is_isolation_dir(directory))
+            except Exception:  # noqa: BLE001 — a host callback must never break a scan
+                return False
+        return False
+
     exclusive_dirs = {
         pid: directory
         for pid, directory in session_dirs.items()
-        if is_hosted_isolation_dir(directory)
+        if _is_exclusive_dir(directory)
     }
     owned_dirs = set(exclusive_dirs.values())
     session_dir_pids = set(exclusive_dirs)
@@ -982,7 +1061,7 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
         if pid not in _pid_session_override
         and pid not in session_dirs
         and not _cmdline_pins_session(cmdlines.get(pid) or "")
-        and not hosted_session_id(envs.get(pid) or {})
+        and not host_session_ident(envs.get(pid) or {}, host)
     }
 
     def bind_by_id_or_path(pid: int, value: str) -> dict | None:
@@ -1017,7 +1096,7 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
         pid: int, session: dict | None, *, remember: bool = False, source: str = "",
     ) -> None:
         if remember and session is not None:
-            _remember_live_session(pid, str(session.get("id") or ""), starts.get(pid))
+            _remember_live_session(pid, str(session.get("id") or ""), starts.get(pid), live_map)
         bound_pids.add(pid)
 
     def rebind_to(pid: int, session: dict) -> None:
@@ -1043,7 +1122,7 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
         return False
 
     def bind_session_dir(pid: int) -> bool:
-        """托管隔离目录：这个进程只能认该目录里的 jsonl，live 钉最新一条。"""
+        """宿主隔离目录：这个进程只能认该目录里的 jsonl，live 钉最新一条。"""
         directory = exclusive_dirs.get(pid)
         if not directory:
             return False
@@ -1068,26 +1147,25 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
         return True
 
     def bind_exact(pid: int) -> None:
-        env_instance = str((envs.get(pid) or {}).get(pi_identity.INSTANCE_ENV) or "").strip()
+        instance_key = host.pi_instance_env_key if host is not None else ""
+        env_instance = (
+            str((envs.get(pid) or {}).get(instance_key) or "").strip() if instance_key else ""
+        )
         candidates = claims_by_pid.get(pid) or []
         if env_instance:
             candidates = [
                 claim for claim in candidates
-                if str(claim.get("instanceId") or "") == env_instance
+                if _claim_instance(claim) == env_instance
             ]
-        claim = max(
-            candidates,
-            key=lambda item: int(item.get("sequence") or 0),
-            default=None,
-        )
+        claim = max(candidates, key=_claim_sequence, default=None)
         if claim is not None:
-            session = bind_by_id_or_path(pid, str(claim.get("sessionId") or ""))
+            session = bind_by_id_or_path(pid, _claim_session_ref(claim))
             if session is None:
-                # header id 与 claim.sessionId 对不上时（占位 ident vs uuid），
+                # header id 与 claim 会话标识对不上时（占位 ident vs uuid），
                 # 精确路径仍是正向证据，不能只查 by_id 然后把 pid 钉死不绑。
-                session = bind_by_id_or_path(pid, str(claim.get("sessionFile") or ""))
+                session = bind_by_id_or_path(pid, _claim_session_path(claim))
             if session is not None:
-                _remember_live_session(pid, str(session.get("id") or ""), starts.get(pid))
+                _remember_live_session(pid, str(session.get("id") or ""), starts.get(pid), live_map)
             # claim 指向的会话尚未落盘或不在扫描窗口：保持 provisional，
             # 绝不回落到 cwd/mtime 猜测。
             bound_pids.add(pid)
@@ -1108,17 +1186,17 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
                     _pid_session_override.pop(pid, None)
                 elif (
                     (_cmdline_pins_session(cmdlines.get(pid) or "")
-                     or hosted_session_id(envs.get(pid) or {}))
+                     or host_session_ident(envs.get(pid) or {}, host))
                     and _pending_owner_exists(
                         session, tui_procs, starts, created_ts, free_procs,
                         {item.get("pid") for item in sessions if item.get("pid")},
                     )
                 ):
-                    # 本进程带着 --session / --session-id / 托管 env 硬证据，而记忆
+                    # 本进程带着 --session / --session-id / 宿主 env 硬证据，而记忆
                     # 指向的会话另有更可能的属主（还在跑、未被任何启动证据钉住的
                     # 裸 pi）：这份记忆多半是相关性/空闲认领抢来的，剔除（含磁盘）
                     # 后走硬证据。
-                    _forget_live_session(pid)
+                    _forget_live_session(pid, live_map)
                 else:
                     _mark_live(session, pid)
                     bind_and_stop(pid, session, source="override")
@@ -1135,14 +1213,14 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
                 _mark_live(session, pid)
             bind_and_stop(pid, session, source="session-id")
             return
-        ident = hosted_session_id(envs.get(pid) or {})
+        ident = host_session_ident(envs.get(pid) or {}, host)
         if ident in by_id:
             session = by_id[ident]
             _mark_live(session, pid)
             bind_and_stop(pid, session, source="env")
             return
         if ident or env_instance:
-            # 托管占位 ident 尚未落盘、不在本轮扫描窗口，或身份扩展没给出
+            # 宿主占位 ident 尚未落盘、不在本轮扫描窗口，或身份扩展没给出
             # 有效 claim：宁可未关联/provisional，不要回落到 cwd 配对。
             bound_pids.add(pid)
 

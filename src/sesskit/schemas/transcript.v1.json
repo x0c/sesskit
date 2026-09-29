@@ -6,7 +6,7 @@
   "required": ["type", "seq"],
   "properties": {
     "schema_note": {
-      "description": "Envelope field schema is sesskit.transcript/v1 (legacy alias: corral.share/v1)"
+      "description": "Envelope field schema is sesskit.transcript/v1 (hosts may accept additional legacy identifiers)"
     },
     "type": {
       "type": "string",

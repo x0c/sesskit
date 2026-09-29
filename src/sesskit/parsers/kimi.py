@@ -27,12 +27,16 @@ import sys
 
 from sesskit import titles
 from sesskit.cache import get_cache
-from sesskit.hosted import hosted_session_id
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
 from sesskit.parsers.common import (
+    HostExtension,
+    ephemeral_prefixes_for,
+    host_cache_tag,
+    host_session_ident,
     is_ephemeral_agent_cwd,
     live_pid_snapshot,
     live_processes,
+    preprocess_excerpt,
     process_command_line,
     process_environ,
     process_start_time,
@@ -112,8 +116,8 @@ def _mark_live(session: dict, pid: int) -> bool:
     return True
 
 
-def _session_for_corral_ident(by_id: dict[str, dict], ident: str) -> dict | None:
-    """托管注入的 CORRAL_SESSION_ID 只有完整会话 ID 才绑定。
+def _session_for_host_ident(by_id: dict[str, dict], ident: str) -> dict | None:
+    """宿主注入的会话标识只有完整会话 ID 才绑定。
 
     空白新建注入的是 8 位临时标识，与 ``session_…`` 无对应关系，不得前缀猜测。
     """
@@ -130,7 +134,11 @@ def _session_for_corral_ident(by_id: dict[str, dict], ident: str) -> dict | None
     return None
 
 
-def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> None:
+def _apply_live_flags(
+    sessions: list[dict],
+    created_ts: dict[str, float],
+    host: HostExtension | None = None,
+) -> None:
     """给 Kimi 会话列表就地标注 live/pid。
 
     同一工作目录常会同时跑多个 TUI。旧实现按「cwd → 最新一条」猜测，
@@ -138,7 +146,7 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
 
     绑定优先级（正向证据优先，禁止「同目录只留最新一条」）：
     1. 命令行 ``-S`` / ``--session``（原生恢复）；
-    2. 环境变量 ``CORRAL_SESSION_ID`` / ``SC_SESSION_ID``（仅完整会话 id）；
+    2. 宿主注入的会话标识（仅完整会话 id，由扩展提供）；
     3. ``-c`` / ``--continue`` → 该 cwd 尚未标记的最新一条；
     4. 其余 TUI：同一 cwd 里，按「进程启动 ≤ 会话创建」一对一认领。
     """
@@ -168,9 +176,9 @@ def _apply_live_flags(sessions: list[dict], created_ts: dict[str, float]) -> Non
                 _mark_live(by_id[session_id], pid)
             bound_pids.add(pid)
             return
-        env = process_environ(pid)
-        ident = hosted_session_id(env)
-        session = _session_for_corral_ident(by_id, ident)
+        env = process_environ(pid, extra_keys=host.env_keys if host is not None else ())
+        ident = host_session_ident(env, host)
+        session = _session_for_host_ident(by_id, ident)
         if session is not None:
             _mark_live(session, pid)
             bound_pids.add(pid)
@@ -359,7 +367,11 @@ def _load_state(session_dir: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _build_session_info(session_dir: str, session_id: str) -> dict | None:
+def _build_session_info(
+    session_dir: str,
+    session_id: str,
+    host: HostExtension | None = None,
+) -> dict | None:
     state = _load_state(session_dir)
     wire_path = _wire_path(session_dir)
     try:
@@ -450,9 +462,9 @@ def _build_session_info(session_dir: str, session_id: str) -> dict | None:
         fallback_title=fallback or "(无消息)",
         status_tag=status_tag,
         path=wire_path,
-        first_user_msg=first_user_msg,
-        last_user_msg=last_user_msg,
-        last_agent_msg=last_agent_msg,
+        first_user_msg=preprocess_excerpt(first_user_msg, host),
+        last_user_msg=preprocess_excerpt(last_user_msg, host),
+        last_agent_msg=preprocess_excerpt(last_agent_msg, host),
         completion_id=completion_id_for(
             file_mtime=file_mtime,
             size_bytes=stat.st_size,
@@ -492,6 +504,7 @@ def scan_sessions(
     limit: int = 50,
     *,
     include_missing_cwd: bool = False,
+    host: HostExtension | None = None,
 ) -> list[SessionInfo]:
     """扫描所有 Kimi Code 会话，返回统一结构列表，按 mtime 降序。
 
@@ -529,16 +542,25 @@ def scan_sessions(
 
     results: list[dict] = []
     created_ts: dict[str, float] = {}
+    host_prefixes = ephemeral_prefixes_for(host)
+    session_cache = host.cache if (host is not None and host.cache is not None) else get_cache()
+    cache_tag = host_cache_tag(host)
     for _, session_dir, session_id in candidates:
         if len(results) >= limit:
             break
         wire_path = _wire_path(session_dir)
-        cache = get_cache()
-        info = cache.get_session("kimi", wire_path)
+        cache = session_cache
+        if cache_tag:
+            info = cache.get_session("kimi", wire_path, cache_tag)
+        else:
+            info = cache.get_session("kimi", wire_path)
         if info is None:
-            info = _build_session_info(session_dir, session_id)
+            info = _build_session_info(session_dir, session_id, host)
             if info is not None:
-                cache.put_session("kimi", wire_path, info)
+                if cache_tag:
+                    cache.put_session("kimi", wire_path, info, cache_tag)
+                else:
+                    cache.put_session("kimi", wire_path, info)
         if info is None:
             continue
         # 标题生成用 `kimi -p` 会落盘会话；用固定前缀拦掉自产噪音。
@@ -551,8 +573,8 @@ def scan_sessions(
             or titles.is_title_generation_prompt(native)
         ):
             continue
-        if is_ephemeral_agent_cwd(info["cwd"]):
-            continue  # OpenConductor 管家临时 cwd，目录复活会刷屏
+        if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
+            continue  # 宿主声明的临时 cwd，目录复活会刷屏
         if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
             continue  # 工作目录已删除，无法原生恢复
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
@@ -564,7 +586,7 @@ def scan_sessions(
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
     results = results[:limit]
-    _apply_live_flags(results, created_ts)
+    _apply_live_flags(results, created_ts, host)
     return results
 
 
