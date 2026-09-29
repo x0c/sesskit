@@ -37,6 +37,7 @@ Legacy Corral share payloads used `corral.share/v1`; readers should accept both 
 - Default scan drops sessions whose project `cwd` no longer exists (resume-oriented; **Corral must keep this default**).
 - Pass `--include-missing-cwd` (or `include_missing_cwd=True` on scanners) for archive/search when history files still exist.
 - Never turn `include_missing_cwd` on inside Corral’s recover / sidebar path.
+- **Disposable automation workspaces never list.** A `cwd` is ephemeral when any path segment starts with `oc-manager-` (OpenConductor manager jobs) **or** the `cwd` or any ancestor directory contains a `.sesskit-ignore` file. Scanners drop these sessions regardless of `include_missing_cwd`. Automation that launches real agent sessions (experiments, probes, evals) must drop the marker in its workspace root before starting the agent. The owning automation may set `SESSKIT_INCLUDE_EPHEMERAL=1` in its own process to observe its sessions; never set it globally. Do not hide sessions by a temp-directory prefix alone: people also run real sessions from `/tmp`.
 
 ## Export / share writes
 

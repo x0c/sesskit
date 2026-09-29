@@ -67,6 +67,8 @@ for runtime_id, items in sessions.items():
 
 只读。不会启动助手、恢复对话，也不会改写历史文件。
 
+会真实启动助手会话的自动化（测试、评测、探针）可以在工作区根目录放一个空的 `.sesskit-ignore` 文件，让这些会话不进列表；见 [`docs/CONTRACT.md`](docs/CONTRACT.md)。
+
 ## 契约
 
 见 [`schemas/`](schemas/) 与 [`docs/CONTRACT.md`](docs/CONTRACT.md)。

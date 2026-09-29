@@ -67,6 +67,8 @@ for runtime_id, items in sessions.items():
 
 Read-only. It does not launch agents, resume chats, or write history.
 
+Automation that launches real agent sessions (tests, evals, probes) can keep them out of listings by placing an empty `.sesskit-ignore` file in its workspace root; see [`docs/CONTRACT.md`](docs/CONTRACT.md).
+
 ## Schemas
 
 See [`schemas/`](schemas/) and [`docs/CONTRACT.md`](docs/CONTRACT.md).

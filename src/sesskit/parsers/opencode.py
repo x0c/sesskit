@@ -23,6 +23,7 @@ from sesskit import titles
 from sesskit.hosted import hosted_session_id
 from sesskit.models import ConversationMessage, SessionInfo, make_session_info
 from sesskit.parsers.common import (
+    is_ephemeral_agent_cwd,
     live_processes,
     process_command_line,
     process_environ,
@@ -718,6 +719,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
                 or titles.is_title_generation_prompt(native)
             ):
                 continue
+            if is_ephemeral_agent_cwd(info["cwd"]):
+                continue
             if cwd_filter and not info["cwd"].startswith(cwd_filter):
                 continue
             results.append(info)
@@ -752,6 +755,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[Sessio
                     or titles.is_title_generation_prompt(fallback)
                     or titles.is_title_generation_prompt(native)
                 ):
+                    continue
+                if is_ephemeral_agent_cwd(info["cwd"]):
                     continue
                 if cwd_filter and not info["cwd"].startswith(cwd_filter):
                     continue

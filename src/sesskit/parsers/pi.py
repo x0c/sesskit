@@ -17,6 +17,7 @@ from sesskit.hosted import (
 )
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
 from sesskit.parsers.common import (
+    is_ephemeral_agent_cwd,
     live_pid_snapshot,
     live_processes,
     open_file_paths,
@@ -267,6 +268,8 @@ def scan_sessions(
         if session_id in seen_ids:
             continue
         if over_quota and session_id not in keep_ids:
+            continue
+        if is_ephemeral_agent_cwd(info["cwd"]):
             continue
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue

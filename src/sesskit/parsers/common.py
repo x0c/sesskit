@@ -24,19 +24,43 @@ def shorten_cwd(cwd: str) -> str:
     return cwd
 
 
-def is_ephemeral_agent_cwd(cwd: str) -> bool:
-    """OpenConductor 管家等自动任务写在 /tmp/oc-manager-* 下的临时 cwd。
+EPHEMERAL_MARKER = ".sesskit-ignore"
 
-    这类目录会随任务创建/删除反复出现：曾经因「cwd 不存在」被滤掉的旧会话，
-    在目录复活后会整批重新进入扫描结果，被 SessionStore 当成「新会话」插到
-    列表最前，造成侧边栏被几天前的管家会话刷屏。扫描阶段直接丢弃。
+
+def is_ephemeral_agent_cwd(cwd: str) -> bool:
+    """Disposable automation workspace whose sessions must never list.
+
+    Two signals (see docs/CONTRACT.md "Listing modes"):
+
+    - a path segment starting with ``oc-manager-`` (OpenConductor manager jobs
+      under ``/tmp/oc-manager-*``; the dirs are deleted and recreated, so old
+      sessions would otherwise resurrect in bulk and flood the list);
+    - a ``.sesskit-ignore`` file in the cwd or any ancestor, dropped by
+      experiments / probes / evals that launch real agent sessions.
+
+    A bare temp-directory prefix is deliberately not a signal: people also run
+    real sessions from ``/tmp``. The automation that owns such a workspace can
+    still observe its own sessions by setting ``SESSKIT_INCLUDE_EPHEMERAL=1``
+    in its own process.
     """
-    if not cwd:
+    if not cwd or os.environ.get("SESSKIT_INCLUDE_EPHEMERAL") == "1":
         return False
     normalized = cwd.replace("\\", "/").rstrip("/")
-    # /tmp/oc-manager-codex/... 、/tmp/oc-manager-claude/... 、以及嵌套变体
     parts = [p for p in normalized.split("/") if p]
-    return any(p.startswith("oc-manager-") for p in parts)
+    if any(p.startswith("oc-manager-") for p in parts):
+        return True
+    return _has_ephemeral_marker(cwd)
+
+
+def _has_ephemeral_marker(cwd: str) -> bool:
+    path = os.path.abspath(os.path.expanduser(cwd))
+    while True:
+        if os.path.isfile(os.path.join(path, EPHEMERAL_MARKER)):
+            return True
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
 
 
 def parse_timestamp(value) -> float | None:
