@@ -52,6 +52,135 @@ WHERE session_id = ?
 ORDER BY seq ASC, time_created ASC, id ASC
 """
 
+# Append-delta queries: warm polls must not re-read the whole per-session
+# window. New rows sort strictly after the committed position (range scans
+# over the per-session ordering indexes); the recheck window below catches
+# in-place content updates via the writer-maintained ``time_updated``
+# columns plus per-row lengths. v1 needs two delta queries: strictly newer
+# messages, plus brand-new parts of the still-open last message. Count
+# growth must exactly match the fetched rows, otherwise a backfilled older
+# row is hiding outside the suffix and the poll takes the slow path.
+_V1_NEW_MESSAGES = """
+SELECT m.id AS message_id, m.time_created, m.data AS msg_data,
+       p.id AS part_id, p.time_created AS part_time, p.data AS part_data,
+       m.time_updated AS msg_updated, p.time_updated AS part_updated
+FROM message m LEFT JOIN part p ON p.message_id = m.id
+WHERE m.session_id = ?
+  AND (m.time_created > ? OR (m.time_created = ? AND m.id > ?))
+ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC, p.id ASC
+"""
+_V1_NEW_PARTS = """
+SELECT m.id AS message_id, m.time_created, m.data AS msg_data,
+       p.id AS part_id, p.time_created AS part_time, p.data AS part_data,
+       m.time_updated AS msg_updated, p.time_updated AS part_updated
+FROM message m LEFT JOIN part p ON p.message_id = m.id
+WHERE m.session_id = ?
+  AND m.id = ?
+  AND p.id IS NOT NULL
+  AND (p.time_created > ? OR (p.time_created = ? AND p.id > ?))
+ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC, p.id ASC
+"""
+_V1_LAST_MSG_PARTS = """
+SELECT m.id AS message_id, m.time_created, m.data AS msg_data,
+       p.id AS part_id, p.time_created AS part_time, p.data AS part_data,
+       m.time_updated AS msg_updated, p.time_updated AS part_updated
+FROM message m LEFT JOIN part p ON p.message_id = m.id
+WHERE m.session_id = ?
+  AND m.id = ?
+  AND p.id IS NOT NULL
+ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC, p.id ASC
+"""
+_V1_TAIL_SIG = """
+SELECT m.id, m.time_created, p.id, p.time_created,
+       m.time_updated, p.time_updated, length(m.data), length(p.data)
+FROM message m LEFT JOIN part p ON p.message_id = m.id
+WHERE m.session_id = ?
+  AND (m.time_created < ? OR (m.time_created = ? AND m.id <= ?))
+ORDER BY m.time_created DESC, m.id DESC, p.time_created DESC, p.id DESC
+LIMIT ?
+"""
+_V1_COUNTS_SQL = (
+    "SELECT (SELECT COUNT(*) FROM message WHERE session_id = ?),"
+    " (SELECT COUNT(*) FROM part WHERE session_id = ?)"
+)
+_V2_DELTA_ROWS = """
+SELECT type, seq, time_created, id, data
+FROM session_message
+WHERE session_id = ?
+  AND (seq > ? OR (seq = ? AND id > ?))
+ORDER BY seq ASC, time_created ASC, id ASC
+"""
+_V2_TAIL_SIG = """
+SELECT id, seq, time_created, time_updated, length(data)
+FROM session_message
+WHERE session_id = ?
+  AND seq <= ?
+ORDER BY seq DESC, time_created DESC, id DESC
+LIMIT ?
+"""
+_V2_COUNT_SQL = "SELECT COUNT(*) FROM session_message WHERE session_id = ?"
+
+# Bounded recheck window: trailing rows whose signature is compared before
+# accepting an append without a rebuild. Same-count middle swaps beyond the
+# window are the documented residual blind spot.
+_OPENCODE_RECHECK_ROWS = 20
+
+# Legacy schemas (older databases) lack the writer-maintained time_updated
+# columns. The primary queries above use them for exact in-place-update
+# detection; when SQLite reports a missing column the reader retries with
+# these length-only variants (weaker, documented) instead of failing.
+_V1_NEW_MESSAGES_LEGACY = """
+SELECT m.id AS message_id, m.time_created, m.data AS msg_data,
+       p.id AS part_id, p.time_created AS part_time, p.data AS part_data,
+       NULL AS msg_updated, NULL AS part_updated
+FROM message m LEFT JOIN part p ON p.message_id = m.id
+WHERE m.session_id = ?
+  AND (m.time_created > ? OR (m.time_created = ? AND m.id > ?))
+ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC, p.id ASC
+"""
+_V1_NEW_PARTS_LEGACY = """
+SELECT m.id AS message_id, m.time_created, m.data AS msg_data,
+       p.id AS part_id, p.time_created AS part_time, p.data AS part_data,
+       NULL AS msg_updated, NULL AS part_updated
+FROM message m LEFT JOIN part p ON p.message_id = m.id
+WHERE m.session_id = ?
+  AND m.id = ?
+  AND p.id IS NOT NULL
+  AND (p.time_created > ? OR (p.time_created = ? AND p.id > ?))
+ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC, p.id ASC
+"""
+_V1_LAST_MSG_PARTS_LEGACY = """
+SELECT m.id AS message_id, m.time_created, m.data AS msg_data,
+       p.id AS part_id, p.time_created AS part_time, p.data AS part_data,
+       NULL AS msg_updated, NULL AS part_updated
+FROM message m LEFT JOIN part p ON p.message_id = m.id
+WHERE m.session_id = ?
+  AND m.id = ?
+  AND p.id IS NOT NULL
+ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC, p.id ASC
+"""
+_V1_TAIL_SIG_LEGACY = """
+SELECT m.id, m.time_created, p.id, p.time_created,
+       NULL, NULL, length(m.data), length(p.data)
+FROM message m LEFT JOIN part p ON p.message_id = m.id
+WHERE m.session_id = ?
+  AND (m.time_created < ? OR (m.time_created = ? AND m.id <= ?))
+ORDER BY m.time_created DESC, m.id DESC, p.time_created DESC, p.id DESC
+LIMIT ?
+"""
+_V2_TAIL_SIG_LEGACY = """
+SELECT id, seq, time_created, NULL, length(data)
+FROM session_message
+WHERE session_id = ?
+  AND seq <= ?
+ORDER BY seq DESC, time_created DESC, id DESC
+LIMIT ?
+"""
+
+
+def _is_missing_column(exc: sqlite3.Error) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "no such column" in str(exc)
+
 
 def load_opencode_activity(session: dict) -> ActivitySnapshot:
     """Load typed events for one scanned OpenCode session dictionary.
@@ -408,65 +537,11 @@ def _v1_part(
 def _build_v1(
     rows: list[sqlite3.Row], session_id: str,
 ) -> tuple[list[ActivityEvent], dict]:
-    events: list[ActivityEvent] = []
-    error_emitted: set[str] = set()
-    assistant_text_seen: set[str] = set()
-    pending_errors: dict[str, tuple[dict, float | None]] = {}
-    tail: dict[str, Any] = {"role": None, "message": {}, "record": None, "unresolved": False}
-    calls_in_turn: set[str] = set()
-    resolved_in_turn: set[str] = set()
-    for row in rows:
-        message = _object(row["msg_data"])
-        if not message:
-            continue
-        mid = str(row["message_id"] or "")
-        role = message.get("role")
-        if role == "user":
-            calls_in_turn.clear()
-            resolved_in_turn.clear()
-        tail = {
-            "role": role, "message": message,
-            "record": f"message:{mid}", "unresolved": False,
-        }
-        if row["part_data"] is None:
-            if role == "assistant" and mid not in error_emitted:
-                error = _error(message, f"message:{mid}", "message.data.error")
-                if error is not None:
-                    created = (message.get("time") or {}).get("created") if isinstance(message.get("time"), dict) else None
-                    _add(events, "assistant_message", _timestamp(created),
-                         _message_key(session_id, mid), f"message:{mid}",
-                         "message.data.error", text=error.message, error=error)
-                    error_emitted.add(mid)
-                elif message.get("finish") != "stop":
-                    # Part-less assistant row with no error and no completion:
-                    # native tail evidence with no chat content (typed-only).
-                    created = (message.get("time") or {}).get("created") if isinstance(message.get("time"), dict) else None
-                    _add(events, "lifecycle", _timestamp(created),
-                         _message_key(session_id, mid), f"message:{mid}",
-                         "message.data", text="empty assistant message")
-            continue
-        call_id, tool_status = _v1_part(row, message, session_id, events, assistant_text_seen)
-        if role == "assistant" and call_id:
-            calls_in_turn.add(call_id)
-            if tool_status in {"completed", "error"}:
-                resolved_in_turn.add(call_id)
-        if role == "assistant" and mid in assistant_text_seen:
-            tail["assistant_text"] = True
-        if role == "assistant" and _error(message, f"message:{mid}", "message.data.error"):
-            pending_errors[mid] = (message, _timestamp(
-                (message.get("time") or {}).get("created")
-                if isinstance(message.get("time"), dict) else None
-            ))
-    # Legacy v1 emits errors from messages with parts after processing all parts.
-    for mid, (message, ts) in pending_errors.items():
-        if mid in assistant_text_seen or mid in error_emitted:
-            continue
-        error = _error(message, f"message:{mid}", "message.data.error")
-        if error is not None:
-            _add(events, "assistant_message", ts, _message_key(session_id, mid),
-                 f"message:{mid}", "message.data.error", text=error.message, error=error)
-    tail["unresolved"] = bool(calls_in_turn - resolved_in_turn)
-    return events, tail
+    """Snapshot path of ``_V1Feed``: identical output, one pass."""
+    feed = _V1Feed(session_id)
+    feed.feed(rows)
+    tail, _flushed = feed.finish()
+    return feed.events, tail
 
 
 def _v1_outcome(tail: dict) -> SessionOutcome:
@@ -484,6 +559,121 @@ def _v1_outcome(tail: dict) -> SessionOutcome:
             return SessionOutcome("unknown", Evidence(_UNKNOWN))
         return SessionOutcome("done", Evidence(_NATIVE, field="message.data.finish", record=record))
     return SessionOutcome("unknown", Evidence(_UNKNOWN))
+
+
+class _V1Feed:
+    """Stateful row-sequence interpreter shared by snapshots and the reader.
+
+    ``_build_v1`` feeds every row at once; the incremental reader feeds one
+    appended batch per poll while this object carries the tail flags,
+    per-turn call sets, text/error sets, and pending message errors across
+    polls, so both paths run the same interpretation row for row.
+    ``finish()`` emits message errors with no text yet (snapshot-of-prefix
+    semantics, exactly the legacy end-of-history step). ``open_risk``
+    records message ids whose interpretation later rows could still change
+    (flushed errors, typed-only lifecycle rows). The reader takes the slow
+    full re-read whenever delta rows touch ``open_risk``, arrive out of
+    suffix order, fail count-growth accounting, or would follow previously
+    flushed errors.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self._session_id = session_id
+        self.events: list[ActivityEvent] = []
+        self.error_emitted: set[str] = set()
+        self.assistant_text_seen: set[str] = set()
+        self.pending_errors: dict[str, tuple[dict, float | None]] = {}
+        self.tail: dict[str, Any] = {
+            "role": None, "message": {}, "record": None, "unresolved": False}
+        self.calls_in_turn: set[str] = set()
+        self.resolved_in_turn: set[str] = set()
+        self.open_risk: set[str] = set()
+        self.flushed_total = 0
+
+    def feed(self, rows: list) -> list[ActivityEvent]:
+        """Interpret one batch of message/part rows, appending events.
+
+        Batches are strictly newer than every previously fed row, so each
+        row is interpreted exactly once. Returns the appended events.
+        """
+        before = len(self.events)
+        for row in rows:
+            message = _object(row["msg_data"])
+            if not message:
+                continue
+            mid = str(row["message_id"] or "")
+            role = message.get("role")
+            if role == "user":
+                self.calls_in_turn.clear()
+                self.resolved_in_turn.clear()
+            self.tail = {
+                "role": role, "message": message,
+                "record": f"message:{mid}", "unresolved": False,
+            }
+            if row["part_data"] is None:
+                if role == "assistant" and mid not in self.error_emitted:
+                    error = _error(message, f"message:{mid}", "message.data.error")
+                    if error is not None:
+                        created = ((message.get("time") or {}).get("created")
+                                   if isinstance(message.get("time"), dict) else None)
+                        _add(self.events, "assistant_message", _timestamp(created),
+                             _message_key(self._session_id, mid), f"message:{mid}",
+                             "message.data.error", text=error.message, error=error)
+                        self.error_emitted.add(mid)
+                        self.open_risk.add(mid)
+                    elif message.get("finish") != "stop":
+                        # Part-less assistant row with no error and no
+                        # completion: native tail evidence with no chat
+                        # content (typed-only).
+                        created = ((message.get("time") or {}).get("created")
+                                   if isinstance(message.get("time"), dict) else None)
+                        _add(self.events, "lifecycle", _timestamp(created),
+                             _message_key(self._session_id, mid), f"message:{mid}",
+                             "message.data", text="empty assistant message")
+                        self.open_risk.add(mid)
+                continue
+            call_id, tool_status = _v1_part(
+                row, message, self._session_id, self.events, self.assistant_text_seen)
+            if role == "assistant" and call_id:
+                self.calls_in_turn.add(call_id)
+                if tool_status in {"completed", "error"}:
+                    self.resolved_in_turn.add(call_id)
+            if role == "assistant" and mid in self.assistant_text_seen:
+                self.tail["assistant_text"] = True
+            if role == "assistant" and _error(
+                    message, f"message:{mid}", "message.data.error"):
+                self.pending_errors[mid] = (message, _timestamp(
+                    (message.get("time") or {}).get("created")
+                    if isinstance(message.get("time"), dict) else None
+                ))
+        return self.events[before:]
+
+    def finish(self) -> tuple[dict, list[ActivityEvent]]:
+        """Flush text-less message errors (the legacy end-of-history step).
+
+        Matches the snapshot's end-of-history flush, so the materialized list
+        always equals the snapshot over the rows seen so far. Unlike the
+        retired inline loop, flushed ids join ``error_emitted`` so a later
+        batch never emits the same error twice; later rows for a flushed
+        message must take the slow path (tracked via ``open_risk``).
+        Returns the tail dict plus the flushed events.
+        """
+        before = len(self.events)
+        for mid, (message, ts) in self.pending_errors.items():
+            if mid in self.assistant_text_seen or mid in self.error_emitted:
+                continue
+            error = _error(message, f"message:{mid}", "message.data.error")
+            if error is not None:
+                _add(self.events, "assistant_message", ts,
+                     _message_key(self._session_id, mid),
+                     f"message:{mid}", "message.data.error",
+                     text=error.message, error=error)
+                self.error_emitted.add(mid)
+                self.open_risk.add(mid)
+        flushed = self.events[before:]
+        self.flushed_total += len(flushed)
+        self.tail["unresolved"] = bool(self.calls_in_turn - self.resolved_in_turn)
+        return self.tail, flushed
 
 
 def _v2_part(
@@ -528,92 +718,10 @@ def _v2_part(
 def _build_v2(
     rows: list[sqlite3.Row], session_id: str,
 ) -> tuple[list[ActivityEvent], SessionOutcome]:
-    events: list[ActivityEvent] = []
-    tail_role: str | None = None
-    tail_data: dict = {}
-    tail_record = "session_message:unknown"
-    idle_failed: tuple[str, str] | None = None
-    calls_in_turn: set[str] = set()
-    resolved_in_turn: set[str] = set()
-    tail_unresolved = False
-    for row in rows:
-        row_type = str(row["type"] or "")
-        data = _object(row["data"])
-        row_id = str(row["id"] or "")
-        record = f"session_message:{row_id}"
-        if row_type == "idle" and data.get("outcome") == "failed":
-            idle_failed = (record, "data.outcome")
-        if row_type in {"system", "synthetic", "compaction", "idle"}:
-            if row_type == "compaction":
-                _add(events, "thinking", _timestamp(data.get("time", {}).get("created")
-                     if isinstance(data.get("time"), dict) else None) or _timestamp(row["time_created"]),
-                     _message_key(session_id, row_id), record, "data.summary",
-                     text=data.get("summary") if isinstance(data.get("summary"), str) else "",
-                     compaction=CompactionInfo(
-                         Evidence(_NATIVE, field="data.summary", record=record)))
-            continue
-        idle_failed = None
-        ts = (_timestamp(data.get("time", {}).get("created")
-             if isinstance(data.get("time"), dict) else None)
-              or _timestamp(row["time_created"]))
-        if row_type == "user":
-            calls_in_turn.clear()
-            resolved_in_turn.clear()
-            text = data.get("text")
-            _add(events, "user_message", ts, _message_key(session_id, row_id),
-                 record, "data.text", text=text if isinstance(text, str) else "",
-                 origin="human")
-            tail_role, tail_data, tail_record = "user", data, record
-            tail_unresolved = False
-            continue
-        if row_type != "assistant":
-            tail_role = row_type or None
-            tail_data, tail_record = data, record
-            tail_unresolved = False
-            continue
-        content = data.get("content")
-        items = content if isinstance(content, list) else []
-        text_seen = False
-        assistant_indexes: list[int] = []
-        row_events_before = len(events)
-        for item_index, item in enumerate(items):
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "reasoning":
-                continue
-            before = len(events)
-            call_id, status, is_text = _v2_part(
-                item, data, row_id, session_id, ts, events,
-            )
-            if item.get("type") == "tool":
-                outcome_key = call_id or f"{row_id}:tool:{item_index}"
-                calls_in_turn.add(outcome_key)
-                if status in {"completed", "error"}:
-                    resolved_in_turn.add(outcome_key)
-            if is_text:
-                text_seen = True
-                if len(events) > before:
-                    assistant_indexes.append(len(events) - 1)
-        error = _error(data, record, "data.error")
-        if error is not None:
-            if text_seen and assistant_indexes:
-                index = assistant_indexes[-1]
-                events[index] = _copy_with_error(events[index], error)
-            elif not text_seen:
-                _add(events, "assistant_message", ts, _message_key(session_id, row_id),
-                     record, "data.error", text=error.message, error=error)
-        elif (not text_seen and len(events) == row_events_before
-                and data.get("finish") != "stop"):
-            # Content-less assistant row with no error and no completion:
-            # native tail evidence with no chat content (typed-only).
-            _add(events, "lifecycle", ts, _message_key(session_id, row_id),
-                 record, "data.content", text="empty assistant message")
-        tail_role, tail_data, tail_record = "assistant", data, record
-        tail_unresolved = bool(calls_in_turn - resolved_in_turn)
-    outcome = _v2_outcome(
-        tail_role, tail_data, tail_record, tail_unresolved, idle_failed,
-    )
-    return events, outcome
+    """Snapshot path of ``_V2Feed``: identical output, one pass."""
+    feed = _V2Feed(session_id)
+    feed.feed(rows)
+    return feed.events, feed.finish()
 
 
 def _copy_with_error(event: ActivityEvent, error: AgentError) -> ActivityEvent:
@@ -627,16 +735,15 @@ def _copy_with_error(event: ActivityEvent, error: AgentError) -> ActivityEvent:
 # --- Incremental reader -----------------------------------------------------
 
 
-class _RowShim:
-    """Mapping-style row view over cached plain tuples for the builders."""
-
-    __slots__ = ("_data",)
-
-    def __init__(self, data: dict[str, Any]) -> None:
-        self._data = data
-
-    def __getitem__(self, key: str) -> Any:
-        return self._data[key]
+def _num(value: object) -> int:
+    """Non-negative int for ordering keys; ``-1`` for missing/non-numeric."""
+    if isinstance(value, bool):
+        return -1
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    return -1
 
 
 def _file_state(path: str) -> tuple[int, int, int, int] | None:
@@ -677,17 +784,24 @@ class OpenCodeActivityReader(ActivityReader):
     by ``(time_created, id)`` ordering, and v2 ``session_message`` rows keyed
     by ``(seq, id)``. The shared database is opened read-only with
     WAL-visible tails (never ``immutable=1``); every query filters on the
-    session id, so opening never scans other sessions. The opaque cursor
-    carries a database fingerprint (file identity plus WAL state plus SQLite
-    ``data_version``), the schema family, the last committed row position
-    (ordering keys plus boundary checksum plus row count), and the event
-    count. A no-change poll stats the main file and its ``-wal`` sidecar
-    only and never opens the database. A vacuum, rowid reuse, checkpoint
-    reshuffle that moves the boundary, file replacement, family change, or
-    invalid cursor starts a new generation: the returned events replace, not
-    extend, the previous generation. Deltas rebuild through the same
-    ``_build_v1``/``_build_v2`` builders as the snapshot, so ``seq`` stays
-    stable within a generation and ``to_v1_dicts`` parity holds.
+    session id, so opening never scans other sessions (writes for other
+    sessions cost only two small index queries and report no change). The
+    opaque cursor carries a database fingerprint (file identity plus WAL
+    state plus SQLite ``data_version``), the schema family, the last
+    committed row position (ordering keys plus boundary checksum plus row
+    counts), the event count, and compact interpreter aux state (open-risk
+    messages, flushed error totals, tail record). A no-change poll stats the
+    main file and its ``-wal`` sidecar only and never opens the database. A
+    warm append poll reads only rows after the committed position plus a
+    bounded recheck window (``time_updated`` plus per-row lengths) and feeds
+    them through the carried ``_V1Feed``/``_V2Feed``; it never re-reads or
+    rebuilds the whole per-session window. A vacuum, rowid reuse, checkpoint
+    reshuffle that moves the boundary, in-place edit inside the window,
+    file replacement, family change, or invalid cursor starts a new
+    generation: the returned events replace, not extend, the previous
+    generation. Deltas feed the same row-sequence builders as the snapshot
+    (no second interpreter), so ``seq`` stays stable within a generation and
+    ``to_v1_dicts`` parity holds.
     """
 
     def __init__(self, session: dict, cursor: Any = None) -> None:
@@ -702,19 +816,21 @@ class OpenCodeActivityReader(ActivityReader):
         self._gen = 0
         self._family: str | None = None
         self._events: list[ActivityEvent] = []
-        self._rows: list[dict[str, Any]] = []
-        self._previous_rows: list[dict[str, Any]] = []
+        self._feed: _V1Feed | _V2Feed | None = None
         self._previous_events: list[ActivityEvent] = []
         self._position = ""
+        self._pos_key: tuple = ()
         self._boundary = hashlib.sha256(b"").hexdigest()
+        self._sig: tuple = ()
+        self._counts: tuple = ()
         self._outcome = SessionOutcome("unknown", Evidence(_UNKNOWN))
         self._state: LoadState = "unavailable"
         self._file: tuple[int, int, int, int] | None = None
         self._wal: tuple[int, int, int, int] | None = None
         self._data_version = 0
         self._initialized = False
-        # Test/observability counters: database opens and session rows read
-        # (file stat calls excluded).
+        # Test/observability counters: database opens and session rows
+        # JSON-decoded for event building (recheck signature reads excluded).
         self.db_opens = 0
         self.rows_parsed = 0
 
@@ -812,13 +928,136 @@ class OpenCodeActivityReader(ActivityReader):
 
     def _rebuild_events(
         self, family: str, rows: list[dict[str, Any]],
-    ) -> tuple[list[ActivityEvent], SessionOutcome]:
-        shims = [_RowShim(row) for row in rows]
+    ) -> tuple[Any, list[ActivityEvent], SessionOutcome]:
+        """Fresh feed over full rows (slow path); returns the feed for keeps."""
         if family == "v1":
-            events, tail = _build_v1(shims, self._session_id)  # type: ignore[arg-type]
-            return events, _v1_outcome(tail)
-        events, outcome = _build_v2(shims, self._session_id)  # type: ignore[arg-type]
-        return events, outcome
+            feed: Any = _V1Feed(self._session_id)
+            feed.feed(rows)
+            tail, _flushed = feed.finish()
+            return feed, feed.events, _v1_outcome(tail)
+        feed = _V2Feed(self._session_id)
+        feed.feed(rows)
+        return feed, feed.events, feed.finish()
+
+    def _sig_for(
+        self, conn: sqlite3.Connection, family: str, rows: list[dict[str, Any]],
+    ) -> tuple | None:
+        """Tail signature scoped through the last full-read row."""
+        pos_key = self._pos_key_of(family, rows[-1]) if rows else ()
+        return self._tail_sig(conn, family, pos_key)
+
+    def _tail_sig(
+        self, conn: sqlite3.Connection, family: str, pos_key: tuple,
+    ) -> tuple | None:
+        """Bounded recheck-window signature over trailing rows at or before
+        ``pos_key`` (appends past the position never move it)."""
+        if family == "v1":
+            mt, mid = pos_key[:2] if len(pos_key) == 4 else (-1, "")
+            primary = (_V1_TAIL_SIG, (self._session_id, mt, mt, mid,
+                                      _OPENCODE_RECHECK_ROWS))
+            legacy = (_V1_TAIL_SIG_LEGACY, (self._session_id, mt, mt, mid,
+                                            _OPENCODE_RECHECK_ROWS))
+        else:
+            seq = pos_key[0] if len(pos_key) == 2 else -1
+            primary = (_V2_TAIL_SIG, (self._session_id, seq, _OPENCODE_RECHECK_ROWS))
+            legacy = (_V2_TAIL_SIG_LEGACY, (self._session_id, seq, _OPENCODE_RECHECK_ROWS))
+        try:
+            fetched = conn.execute(*primary).fetchall()
+        except sqlite3.Error as exc:
+            if not _is_missing_column(exc):
+                return None
+            try:
+                fetched = conn.execute(*legacy).fetchall()
+            except sqlite3.Error:
+                return None
+        return tuple(tuple(row) for row in fetched)
+
+    def _row_counts(
+        self, conn: sqlite3.Connection, family: str,
+    ) -> tuple | None:
+        try:
+            if family == "v1":
+                row = conn.execute(
+                    _V1_COUNTS_SQL, (self._session_id, self._session_id)).fetchone()
+                if row is None:
+                    return None
+                return (int(row[0]), int(row[1]))
+            row = conn.execute(_V2_COUNT_SQL, (self._session_id,)).fetchone()
+            if row is None:
+                return None
+            return (int(row[0]),)
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _v1_dict(row: Any) -> dict[str, Any]:
+        return {
+            "message_id": row["message_id"],
+            "time_created": row["time_created"],
+            "msg_data": row["msg_data"],
+            "part_id": row["part_id"],
+            "part_time": row["part_time"],
+            "part_data": row["part_data"],
+            "msg_updated": row["msg_updated"],
+            "part_updated": row["part_updated"],
+        }
+
+    def _read_delta_v1(
+        self, conn: sqlite3.Connection,
+    ) -> list[dict[str, Any]] | None:
+        """Strictly newer message rows plus brand-new parts of the still-open
+        last message, in snapshot order (last-message parts first). ``None``
+        on SQLite errors."""
+        pos = self._pos_key if len(self._pos_key) == 4 else (-1, "", -1, "")
+        mt, mid, pt, pid = pos
+        legacy = False
+        try:
+            new_msgs = conn.execute(
+                _V1_NEW_MESSAGES, (self._session_id, mt, mt, mid)).fetchall()
+        except sqlite3.Error as exc:
+            if not _is_missing_column(exc):
+                return None
+            legacy = True
+            try:
+                new_msgs = conn.execute(
+                    _V1_NEW_MESSAGES_LEGACY, (self._session_id, mt, mt, mid)).fetchall()
+            except sqlite3.Error:
+                return None
+        parts: list = []
+        if mid:
+            try:
+                if (pt, pid) == (-1, ""):
+                    parts = conn.execute(
+                        _V1_LAST_MSG_PARTS if not legacy else _V1_LAST_MSG_PARTS_LEGACY,
+                        (self._session_id, mid)).fetchall()
+                else:
+                    parts = conn.execute(
+                        _V1_NEW_PARTS if not legacy else _V1_NEW_PARTS_LEGACY,
+                        (self._session_id, mid, pt, pt, pid)).fetchall()
+            except sqlite3.Error:
+                return None
+        return [self._v1_dict(row) for row in parts] + [
+            self._v1_dict(row) for row in new_msgs]
+
+    def _read_delta_v2(
+        self, conn: sqlite3.Connection,
+    ) -> list[dict[str, Any]] | None:
+        seq, rid = self._pos_key if len(self._pos_key) == 2 else (-1, "")
+        try:
+            fetched = conn.execute(
+                _V2_DELTA_ROWS, (self._session_id, seq, seq, rid)).fetchall()
+        except sqlite3.Error:
+            return None
+        return [
+            {
+                "type": row["type"],
+                "seq": row["seq"],
+                "time_created": row["time_created"],
+                "id": row["id"],
+                "data": row["data"],
+            }
+            for row in fetched
+        ]
 
     def _position_of(self, family: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
         if not rows:
@@ -834,6 +1073,13 @@ class OpenCodeActivityReader(ActivityReader):
         last = rows[-1]
         position = f"{last.get('seq')}\x00{last.get('id')}"
         return position, _checksum(f"{position}\x00{last.get('data')}")
+
+    @staticmethod
+    def _pos_key_of(family: str, row: dict[str, Any]) -> tuple:
+        if family == "v1":
+            return (_num(row.get("time_created")), str(row.get("message_id") or ""),
+                    _num(row.get("part_time")), str(row.get("part_id") or ""))
+        return (_num(row.get("seq")), str(row.get("id") or ""))
 
     def _cold_open(
         self,
@@ -851,17 +1097,20 @@ class OpenCodeActivityReader(ActivityReader):
                 return
             data_version = self._fetch_data_version(conn)
             rows = self._read_session_rows(conn, family)
+            sig = self._sig_for(conn, family, rows)
+            counts = self._row_counts(conn, family)
         finally:
             conn.close()
-        if rows is None:
+        if rows is None or sig is None or counts is None:
             self._mark_unavailable()
             return
         saved = self._pending_cursor
         self._pending_cursor = None
         position, boundary = self._position_of(family, rows)
-        events, outcome = self._rebuild_events(family, rows)
-        self._adopt_state(family, rows, position, boundary, events, outcome,
-                          data_version, file_state, wal_state, fresh_gen=1)
+        feed, events, outcome = self._rebuild_events(family, rows)
+        self._adopt_state(family, feed, rows, position, boundary, sig, counts,
+                          events, outcome, data_version, file_state, wal_state,
+                          fresh_gen=1)
         self._initialized = True
         if saved is not None and self._cursor_matches(saved):
             try:
@@ -881,7 +1130,14 @@ class OpenCodeActivityReader(ActivityReader):
         file_state: tuple[int, int, int, int],
         wal_state: tuple[int, int, int, int] | None,
     ) -> None:
-        """Stat changed: re-read the bounded per-session window and diff."""
+        """Stat changed: append-only delta when possible, else a full re-read.
+
+        The fast path reads only rows after the committed position plus a
+        bounded recheck window and feeds them through the carried feed. Any
+        missing evidence or detected change falls back to the slow full
+        re-read on the same connection, which decides delta versus reset by
+        event-prefix comparison.
+        """
         conn = self._open()
         if conn is None:
             # Transient lock or checkpoint race: keep the cached generation
@@ -893,29 +1149,218 @@ class OpenCodeActivityReader(ActivityReader):
                 self._adopt_unsupported()
                 return
             data_version = self._fetch_data_version(conn)
-            rows = self._read_session_rows(conn, family)
+            if family != self._family or not isinstance(self._feed, (_V1Feed, _V2Feed)):
+                rows = self._read_session_rows(conn, family)
+                if rows is None:
+                    return
+                self._adopt_new_generation_on(
+                    conn, family, rows, data_version, file_state, wal_state)
+                return
+            if family == "v1":
+                handled = self._try_v1_delta(conn, data_version, file_state, wal_state)
+            else:
+                handled = self._try_v2_delta(conn, data_version, file_state, wal_state)
+            if handled is True or handled is None:
+                return
+            self._slow_on(conn, family, data_version, file_state, wal_state)
         finally:
             conn.close()
+
+    def _adopt_new_generation_on(
+        self,
+        conn: sqlite3.Connection,
+        family: str,
+        rows: list[dict[str, Any]],
+        data_version: int,
+        file_state: tuple[int, int, int, int],
+        wal_state: tuple[int, int, int, int] | None,
+    ) -> None:
+        """Adopt a new generation over an open connection (family change)."""
+        sig = self._sig_for(conn, family, rows)
+        counts = self._row_counts(conn, family)
+        if sig is None or counts is None:
+            return
+        self._adopt_new_generation_on_data(
+            family, rows, sig, counts, data_version, file_state, wal_state)
+
+    def _try_v1_delta(
+        self,
+        conn: sqlite3.Connection,
+        data_version: int,
+        file_state: tuple[int, int, int, int],
+        wal_state: tuple[int, int, int, int] | None,
+    ) -> bool | None:
+        """v1 fast path. True when handled, False for slow, None on transient."""
+        feed = self._feed
+        assert isinstance(feed, _V1Feed)
+        try:
+            counts = self._row_counts(conn, "v1")
+            if counts is None:
+                return None
+            if counts[0] < self._counts[0] or counts[1] < self._counts[1]:
+                return False
+            sig = self._tail_sig(conn, "v1", self._pos_key)
+            if sig is None or sig != self._sig:
+                return False
+            if counts == self._counts:
+                self._file = file_state
+                self._wal = wal_state
+                self._data_version = data_version
+                self._last_reset = False
+                self._new_events = []
+                return True
+            rows = self._read_delta_v1(conn)
+            if rows is None:
+                return None
+        except sqlite3.Error:
+            return None
+        # Suffix plus growth accounting: every count increment must be
+        # explained by a fetched row, otherwise an older row was backfilled
+        # outside the suffix and only a full rebuild can order it.
+        pos_msg = self._pos_key[:2] if len(self._pos_key) == 4 else (-1, "")
+        new_mids: set[str] = set()
+        new_pids = 0
+        for row in rows:
+            key = self._pos_key_of("v1", row)
+            if (key[0], key[1]) < pos_msg:
+                return False
+            if (key[0], key[1]) > pos_msg:
+                new_mids.add(key[1])
+            if row.get("part_id") is not None:
+                new_pids += 1
+        if len(new_mids) != counts[0] - self._counts[0]:
+            return False
+        if new_pids != counts[1] - self._counts[1]:
+            return False
+        if any(str(row.get("message_id") or "") in feed.open_risk for row in rows):
+            return False
+        flushed_before = feed.flushed_total
+        fresh = feed.feed(rows)
+        tail, flushed = feed.finish()
+        if flushed_before > 0 and (fresh or flushed):
+            return False
+        self.rows_parsed += len(rows)
+        outcome = _v1_outcome(tail)
+        if not rows:
+            return False
+        position, boundary = self._position_of("v1", [rows[-1]])
+        pos_key = self._pos_key_of("v1", rows[-1])
+        new_sig = self._tail_sig(conn, "v1", pos_key)
+        if new_sig is None:
+            return False
+        self._previous_events = list(self._events)
+        self._events = feed.events
+        self._outcome = outcome
+        self._state = "available" if feed.events else "empty"
+        self._position = position
+        self._pos_key = pos_key
+        self._boundary = boundary
+        self._sig = new_sig
+        self._counts = counts
+        self._file = file_state
+        self._wal = wal_state
+        self._data_version = data_version
+        self._last_reset = False
+        self._new_events = list(fresh) + list(flushed)
+        return True
+
+    def _try_v2_delta(
+        self,
+        conn: sqlite3.Connection,
+        data_version: int,
+        file_state: tuple[int, int, int, int],
+        wal_state: tuple[int, int, int, int] | None,
+    ) -> bool | None:
+        """v2 fast path. True when handled, False for slow, None on transient."""
+        feed = self._feed
+        assert isinstance(feed, _V2Feed)
+        try:
+            counts = self._row_counts(conn, "v2")
+            if counts is None:
+                return None
+            if counts[0] < self._counts[0]:
+                return False
+            sig = self._tail_sig(conn, "v2", self._pos_key)
+            if sig is None or sig != self._sig:
+                return False
+            if counts == self._counts:
+                self._file = file_state
+                self._wal = wal_state
+                self._data_version = data_version
+                self._last_reset = False
+                self._new_events = []
+                return True
+            rows = self._read_delta_v2(conn)
+            if rows is None:
+                return None
+        except sqlite3.Error:
+            return None
+        for row in rows:
+            if self._pos_key_of("v2", row) <= self._pos_key:
+                return False
+        # Growth accounting: seq is unique per session, so every new row
+        # must be fetched; a backfilled older seq hides outside the suffix.
+        if len(rows) != counts[0] - self._counts[0]:
+            return False
+        if not rows:
+            return False
+        self.rows_parsed += len(rows)
+        fresh = feed.feed(rows)
+        outcome = feed.finish()
+        position, boundary = self._position_of("v2", [rows[-1]])
+        pos_key = self._pos_key_of("v2", rows[-1])
+        new_sig = self._tail_sig(conn, "v2", pos_key)
+        if new_sig is None:
+            return False
+        self._previous_events = list(self._events)
+        self._events = feed.events
+        self._outcome = outcome
+        self._state = "available" if feed.events else "empty"
+        self._position = position
+        self._pos_key = pos_key
+        self._boundary = boundary
+        self._sig = new_sig
+        self._counts = counts
+        self._file = file_state
+        self._wal = wal_state
+        self._data_version = data_version
+        self._last_reset = False
+        self._new_events = list(fresh)
+        return True
+
+    def _slow_on(
+        self,
+        conn: sqlite3.Connection,
+        family: str,
+        data_version: int,
+        file_state: tuple[int, int, int, int],
+        wal_state: tuple[int, int, int, int] | None,
+    ) -> None:
+        """Slow full re-read over an open connection, then delta-or-reset."""
+        rows = self._read_session_rows(conn, family)
         if rows is None:
             return
-        if family != self._family:
-            self._adopt_new_generation(family, rows, data_version,
-                                       file_state, wal_state)
+        sig = self._sig_for(conn, family, rows)
+        counts = self._row_counts(conn, family)
+        if sig is None or counts is None:
             return
         position, boundary = self._position_of(family, rows)
-        events, outcome = self._rebuild_events(family, rows)
-        self._previous_rows = list(self._rows)
+        feed, events, outcome = self._rebuild_events(family, rows)
         self._previous_events = list(self._events)
-        self._rows = rows
+        self._family = family
+        self._feed = feed
         self._events = events
         self._outcome = outcome
         self._state = "available" if events else "empty"
         self._position = position
+        self._pos_key = self._pos_key_of(family, rows[-1]) if rows else ()
         self._boundary = boundary
+        self._sig = sig
+        self._counts = counts
         self._file = file_state
         self._wal = wal_state
         self._data_version = data_version
-        if self._prefix_matches(rows):
+        if self._events_prefix_match():
             self._last_reset = False
             self._new_events = list(self._events[len(self._previous_events):])
         else:
@@ -939,27 +1384,31 @@ class OpenCodeActivityReader(ActivityReader):
                 return
             data_version = self._fetch_data_version(conn)
             rows = self._read_session_rows(conn, family)
+            sig = self._sig_for(conn, family, rows)
+            counts = self._row_counts(conn, family)
         finally:
             conn.close()
-        if rows is None:
+        if rows is None or sig is None or counts is None:
             self._mark_unavailable()
             return
-        self._adopt_new_generation(family, rows, data_version,
-                                   file_state, wal_state)
+        self._adopt_new_generation_on_data(
+            family, rows, sig, counts, data_version, file_state, wal_state)
         self._initialized = True
 
-    def _adopt_new_generation(
+    def _adopt_new_generation_on_data(
         self,
         family: str,
         rows: list[dict[str, Any]],
+        sig: tuple,
+        counts: tuple,
         data_version: int,
         file_state: tuple[int, int, int, int],
         wal_state: tuple[int, int, int, int] | None,
     ) -> None:
         position, boundary = self._position_of(family, rows)
-        events, outcome = self._rebuild_events(family, rows)
-        self._adopt_state(family, rows, position, boundary, events, outcome,
-                          data_version, file_state, wal_state,
+        feed, events, outcome = self._rebuild_events(family, rows)
+        self._adopt_state(family, feed, rows, position, boundary, sig, counts,
+                          events, outcome, data_version, file_state, wal_state,
                           fresh_gen=self._gen + 1)
         self._initialized = True
         self._last_reset = True
@@ -968,9 +1417,12 @@ class OpenCodeActivityReader(ActivityReader):
     def _adopt_state(
         self,
         family: str,
+        feed: Any,
         rows: list[dict[str, Any]],
         position: str,
         boundary: str,
+        sig: tuple,
+        counts: tuple,
         events: list[ActivityEvent],
         outcome: SessionOutcome,
         data_version: int,
@@ -978,15 +1430,17 @@ class OpenCodeActivityReader(ActivityReader):
         wal_state: tuple[int, int, int, int] | None,
         fresh_gen: int,
     ) -> None:
-        self._previous_rows = list(self._rows)
         self._previous_events = list(self._events)
         self._family = family
-        self._rows = rows
+        self._feed = feed
         self._events = events
         self._outcome = outcome
         self._state = "available" if events else "empty"
         self._position = position
+        self._pos_key = self._pos_key_of(family, rows[-1]) if rows else ()
         self._boundary = boundary
+        self._sig = sig
+        self._counts = counts
         self._file = file_state
         self._wal = wal_state
         self._data_version = data_version
@@ -1001,15 +1455,12 @@ class OpenCodeActivityReader(ActivityReader):
         self._last_reset = True
         self._new_events = []
 
-    def _prefix_matches(self, rows: list[dict[str, Any]]) -> bool:
-        """True when the rebuild only appended: vacuum, reuse, replacement,
-        family change, or reorder change the cached rows or event prefix and
-        must start a new generation.
+    def _events_prefix_match(self) -> bool:
+        """True when the rebuild only appended: the cached event prefix is
+        unchanged, so the poll is a delta. Anything else (vacuum, reuse,
+        replacement, reorder, in-place edit) starts a new generation.
         """
-        old_rows = self._previous_rows
         old = self._previous_events
-        if len(rows) < len(old_rows) or list(rows[: len(old_rows)]) != old_rows:
-            return False
         if len(self._events) < len(old):
             return False
         old_keys = [_event_key(event) for event in old]
@@ -1022,6 +1473,27 @@ class OpenCodeActivityReader(ActivityReader):
         self._outcome = SessionOutcome("unknown", Evidence(_UNKNOWN))
         self._new_events = []
         self._last_reset = had_history
+
+    def _aux_state(self) -> dict[str, Any]:
+        """Compact interpreter aux state carried in the cursor (like the
+        JSONL readers): open-risk messages / tail record plus bounded
+        overflow flags."""
+        feed = self._feed
+        if isinstance(feed, _V1Feed):
+            risk = sorted(feed.open_risk)
+            return {
+                "open_risk": risk[:500],
+                "open_risk_truncated": len(risk) > 500,
+                "flushed": feed.flushed_total,
+                "tail": feed.tail.get("record"),
+            }
+        if isinstance(feed, _V2Feed):
+            return {
+                "tail": feed.tail_record,
+                "calls": len(feed.calls_in_turn),
+                "resolved": len(feed.resolved_in_turn),
+            }
+        return {}
 
     def _cursor_matches(self, saved: dict[str, Any]) -> bool:
         try:
@@ -1038,6 +1510,10 @@ class OpenCodeActivityReader(ActivityReader):
             if saved.get("boundary") != self._boundary:
                 return False
             if int(saved.get("events", -1)) != len(self._events):
+                return False
+            if list(saved.get("counts", [])) != list(self._counts):
+                return False
+            if saved.get("aux", {}) != self._aux_state():
                 return False
         except (TypeError, ValueError):
             return False
@@ -1062,9 +1538,10 @@ class OpenCodeActivityReader(ActivityReader):
             "data_version": self._data_version,
             "position": self._position,
             "boundary": self._boundary,
-            "rows": len(self._rows),
+            "counts": list(self._counts),
             "events": len(self._events),
             "gen": self._gen,
+            "aux": self._aux_state(),
         })
 
 
@@ -1088,3 +1565,113 @@ def _v2_outcome(
         err_record, field = idle_failed
         return SessionOutcome("aborted", Evidence(_NATIVE, field=field, record=err_record))
     return SessionOutcome("unknown", Evidence(_UNKNOWN))
+
+
+class _V2Feed:
+    """Stateful row-sequence interpreter shared by snapshots and the reader.
+
+    ``_build_v2`` feeds every row at once; the incremental reader feeds one
+    appended batch per poll while this object carries the tail role/data,
+    the ``idle`` failure flag, and the per-turn call sets across polls, so
+    both paths run the same interpretation row for row. Every row is decided
+    independently (no deferred flush), so appended batches extend the stream
+    directly; ``finish()`` purely recomputes the tail outcome.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self._session_id = session_id
+        self.events: list[ActivityEvent] = []
+        self.tail_role: str | None = None
+        self.tail_data: dict = {}
+        self.tail_record = "session_message:unknown"
+        self.tail_unresolved = False
+        self.idle_failed: tuple[str, str] | None = None
+        self.calls_in_turn: set[str] = set()
+        self.resolved_in_turn: set[str] = set()
+
+    def feed(self, rows: list) -> list[ActivityEvent]:
+        """Interpret one batch of ``session_message`` rows, appending events."""
+        before = len(self.events)
+        for row in rows:
+            row_type = str(row["type"] or "")
+            data = _object(row["data"])
+            row_id = str(row["id"] or "")
+            record = f"session_message:{row_id}"
+            if row_type == "idle" and data.get("outcome") == "failed":
+                self.idle_failed = (record, "data.outcome")
+            if row_type in {"system", "synthetic", "compaction", "idle"}:
+                if row_type == "compaction":
+                    _add(self.events, "thinking", _timestamp(data.get("time", {}).get("created")
+                         if isinstance(data.get("time"), dict) else None) or _timestamp(row["time_created"]),
+                         _message_key(self._session_id, row_id), record, "data.summary",
+                         text=data.get("summary") if isinstance(data.get("summary"), str) else "",
+                         compaction=CompactionInfo(
+                             Evidence(_NATIVE, field="data.summary", record=record)))
+                continue
+            self.idle_failed = None
+            ts = (_timestamp(data.get("time", {}).get("created")
+                  if isinstance(data.get("time"), dict) else None)
+                  or _timestamp(row["time_created"]))
+            if row_type == "user":
+                self.calls_in_turn.clear()
+                self.resolved_in_turn.clear()
+                text = data.get("text")
+                _add(self.events, "user_message", ts, _message_key(self._session_id, row_id),
+                     record, "data.text", text=text if isinstance(text, str) else "",
+                     origin="human")
+                self.tail_role, self.tail_data, self.tail_record = "user", data, record
+                self.tail_unresolved = False
+                continue
+            if row_type != "assistant":
+                self.tail_role = row_type or None
+                self.tail_data, self.tail_record = data, record
+                self.tail_unresolved = False
+                continue
+            content = data.get("content")
+            items = content if isinstance(content, list) else []
+            text_seen = False
+            assistant_indexes: list[int] = []
+            row_events_before = len(self.events)
+            for item_index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "reasoning":
+                    continue
+                before_item = len(self.events)
+                call_id, status, is_text = _v2_part(
+                    item, data, row_id, self._session_id, ts, self.events,
+                )
+                if item.get("type") == "tool":
+                    outcome_key = call_id or f"{row_id}:tool:{item_index}"
+                    self.calls_in_turn.add(outcome_key)
+                    if status in {"completed", "error"}:
+                        self.resolved_in_turn.add(outcome_key)
+                if is_text:
+                    text_seen = True
+                    if len(self.events) > before_item:
+                        assistant_indexes.append(len(self.events) - 1)
+            error = _error(data, record, "data.error")
+            if error is not None:
+                if text_seen and assistant_indexes:
+                    index = assistant_indexes[-1]
+                    self.events[index] = _copy_with_error(self.events[index], error)
+                elif not text_seen:
+                    _add(self.events, "assistant_message", ts,
+                         _message_key(self._session_id, row_id),
+                         record, "data.error", text=error.message, error=error)
+            elif (not text_seen and len(self.events) == row_events_before
+                    and data.get("finish") != "stop"):
+                # Content-less assistant row with no error and no completion:
+                # native tail evidence with no chat content (typed-only).
+                _add(self.events, "lifecycle", ts, _message_key(self._session_id, row_id),
+                     record, "data.content", text="empty assistant message")
+            self.tail_role, self.tail_data, self.tail_record = "assistant", data, record
+            self.tail_unresolved = bool(self.calls_in_turn - self.resolved_in_turn)
+        return self.events[before:]
+
+    def finish(self) -> SessionOutcome:
+        """Recompute the tail outcome over the rows seen so far (pure)."""
+        return _v2_outcome(
+            self.tail_role, self.tail_data, self.tail_record,
+            self.tail_unresolved, self.idle_failed,
+        )

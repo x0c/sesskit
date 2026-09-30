@@ -45,6 +45,7 @@ from sesskit.activity_reader import open_activity_reader, supports_incremental
 from sesskit.models import ActivitySnapshot
 from sesskit.registry import ConversationLoadError, ParserRegistry, load_session_conversation
 from sesskit.transcript import count_events, load_events
+from sesskit.visibility import visible_in_conversation
 
 RUNTIME_IDS = ("claude", "codex", "opencode", "kimi", "cursor", "pi")
 TYPED_RUNTIMES = ("pi", "claude", "codex", "cursor", "opencode")
@@ -207,9 +208,9 @@ def check_outcome(snapshot: ActivitySnapshot) -> list[Violation]:
 
 def check_v1_parity(snapshot: ActivitySnapshot, v1_events: Sequence[dict]) -> list[Violation]:
     """The typed snapshot must project byte-equal to ``load_events``."""
-    if snapshot.state != "available":
+    if snapshot.state not in {"available", "empty"}:
         return []
-    projected = to_v1_dicts(snapshot)
+    projected = to_v1_dicts(snapshot) if snapshot.state == "available" else []
     if list(projected) == list(v1_events):
         return []
     detail = f"projected {len(projected)} events, loader returned {len(v1_events)}"
@@ -217,7 +218,7 @@ def check_v1_parity(snapshot: ActivitySnapshot, v1_events: Sequence[dict]) -> li
         if left != right:
             keys = sorted(set(left) | set(right))
             differing = sorted(k for k in keys if left.get(k) != right.get(k))
-            detail = f"first diff at seq={index + 1}: keys={differing}"
+            detail = f"first diff at seq={index + 1}: differing_fields={len(differing)}"
             break
     return [Violation("v1_parity", detail)]
 
@@ -228,31 +229,87 @@ def _conversation_roles(conversation: Sequence[Any]) -> list[Violation]:
         role = message.role if hasattr(message, "role") else message.get("role")
         text = message.text if hasattr(message, "text") else message.get("text")
         if role not in {"user", "assistant"}:
-            violations.append(Violation("conversation_roles", f"turn {index} has role={role!r}"))
+            violations.append(Violation("conversation_roles", f"turn {index} has unsupported role"))
         if not isinstance(text, str) or not text.strip() or text.strip() == "None":
             violations.append(Violation("conversation_roles", f"turn {index} has empty text"))
     return violations
 
 
+def _message_role(message: Any) -> Any:
+    return message.role if hasattr(message, "role") else message.get("role")
+
+
+def _message_text(message: Any) -> Any:
+    return message.text if hasattr(message, "text") else message.get("text")
+
+
+def _visible_conversation_event(event: Any) -> bool:
+    if hasattr(event, "seq"):
+        return visible_in_conversation(event)
+    # v1 has already applied the shared event visibility projection. Only
+    # chat-message rows can appear in plain conversation.
+    return _event_type(event) in {"user_message", "assistant_message"}
+
+
+def _expected_conversation_pairs(events: Sequence[Any]) -> list[tuple[str, str]]:
+    if any(hasattr(event, "seq") for event in events):
+        return [
+            (_event_type(event).removesuffix("_message"), text)
+            for event in events
+            if _event_type(event) in {"user_message", "assistant_message"}
+            and _visible_conversation_event(event)
+            and isinstance((text := _event_text(event)), str)
+            and text.strip()
+        ]
+
+    # Kimi's legacy loader joins adjacent assistant text chunks across
+    # non-chat rows and flushes at each user message.
+    expected: list[tuple[str, str]] = []
+    pending_assistant: list[str] = []
+
+    def flush_assistant() -> None:
+        if pending_assistant:
+            expected.append(("assistant", "\n\n".join(pending_assistant)))
+            pending_assistant.clear()
+
+    for event in events:
+        kind = _event_type(event)
+        text = _event_text(event)
+        if kind == "user_message":
+            flush_assistant()
+            if isinstance(text, str) and text.strip():
+                expected.append(("user", text))
+        elif kind == "assistant_message" and isinstance(text, str) and text.strip():
+            pending_assistant.append(text.strip())
+    flush_assistant()
+    return expected
+
+
 def check_conversation(conversation: Sequence[Any], events: Sequence[Any]) -> list[Violation]:
-    """Plain conversation stays consistent with activity user/assistant text."""
+    """Plain conversation exactly matches its ordered, visible event projection."""
     violations = _conversation_roles(conversation)
-    if not conversation or not events:
-        return violations
+    actual = [(_message_role(message), _message_text(message)) for message in conversation
+              if _message_role(message) in {"user", "assistant"}
+              and isinstance(_message_text(message), str)
+              and _message_text(message).strip()]
+    expected = _expected_conversation_pairs(events)
     for role in ("user", "assistant"):
-        plain = [m.text if hasattr(m, "text") else m.get("text") for m in conversation
-                 if (m.role if hasattr(m, "role") else m.get("role")) == role]
-        typed = [_event_text(e) for e in events if _event_type(e) == f"{role}_message"]
-        typed = [t for t in typed if isinstance(t, str) and t.strip()]
-        if not plain or not typed:
-            continue  # not applicable: one side has no text for this role.
-        missing = sum(1 for text in plain
-                      if not any(text in t or t in text for t in typed))
-        if missing:
+        actual_role = [pair for pair in actual if pair[0] == role]
+        expected_role = [pair for pair in expected if pair[0] == role]
+        if actual_role != expected_role:
             violations.append(Violation(
                 f"conversation_{role}_coverage",
-                f"{missing} of {len(plain)} plain {role} turns missing from events",
+                f"ordered visible {role} projection differs "
+                f"(conversation={len(actual_role)}, events={len(expected_role)})",
             ))
+    if actual != expected and all(
+            [pair for pair in actual if pair[0] == role]
+            == [pair for pair in expected if pair[0] == role]
+            for role in ("user", "assistant")):
+        violations.append(Violation(
+            "conversation_order",
+            f"conversation turn order differs (conversation={len(actual)}, events={len(expected)})",
+        ))
     return violations
 
 
@@ -262,6 +319,7 @@ def run_conformance(
     snapshot: ActivitySnapshot | None,
     v1_events: Sequence[dict],
     conversation: Sequence[Any] | None = None,
+    compare_views: bool = True,
 ) -> ConformanceReport:
     """Run the suite against one session's loaded views.
 
@@ -269,21 +327,27 @@ def run_conformance(
     v1-level checks still run against ``v1_events``.
     """
     violations: list[Violation] = []
+    if runtime != "kimi" and (snapshot is None or snapshot.state == "unsupported"):
+        violations.append(Violation("typed_activity_unavailable",
+                                    "runtime declares typed activity but snapshot is unsupported"))
     if snapshot is not None and snapshot.state == "available":
         typed = list(snapshot.events)
         violations.extend(check_seq(typed))
         violations.extend(check_pairing(typed))
         violations.extend(check_evidence(typed))
         violations.extend(check_outcome(snapshot))
-        violations.extend(check_v1_parity(snapshot, v1_events))
+        if compare_views:
+            violations.extend(check_v1_parity(snapshot, v1_events))
         state = snapshot.state
         count = len(typed)
     else:
         violations.extend(check_seq(list(v1_events)))
         violations.extend(check_pairing(list(v1_events)))
+        if snapshot is not None and snapshot.state == "empty" and compare_views:
+            violations.extend(check_v1_parity(snapshot, v1_events))
         state = snapshot.state if snapshot is not None else "legacy"
         count = len(v1_events)
-    if conversation is not None:
+    if conversation is not None and compare_views:
         basis = list(snapshot.events) if snapshot is not None and snapshot.state == "available" else list(v1_events)
         violations.extend(check_conversation(conversation, basis))
     return ConformanceReport(runtime=runtime, state=state, event_count=count,
@@ -315,6 +379,54 @@ def _error_kind(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _source_stamp(session: dict) -> tuple | None:
+    """Best-effort stable identity/version evidence for independent reads."""
+    path = str(session.get("path") or "")
+    if not path:
+        return None
+    if str(session.get("source") or "") == "cursor" and os.path.isdir(path):
+        paths = [os.path.join(path, "store.db"), os.path.join(path, "store.db-wal"),
+                 os.path.join(path, "prompt_history.json")]
+    else:
+        paths = [path, path + "-wal"]
+        if str(session.get("source") or "") == "cursor":
+            paths.append(os.path.join(os.path.dirname(path), "prompt_history.json"))
+    stamps: list[tuple] = []
+    for candidate in paths:
+        try:
+            stat = os.stat(candidate)
+        except FileNotFoundError:
+            stamps.append(("missing",))
+        except OSError as exc:
+            stamps.append(("unreadable", type(exc).__name__))
+        else:
+            stamps.append((stat.st_dev, stat.st_ino, stat.st_size,
+                           stat.st_mtime_ns, stat.st_ctime_ns))
+    return tuple(stamps)
+
+
+def _source_exists(session: dict) -> bool:
+    """Confirm a scanned session still has one of its native source files."""
+    path = str(session.get("path") or "")
+    if not path:
+        return False
+    if str(session.get("source") or "") == "cursor":
+        if os.path.isdir(path):
+            return any(os.path.isfile(os.path.join(path, name))
+                       for name in ("store.db", "prompt_history.json"))
+        return (os.path.isfile(path)
+                or os.path.isfile(os.path.join(os.path.dirname(path), "prompt_history.json")))
+    return bool(os.path.isfile(path))
+
+
+def _is_exact_suffix(window: Sequence[Any], full: Sequence[Any]) -> bool:
+    if len(window) > len(full):
+        return False
+    if not window:
+        return not full
+    return list(window) == list(full[-len(window):])
+
+
 def verify_session(session: dict) -> dict:
     """Load one real session through every view and run conformance.
 
@@ -322,7 +434,9 @@ def verify_session(session: dict) -> dict:
     or paths.
     """
     runtime = str(session.get("source") or "unknown")
+    source_present = _source_exists(session)
     started = time.perf_counter()
+    source_stamps: list[tuple | None] = [_source_stamp(session)]
     try:
         conversation = load_session_conversation(session)
         load_ok = True
@@ -336,46 +450,84 @@ def verify_session(session: dict) -> dict:
         load_ok = False
         load_error = _error_kind(exc)
     conversation_ms = (time.perf_counter() - started) * 1000
+    source_stamps.append(_source_stamp(session))
 
     started = time.perf_counter()
     try:
         snapshot = load_activity(session)
-    except Exception:  # noqa: BLE001 — an unreadable history is unavailable
+        activity_load_error = None
+    except Exception as exc:  # noqa: BLE001 — recorded as a failed load
         from sesskit.models import Evidence, SessionOutcome
         snapshot = ActivitySnapshot("unavailable", (), SessionOutcome("unknown", Evidence("unknown")))
+        activity_load_error = _error_kind(exc)
     snapshot_ms = (time.perf_counter() - started) * 1000
+    source_stamps.append(_source_stamp(session))
+    if snapshot.state == "unavailable" and activity_load_error is None:
+        activity_load_error = "Unavailable"
+    activity_load_ok = activity_load_error is None or (
+        snapshot.state == "unsupported" and runtime == "kimi")
 
     started = time.perf_counter()
     try:
         v1_events = load_events(session)
-    except Exception:  # noqa: BLE001 — counted via parity below
+        event_load_error = None
+    except Exception as exc:  # noqa: BLE001 — counted, never raised
         v1_events = []
+        event_load_error = _error_kind(exc)
     v1_ms = (time.perf_counter() - started) * 1000
+    source_stamps.append(_source_stamp(session))
+
+    source_stable = (source_stamps[0] is not None
+                     and all(stamp == source_stamps[0] for stamp in source_stamps[1:]))
+    views_available = (source_present and load_ok and activity_load_ok and event_load_error is None
+                       and snapshot.state in {"available", "empty", "unsupported"})
 
     report = run_conformance(runtime, snapshot=snapshot, v1_events=v1_events,
-                             conversation=conversation if load_ok else [])
-
+                             conversation=conversation if load_ok else None,
+                             compare_views=bool(source_stable and views_available))
+    violations = [{"rule": v.rule, "detail": v.detail} for v in report.violations]
+    if not load_ok:
+        violations.append({"rule": "conversation_load", "detail": "conversation load failed"})
+    if not activity_load_ok:
+        violations.append({"rule": "activity_load", "detail": "activity load failed or was unavailable"})
+    if event_load_error is not None:
+        violations.append({"rule": "event_load", "detail": "v1 event load failed"})
+    if not source_present:
+        violations.append({"rule": "source_missing", "detail": "scanned session source is absent"})
     reader_info: dict[str, Any] = {"supported": False, "ok": True,
                                    "reset": None, "mismatch": False,
                                    "page_ok": None,
-                                   "open_poll_ms": None}
-    if supports_incremental(session):
+                                   "open_poll_ms": None, "error_kind": None,
+                                   "comparison_state": "not_applicable"}
+    try:
+        reader_supported = supports_incremental(session)
+    except Exception as exc:  # noqa: BLE001 — capability probe itself can fail
+        reader_supported = False
+        reader_info.update(ok=False, error_kind=_error_kind(exc),
+                           comparison_state="failed")
+    if reader_supported:
+        reader_source_before = _source_stamp(session)
+        source_stamps.append(reader_source_before)
         reader_info["supported"] = True
+        reader_info["comparison_state"] = "inconclusive"
         started = time.perf_counter()
         try:
             reader = open_activity_reader(session)
             poll = reader.poll()
             reader_info["open_poll_ms"] = (time.perf_counter() - started) * 1000
             reader_info["reset"] = bool(poll.reset)
-            if snapshot.state == "available" and poll.state == "available" and poll.reset:
-                poll_keys = [(e.seq, e.type) for e in poll.events]
-                snap_keys = [(e.seq, e.type) for e in snapshot.events]
-                # Tail-window readers return a suffix with snapshot-global
-                # seqs; full readers return everything. Either shape is
-                # exact; anything else (renumbered, reordered, dropped
-                # middle events) mismatches.
-                if poll_keys != snap_keys and poll_keys != snap_keys[len(snap_keys) - len(poll_keys):]:
-                    reader_info["mismatch"] = True
+            if source_stable and views_available:
+                expected_state = snapshot.state
+                state_matches = poll.state == expected_state
+                events_match = (snapshot.state == "available"
+                                and (list(poll.events) == list(snapshot.events)
+                                     or _is_exact_suffix(poll.events, snapshot.events)))
+                if snapshot.state == "empty":
+                    events_match = not poll.events
+                outcome_matches = poll.outcome == snapshot.outcome
+                reader_info["mismatch"] = not (
+                    state_matches and poll.reset and events_match and outcome_matches)
+                reader_info["comparison_state"] = "verified"
             # Backward pages reassembled must equal the full snapshot with
             # dense seqs and intact call/result order, in every generation;
             # a generation change mid-paging (live writer) is inconclusive,
@@ -384,9 +536,11 @@ def verify_session(session: dict) -> dict:
                 assembled: list = []
                 before_token = None
                 pg = None
+                generation_changed = False
                 for _ in range(200):
                     pg = reader.page(before=before_token, limit=200)
                     if str(pg.generation) != str(poll.generation):
+                        generation_changed = True
                         break
                     assembled = list(pg.events) + assembled
                     if not pg.has_more:
@@ -394,37 +548,87 @@ def verify_session(session: dict) -> dict:
                     before_token = pg.before
                 else:
                     reader_info["page_ok"] = False
-                if reader_info["page_ok"] is None and pg is not None and str(
+                if generation_changed:
+                    reader_info["page_ok"] = None
+                    reader_info["mismatch"] = False
+                    reader_info["comparison_state"] = "inconclusive"
+                elif reader_info["page_ok"] is None and pg is not None and str(
                         pg.generation) == str(poll.generation):
-                    asm_keys = [(e.seq, e.type) for e in assembled]
-                    snap_keys = ([(e.seq, e.type) for e in snapshot.events]
-                                 if snapshot.state == "available" else [])
-                    reader_info["page_ok"] = bool(asm_keys == snap_keys)
-            except Exception:  # noqa: BLE001 — counted, never raised
+                    if source_stable and views_available and snapshot.state in {"available", "empty"}:
+                        reader_info["page_ok"] = (
+                            assembled == list(snapshot.events)
+                            and poll.outcome == snapshot.outcome
+                            and poll.state == snapshot.state
+                        )
+                        if reader_info["page_ok"]:
+                            reader_info["comparison_state"] = "verified"
+            except Exception as exc:  # noqa: BLE001 — counted, never raised
                 reader_info["page_ok"] = False
-        except Exception:  # noqa: BLE001 — counted, never raised
+                reader_info["ok"] = False
+                reader_info["error_kind"] = _error_kind(exc)
+        except Exception as exc:  # noqa: BLE001 — counted, never raised
             reader_info["ok"] = False
+            reader_info["error_kind"] = _error_kind(exc)
             reader_info["open_poll_ms"] = (time.perf_counter() - started) * 1000
+            reader_info["comparison_state"] = "failed"
+        source_stamps.append(_source_stamp(session))
+    elif runtime == "kimi":
+        reader_info["comparison_state"] = "unsupported"
+    elif runtime in TYPED_RUNTIMES:
+        reader_info.update(ok=False, error_kind="UnsupportedCapability",
+                           comparison_state="failed")
+        violations.append({"rule": "reader_unavailable",
+                           "detail": "runtime declares incremental reading but has no reader"})
 
-    violations = [{"rule": v.rule, "detail": v.detail} for v in report.violations]
-    if reader_info["mismatch"]:
+    source_stable = (source_stamps[0] is not None
+                     and all(stamp == source_stamps[0] for stamp in source_stamps[1:]))
+    if not source_stable and reader_info["supported"] and reader_info["ok"]:
+        # Independent reader and snapshot reads may straddle an append or
+        # checkpoint. Preserve any operation error, but do not call the
+        # resulting comparison a pass or a content mismatch.
+        reader_info["mismatch"] = False
+        if reader_info["page_ok"] is not False:
+            reader_info["page_ok"] = None
+        reader_info["comparison_state"] = "inconclusive"
+
+    if reader_info["mismatch"] and source_stable:
         violations.append({"rule": "reader_snapshot_match",
-                           "detail": "incremental poll events differ from snapshot"})
-    if reader_info["page_ok"] is False:
+                           "detail": "incremental poll state, events, or outcome differ from snapshot"})
+    if reader_info["page_ok"] is False and source_stable:
         violations.append({"rule": "reader_page_match",
-                           "detail": "backward pages do not reassemble the poll"})
+                           "detail": "backward pages do not equal the full snapshot"})
+    if not reader_info["ok"]:
+        violations.append({"rule": "reader_failure", "detail": "reader operation failed"})
+
+    failed = bool(violations)
+    comparison_state = "verified" if source_stable else "inconclusive"
+    verification_state = ("failed" if failed else
+                         "inconclusive" if not source_stable
+                         or (reader_info["supported"] and reader_info["page_ok"] is None)
+                         else "passed")
 
     return {
         "runtime": runtime,
+        "verification_state": verification_state,
+        "comparison_state": comparison_state,
+        "source_stable": source_stable,
+        "source_present": source_present,
         "load_ok": load_ok,
         "load_error_kind": load_error,
+        "activity_load_ok": activity_load_ok,
+        "activity_load_error_kind": activity_load_error,
+        "event_load_ok": event_load_error is None,
+        "event_load_error_kind": event_load_error,
         "state": snapshot.state,
         "outcome": snapshot.outcome.status,
         "event_count": report.event_count,
         "event_types": count_events(v1_events),
         "evidence": _evidence_counts(snapshot),
         "result_status": _result_counts(snapshot),
-        "parity_ok": not any(v.rule == "v1_parity" for v in report.violations),
+        "parity_ok": (None if not (source_stable and views_available
+                                   and snapshot.state in {"available", "empty"}) else
+                      event_load_error is None and
+                      not any(v.get("rule") == "v1_parity" for v in violations)),
         "violations": violations,
         "conversation_ms": round(conversation_ms, 2),
         "snapshot_ms": round(snapshot_ms, 2),
@@ -490,26 +694,37 @@ def probe_jsonl_reader(session: dict) -> dict[str, Any]:
                                "nochange_empty_ok": None, "cold_ms": None,
                                "nochange_ms": None, "page_ms": None,
                                "append_ms": None, "events_before": None,
-                               "size_bytes": None, "error_kind": None}
+                               "size_bytes": None, "error_kind": None,
+                               "inconclusive": False, "skip_reason": None}
     rows = _probe_append_rows(runtime_id)
     src = str(session.get("path") or "")
     if rows is None or not src or not os.path.isfile(src):
+        outcome["skip_reason"] = "source_unavailable"
         return outcome
     try:
         with tempfile.TemporaryDirectory() as tmp:
             dst = os.path.join(tmp, "history.jsonl")
+            source_before = _source_stamp(session)
             shutil.copyfile(src, dst)
+            if source_before is None or source_before != _source_stamp(session):
+                outcome["inconclusive"] = True
+                outcome["skip_reason"] = "source_changed_during_copy"
+                return outcome
             probe_session = dict(session, path=dst)
             outcome["size_bytes"] = os.path.getsize(dst)
             started = time.perf_counter()
             reader = open_activity_reader(probe_session)
-            reader.poll()
+            baseline = reader.poll()
             outcome["cold_ms"] = round((time.perf_counter() - started) * 1000, 2)
             outcome["events_before"] = len(getattr(reader, "_events", ()))
             started = time.perf_counter()
             again = reader.poll()
             outcome["nochange_ms"] = round((time.perf_counter() - started) * 1000, 2)
-            outcome["nochange_empty_ok"] = again.events == () and not again.reset
+            outcome["nochange_empty_ok"] = (
+                again.events == () and not again.reset
+                and again.state == baseline.state
+                and again.outcome == baseline.outcome
+            )
             started = time.perf_counter()
             reader.page(limit=50)
             outcome["page_ms"] = round((time.perf_counter() - started) * 1000, 2)
@@ -522,6 +737,7 @@ def probe_jsonl_reader(session: dict) -> dict[str, Any]:
             before_total = outcome["events_before"] or 0
             outcome["append_parity_ok"] = bool(
                 not delta.reset
+                and delta.state == after.state
                 and list(delta.events) == list(after.events[before_total:])
                 and delta.outcome == after.outcome)
             outcome["checked"] = True
@@ -532,16 +748,20 @@ def probe_jsonl_reader(session: dict) -> dict[str, Any]:
 
 def _empty_runtime_report(sample: int) -> dict[str, Any]:
     return {
+        "verification_state": "unverified",
         "sample": sample,
         "scanned": 0,
         "sampled": 0,
         "load_ok": 0,
         "load_failed": 0,
+        "activity_load_failed": 0,
+        "event_load_failed": 0,
         "load_errors": {},
         "states": {},
         "parity_ok": 0,
         "parity_failed": 0,
         "parity_not_applicable": 0,
+        "parity_inconclusive": 0,
         "violations": {},
         "event_types": {name: 0 for name in ("user_message", "assistant_message",
                                              "thinking", "tool_call", "tool_result")},
@@ -557,6 +777,11 @@ def _empty_runtime_report(sample: int) -> dict[str, Any]:
 def verify_runtime(registry: ParserRegistry, runtime_id: str, sample: int) -> dict[str, Any]:
     """Verify up to ``sample`` recent real sessions for one runtime."""
     report = _empty_runtime_report(sample)
+    if sample < 0:
+        raise ValueError("sample limit must be non-negative")
+    if sample == 0:
+        report["skip_reason"] = "sample_limit_zero"
+        return report
     started = time.perf_counter()
     try:
         sessions = registry.get(runtime_id).scan_sessions(sample)
@@ -567,14 +792,21 @@ def verify_runtime(registry: ParserRegistry, runtime_id: str, sample: int) -> di
     report["timings_ms"]["scan"] = round((time.perf_counter() - started) * 1000, 2)
     if scan_error is not None:
         report["scan_error_kind"] = scan_error
+        report["verification_state"] = "failed"
+        report["violations"]["scan_failure"] = 1
         return report
     report["scanned"] = len(sessions)
+    if not sessions:
+        report["skip_reason"] = "no_sessions"
+        return report
     snapshot_times: list[float] = []
     reader_times: list[float] = []
+    session_results: list[dict] = []
     largest: dict | None = None
     largest_bytes = -1
     for session in sessions[: max(0, sample)]:
         result = verify_session(dict(session))
+        session_results.append(result)
         report["sampled"] += 1
         try:
             size_bytes = int(dict(session).get("size_bytes") or 0)
@@ -589,9 +821,15 @@ def verify_runtime(registry: ParserRegistry, runtime_id: str, sample: int) -> di
             report["load_failed"] += 1
             kind = result["load_error_kind"] or "Unknown"
             report["load_errors"][kind] = report["load_errors"].get(kind, 0) + 1
+        if not result["activity_load_ok"]:
+            report["activity_load_failed"] += 1
+        if not result["event_load_ok"]:
+            report["event_load_failed"] += 1
         report["states"][result["state"]] = report["states"].get(result["state"], 0) + 1
         if result["state"] in {"unavailable", "unsupported", "legacy"}:
             report["parity_not_applicable"] += 1
+        elif result["comparison_state"] != "verified":
+            report["parity_inconclusive"] += 1
         elif result["parity_ok"]:
             report["parity_ok"] += 1
         else:
@@ -627,12 +865,35 @@ def verify_runtime(registry: ParserRegistry, runtime_id: str, sample: int) -> di
     report["timings_ms"]["reader_p95"] = _p95_ms(reader_times)
     if runtime_id in {"claude", "codex"} and largest is not None:
         probe = probe_jsonl_reader(largest)
+        if probe["checked"]:
+            probe["verification_state"] = (
+                "passed" if probe["append_parity_ok"] is True
+                and probe["nochange_empty_ok"] is True else "failed")
+        elif probe["error_kind"]:
+            probe["verification_state"] = "failed"
+        elif probe["inconclusive"]:
+            probe["verification_state"] = "inconclusive"
+        else:
+            probe["verification_state"] = "unverified"
         report["reader_probe"] = probe
-        if probe["checked"] and (
-                probe["append_parity_ok"] is not True
-                or probe["nochange_empty_ok"] is not True):
+        if probe["verification_state"] == "failed":
             report["violations"]["reader_append_match"] = (
                 report["violations"].get("reader_append_match", 0) + 1)
+    states = [result["verification_state"] for result in session_results]
+    probe_state = report.get("reader_probe", {}).get("verification_state")
+    if not report["sampled"]:
+        report["verification_state"] = "unverified"
+    elif any(state == "failed" for state in states) or report["violations"]:
+        report["verification_state"] = "failed"
+    elif any(state == "inconclusive" for state in states) or probe_state == "inconclusive":
+        report["verification_state"] = "inconclusive"
+    elif probe_state == "unverified":
+        report["verification_state"] = "unverified"
+    elif runtime_id in {"claude", "codex"} and largest is not None and (
+            report.get("reader_probe", {}).get("verification_state") != "passed"):
+        report["verification_state"] = "failed"
+    else:
+        report["verification_state"] = "passed"
     return report
 
 
@@ -646,16 +907,30 @@ def verify_all(registry: ParserRegistry, runtime_ids: Sequence[str], sample: int
         totals["sampled"] += single["sampled"]
         totals["load_ok"] += single["load_ok"]
         totals["load_failed"] += single["load_failed"]
+        totals["activity_load_failed"] += single["activity_load_failed"]
+        totals["event_load_failed"] += single["event_load_failed"]
         totals["parity_ok"] += single["parity_ok"]
         totals["parity_failed"] += single["parity_failed"]
         totals["parity_not_applicable"] += single["parity_not_applicable"]
+        totals["parity_inconclusive"] += single["parity_inconclusive"]
         for key in ("load_errors", "states", "violations", "event_types",
                     "evidence", "outcomes", "result_status"):
             for name, count in single[key].items():
                 totals[key][name] = totals[key].get(name, 0) + count
         for key in ("supported", "ok", "failed", "mismatched", "page_failed"):
             totals["reader"][key] += single["reader"][key]
-    passed = (totals["parity_failed"] == 0
+    all_verified = bool(runtimes) and all(
+        single["verification_state"] == "passed" for single in runtimes.values())
+    passed = (all_verified and totals["parity_failed"] == 0
               and not totals["violations"]
-              and totals["reader"]["mismatched"] == 0)
-    return {"sample": sample, "runtimes": runtimes, "totals": totals, "passed": passed}
+              and totals["reader"]["mismatched"] == 0
+              and totals["reader"]["failed"] == 0)
+    state = "passed" if passed else (
+        "failed" if any(single["verification_state"] == "failed"
+                         for single in runtimes.values())
+        else "inconclusive" if any(single["verification_state"] == "inconclusive"
+                                   for single in runtimes.values())
+        else "unverified")
+    totals["verification_state"] = state
+    return {"sample": sample, "runtimes": runtimes, "totals": totals,
+            "verification_state": state, "passed": passed}

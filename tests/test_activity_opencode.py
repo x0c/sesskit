@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from sesskit.activity import to_v1_dicts
 from sesskit.activity_opencode import load_opencode_activity
 from sesskit.parsers import opencode as scan_opencode
-from sesskit.parsers.common import classify_tool
 from sesskit.transcript import load_events
 
 
@@ -67,38 +67,9 @@ def _v2_db(path: Path, rows: list[tuple[str, int, str, dict]]) -> None:
 
 
 def _legacy_projection(snapshot) -> list[dict]:
-    projected: list[dict] = []
-    for event in snapshot.events:
-        item = {"type": event.type, "seq": event.seq, "ts": event.ts}
-        if event.type in {"user_message", "assistant_message", "thinking"}:
-            item["text"] = event.text
-        elif event.type == "tool_call":
-            item.update({
-                "id": event.call_id or "",
-                "name": event.name or "tool",
-                "kind": classify_tool(event.name or "tool"),
-                "input": event.raw_input if event.raw_input is not None else {},
-            })
-        elif event.type == "tool_result":
-            status = event.result.status if event.result is not None else "unknown"
-            item.update({
-                "call_id": event.call_id or "",
-                "status": "error" if status == "error" else "ok",
-            })
-            raw_output = event.raw_output
-            if isinstance(raw_output, list):
-                raw_output = "\n\n".join(
-                    part["text"].strip()
-                    for part in raw_output
-                    if isinstance(part, dict)
-                    and part.get("type") == "text"
-                    and isinstance(part.get("text"), str)
-                    and part["text"].strip()
-                )
-            if raw_output is not None:
-                item["output"] = raw_output
-        projected.append(item)
-    return projected
+    # The production v1 projection is the contract; a private copy here fell
+    # behind once typed-only lifecycle markers were added (2026-09-30).
+    return to_v1_dicts(snapshot)
 
 
 def _same_legacy_events(snapshot, legacy: list[dict]) -> bool:
@@ -353,46 +324,84 @@ class OpenCodeV2ActivityTests(unittest.TestCase):
         paths = scan_opencode._db_paths()
         if not paths:
             self.skipTest("no local OpenCode history")
-        conn = scan_opencode.connect_ro(paths[0])
-        if conn is None:
-            self.skipTest("local OpenCode database is unavailable")
-        try:
-            tables = {
-                row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-            sample: list[str] = []
-            if {"session", "message", "part"} <= tables:
-                sample.extend(row[0] for row in conn.execute(
-                    "SELECT s.id FROM session s JOIN message m ON m.session_id=s.id "
-                    "WHERE s.parent_id IS NULL GROUP BY s.id "
-                    "ORDER BY MAX(m.time_created) DESC LIMIT 2"
-                ))
-            if "session_message" in tables:
-                sample.extend(row[0] for row in conn.execute(
-                    "SELECT session_id FROM session_message "
-                    "WHERE type IN ('user','assistant') "
-                    "GROUP BY session_id ORDER BY MAX(time_updated) DESC LIMIT 3"
-                ))
-        finally:
-            conn.close()
-        sample = list(dict.fromkeys(str(session_id) for session_id in sample))[:5]
-        if not sample:
-            self.skipTest("no bounded OpenCode history sample")
-        checked = 0
-        for session_id in sample:
-            session = {"source": "opencode", "path": paths[0], "id": session_id}
-            snapshot = load_opencode_activity(session)
-            legacy = load_events(session)
-            self.assertIn(snapshot.state, {"available", "empty"})
-            if snapshot.state == "available":
-                self.assertTrue(
-                    _same_legacy_events(snapshot, legacy),
-                    "typed adapter differs from transcript v1 on a private live sample",
-                )
-            checked += 1
-        self.assertGreater(checked, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot_path = Path(directory) / "opencode-snapshot.db"
+            source = scan_opencode.connect_ro(paths[0])
+            if source is None:
+                self.fail("could not open local history read-only for snapshot")
+            destination = sqlite3.connect(snapshot_path)
+            try:
+                source.backup(destination)
+            except sqlite3.Error:
+                self.fail("could not create a stable local history snapshot")
+            finally:
+                destination.close()
+                source.close()
+
+            # Select IDs only after backup, so all exact IDs and both views
+            # refer to the same consistent database image.
+            conn = sqlite3.connect(snapshot_path)
+            try:
+                tables = {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                sample: list[str] = []
+                if {"session", "message", "part"} <= tables:
+                    sample.extend(row[0] for row in conn.execute(
+                        "SELECT s.id FROM session s JOIN message m ON m.session_id=s.id "
+                        "WHERE s.parent_id IS NULL GROUP BY s.id "
+                        "ORDER BY MAX(m.time_created) DESC LIMIT 2"
+                    ))
+                if "session_message" in tables:
+                    sample.extend(row[0] for row in conn.execute(
+                        "SELECT session_id FROM session_message "
+                        "WHERE type IN ('user','assistant') "
+                        "GROUP BY session_id ORDER BY MAX(time_updated) DESC LIMIT 3"
+                    ))
+            finally:
+                conn.close()
+
+            sample = list(dict.fromkeys(str(session_id) for session_id in sample))[:5]
+            if not sample:
+                self.skipTest("stable local history snapshot has no bounded sample")
+            checked = 0
+            for session_id in sample:
+                # Keep each source-native session ID unchanged in the copied DB.
+                session = _session(snapshot_path, session_id)
+                snapshot = load_opencode_activity(session)
+                legacy = load_events(session)
+                self.assertIn(snapshot.state, {"available", "empty"})
+                if snapshot.state == "available":
+                    typed = _legacy_projection(snapshot)
+                    if typed != legacy:
+                        field_counts: dict[str, int] = {}
+                        first_difference = None
+                        for left, right in zip(typed, legacy):
+                            if left != right and first_difference is None:
+                                first_difference = left["seq"]
+                            for field in set(left) | set(right):
+                                if left.get(field) != right.get(field):
+                                    field_counts[field] = field_counts.get(field, 0) + 1
+                        typed_types: dict[str, int] = {}
+                        legacy_types: dict[str, int] = {}
+                        for event in typed:
+                            typed_types[event["type"]] = typed_types.get(event["type"], 0) + 1
+                        for event in legacy:
+                            legacy_types[event["type"]] = legacy_types.get(event["type"], 0) + 1
+                        self.fail(
+                            "stable snapshot typed-v1 mismatch: "
+                            f"event_counts=({len(typed)}, {len(legacy)}), "
+                            f"first_differing_seq={first_difference}, "
+                            f"typed_type_counts={typed_types}, "
+                            f"legacy_type_counts={legacy_types}, "
+                            f"typed_tail={[(event['type'], event['seq']) for event in typed[-3:]]}, "
+                            f"legacy_tail={[(event['type'], event['seq']) for event in legacy[-3:]]}, "
+                            f"differing_fields={field_counts}"
+                        )
+                checked += 1
+            self.assertGreater(checked, 0)
 
 
 if __name__ == "__main__":

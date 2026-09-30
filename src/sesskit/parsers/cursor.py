@@ -152,6 +152,45 @@ def _fallback_title(native_title: str | None, first_user: str, last_user: str) -
     return "(无消息)"
 
 
+# 新版 CLI 的 `--print` 一次性会话只落 meta.json（无 title）+ store.db，
+# 不写 prompt_history.json。store meta 表的 name 即标题源（老会话与
+# meta.json 一致），新会话在标题同步前是该占位值。
+_GENERIC_STORE_NAMES = frozenset({"New Agent"})
+
+
+def _store_list_evidence(chat_dir: str) -> tuple[str | None, bool]:
+    """store-only 会话的列表证据：``(可用标题或 None, 是否有消息 blob)``。
+
+    列表级为保首屏仍不扫 blob：只读 meta 表单行 + 一次存在性查询。
+    store 缺失、打不开、表结构不对时一律按无证据处理。
+    """
+    store_path = os.path.join(chat_dir, "store.db")
+    if not os.path.isfile(store_path):
+        return None, False
+    conn = connect_store_ro(store_path)
+    if conn is None:
+        return None, False
+    try:
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key = '0'").fetchone()
+        except sqlite3.Error:
+            row = None
+        title: str | None = None
+        if row:
+            obj = _decode_store_meta_value(row[0])
+            if isinstance(obj, dict):
+                name = str(obj.get("name") or "").strip()
+                if name and name not in _GENERIC_STORE_NAMES:
+                    title = name
+        try:
+            has_blobs = conn.execute("SELECT 1 FROM blobs LIMIT 1").fetchone() is not None
+        except sqlite3.Error:
+            has_blobs = False
+        return title, has_blobs
+    finally:
+        conn.close()
+
+
 def _chat_size_bytes(chat_dir: str) -> int:
     total = 0
     for name in ("meta.json", "prompt_history.json", "store.db"):
@@ -182,8 +221,16 @@ def _build_session_info(
     last_user_msg = prompts[0] if prompts else ""
     first_user_msg = prompts[-1] if prompts else ""
 
+    store_only = False
     if not first_user_msg and not native_title:
-        return None
+        # 无标题、无 prompt：store 里有消息 blob 仍是真实会话（标题/摘要留空，
+        # 由消费方按预览对话补齐；状态未知，禁止伪造已完成）。空壳与缺 store
+        # 仍不进列表。
+        store_title, has_blobs = _store_list_evidence(chat_dir)
+        if not has_blobs:
+            return None
+        native_title = store_title
+        store_only = True
 
     updated = _ms_to_epoch(meta.get("updatedAtMs"))
     created = _ms_to_epoch(meta.get("createdAtMs"))
@@ -215,6 +262,13 @@ def _build_session_info(
     # Cursor 列表级无助手正文证据：completion_id 留空；终端态才有值。
     # store.db 详情里若读到助手最终答复，后续可在此补证据再发 id（见 Slice 0 设计）。
     completion_id = ""
+    # store-only 会话标题/摘要留空：消费方按预览对话补标题并生成，列表级不
+    # 得用 "(无消息)" 占位（会话实际有内容）也不得伪造摘要。
+    fallback_title = (
+        ""
+        if (store_only and not native_title)
+        else _fallback_title(native_title, first_user_msg, last_user_msg)
+    )
     return make_session_info(
         source="cursor",
         id=chat_id,
@@ -226,7 +280,7 @@ def _build_session_info(
         file_mtime=file_mtime,
         size_bytes=size_bytes,
         native_title=native_title,
-        fallback_title=_fallback_title(native_title, first_user_msg, last_user_msg),
+        fallback_title=fallback_title,
         status_tag=status_tag,
         path=history_path,
         first_user_msg=preprocess_excerpt(first_user_msg, host),

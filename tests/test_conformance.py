@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -32,9 +33,13 @@ from sesskit.models import (
     ActivityEvent,
     ActivitySnapshot,
     AgentError,
+    AnswerRecord,
     Evidence,
+    InteractionRequest,
+    QuestionItem,
     SessionOutcome,
     ToolResultOutcome,
+    Usage,
 )
 from sesskit.parsers import kimi as kimi_parser
 from sesskit.registry import ParserRegistry, RuntimeParser, load_session_conversation
@@ -397,6 +402,19 @@ def test_kimi_fixture_passes_v1_and_load_paths():
         assert report.passed, report.violations
 
 
+def test_verify_session_kimi_typed_unsupported_keeps_legacy_checks():
+    with tempfile.TemporaryDirectory() as directory:
+        session = _kimi_fixture(Path(directory))
+        result = verify_session(session)
+    assert result["state"] == "unsupported"
+    assert result["activity_load_ok"] is True
+    assert result["event_load_ok"] is True
+    assert result["parity_ok"] is None
+    assert result["reader"]["comparison_state"] == "unsupported"
+    assert result["verification_state"] == "passed"
+    assert result["violations"] == []
+
+
 # --- verify wiring ---
 
 
@@ -439,12 +457,22 @@ def test_verify_session_counts_only_no_paths():
     assert str(directory) not in blob
 
 
-def test_verify_session_missing_history_is_counted_not_raised():
-    result = verify_session({"source": "pi", "path": "/no/such/file.jsonl",
-                             "id": "missing"})
+def test_verify_session_missing_history_is_counted_not_raised(tmp_path):
+    missing = tmp_path / "missing.jsonl"
+    result = verify_session({"source": "pi", "path": str(missing), "id": "missing"})
     assert result["load_ok"] is False
     assert result["load_error_kind"] == "ConversationLoadError"
     assert result["state"] == "unavailable"
+
+
+def test_cursor_prompt_history_directory_is_a_valid_source(tmp_path):
+    prompts = tmp_path / "prompt_history.json"
+    prompts.write_text('["prompt"]', encoding="utf-8")
+    session = {"source": "cursor", "path": str(tmp_path)}
+    before = conformance._source_stamp(session)
+    assert conformance._source_exists(session) is True
+    prompts.write_text('["prompt", "next"]', encoding="utf-8")
+    assert conformance._source_stamp(session) != before
 
 
 def test_verify_all_passes_on_fixture_registry():
@@ -458,6 +486,338 @@ def test_verify_all_passes_on_fixture_registry():
     assert report["runtimes"]["pi"]["timings_ms"]["scan"] is not None
 
 
+def test_verify_all_mixed_sampled_and_no_history_is_unverified(tmp_path):
+    session = _pi_fixture(tmp_path)
+    registry = ParserRegistry([
+        RuntimeParser(id="pi", display_name="Pi",
+                      _scan=lambda limit=50: [session], _load=lambda session: []),
+        RuntimeParser(id="codex", display_name="Codex",
+                      _scan=lambda limit=50: [], _load=lambda session: []),
+    ])
+    report = verify_all(registry, ["pi", "codex"], sample=1)
+    assert report["passed"] is False
+    assert report["verification_state"] == "unverified"
+    assert report["runtimes"]["pi"]["verification_state"] == "passed"
+    assert report["runtimes"]["codex"]["verification_state"] == "unverified"
+
+
+def test_verify_all_kimi_legacy_sample_can_pass(tmp_path):
+    session = _kimi_fixture(tmp_path)
+    registry = ParserRegistry([RuntimeParser(
+        id="kimi", display_name="Kimi",
+        _scan=lambda limit=50: [session], _load=lambda session: [])])
+    report = verify_all(registry, ["kimi"], sample=1)
+    assert report["passed"] is True
+    assert report["verification_state"] == "passed"
+    assert report["runtimes"]["kimi"]["states"] == {"unsupported": 1}
+
+
+def test_verify_all_scan_failure_cannot_pass():
+    def fail_scan(limit=50):
+        raise RuntimeError("scan failed")
+
+    registry = ParserRegistry([RuntimeParser(
+        id="pi", display_name="Pi", _scan=fail_scan, _load=lambda session: [])])
+    report = verify_all(registry, ["pi"], sample=10)
+    assert report["passed"] is False
+    assert report["verification_state"] == "failed"
+    assert report["runtimes"]["pi"]["verification_state"] == "failed"
+    assert report["runtimes"]["pi"]["violations"]["scan_failure"] == 1
+
+
+def test_verify_all_no_samples_is_unverified_not_passed():
+    report = verify_all(_fake_registry([]), ["pi"], sample=10)
+    assert report["passed"] is False
+    assert report["verification_state"] == "unverified"
+    assert report["runtimes"]["pi"]["verification_state"] == "unverified"
+    assert report["runtimes"]["pi"]["skip_reason"] == "no_sessions"
+
+
+def test_verify_all_missing_scanned_codex_history_is_failure(tmp_path):
+    missing = {"source": "codex", "path": str(tmp_path / "missing-codex.jsonl"),
+               "id": "missing"}
+    registry = ParserRegistry([RuntimeParser(
+        id="codex", display_name="Codex", _scan=lambda limit=50: [missing],
+        _load=lambda session: [])])
+    report = verify_all(registry, ["codex"], sample=1)
+    runtime = report["runtimes"]["codex"]
+    assert report["passed"] is False
+    assert runtime["load_failed"] == 1
+    assert runtime["states"] == {"unavailable": 1}
+    assert runtime["verification_state"] == "failed"
+
+
+def _reader_comparison_snapshot() -> ActivitySnapshot:
+    events = _typed_pair_flow()
+    events[1] = replace(events[1], usage=Usage(NATIVE, input_tokens=7, output_tokens=2))
+    events[2] = replace(
+        events[2],
+        interaction=InteractionRequest(
+            "question", NATIVE, resolution="answered", resolution_evidence=NATIVE,
+            request_id="q-1", tool_call_id="t-1",
+            questions=(QuestionItem(prompt="Which?", options=()),),
+            answers=(AnswerRecord(question_index=0, text="first"),),
+        ),
+    )
+    events[3] = replace(events[3], error=AgentError("provider", "reported", NATIVE))
+    return ActivitySnapshot("available", tuple(events), SessionOutcome("done", INFERRED))
+
+
+def _verify_with_fake_reader(snapshot, poll_events=None, *, poll_state="available",
+                             poll_outcome=None, page_events=None,
+                             event_load_error=False, reader_error=False,
+                             source_changes=False, source_present=True,
+                             page_generation="g1", generation_changes_during_pages=False):
+    from types import SimpleNamespace
+
+    from sesskit.models import ConversationMessage
+
+    poll_events = tuple(snapshot.events if poll_events is None else poll_events)
+    page_events = tuple(snapshot.events if page_events is None else page_events)
+    outcome = snapshot.outcome if poll_outcome is None else poll_outcome
+
+    class FakeReader:
+        page_count = 0
+
+        def poll(self):
+            return SimpleNamespace(events=poll_events, reset=True, generation="g1",
+                                   outcome=outcome, state=poll_state)
+
+        def page(self, before=None, limit=200):
+            self.page_count += 1
+            if generation_changes_during_pages:
+                if self.page_count == 1:
+                    return SimpleNamespace(events=tuple(snapshot.events[-1:]),
+                                           before="older", has_more=True, generation="g1")
+                return SimpleNamespace(events=tuple(snapshot.events[:-1]), before=None,
+                                       has_more=False, generation="g2")
+            return SimpleNamespace(events=page_events, before=None, has_more=False,
+                                   generation=page_generation)
+
+    conversation = [ConversationMessage("user", "Run checks."),
+                    ConversationMessage("assistant", "Running.")]
+    source_stamp = mock.patch.object(conformance, "_source_stamp", return_value=("stable",))
+    if source_changes:
+        source_stamp = mock.patch.object(
+            conformance, "_source_stamp",
+            side_effect=[("stable",), ("stable",), ("changed",), ("changed",),
+                         ("changed",), ("changed",)],
+        )
+    with (source_stamp,
+          mock.patch.object(conformance, "_source_exists", return_value=source_present),
+          mock.patch.object(conformance, "load_session_conversation", return_value=conversation),
+          mock.patch.object(conformance, "load_activity", return_value=snapshot),
+          mock.patch.object(
+              conformance, "load_events",
+              side_effect=RuntimeError if event_load_error else None,
+              **({} if event_load_error else {"return_value": to_v1_dicts(snapshot)}),
+          ),
+          mock.patch.object(conformance, "supports_incremental", return_value=True),
+          mock.patch.object(
+              conformance, "open_activity_reader",
+              side_effect=RuntimeError if reader_error else None,
+              **({} if reader_error else {"return_value": FakeReader()}),
+          )):
+        return verify_session({"source": "pi", "path": "unused", "id": "s1"})
+
+
+def test_event_load_exception_prevents_verification_pass():
+    result = _verify_with_fake_reader(_reader_comparison_snapshot(), event_load_error=True)
+    assert result["event_load_ok"] is False
+    assert result["verification_state"] == "failed"
+    assert any(item["rule"] == "event_load" for item in result["violations"])
+
+
+def test_reader_exception_prevents_verification_pass():
+    result = _verify_with_fake_reader(_reader_comparison_snapshot(), reader_error=True)
+    assert result["reader"]["ok"] is False
+    assert result["verification_state"] == "failed"
+    assert any(item["rule"] == "reader_failure" for item in result["violations"])
+
+
+def test_absent_scanned_source_cannot_pass_even_if_loaders_return_empty():
+    empty = ActivitySnapshot("empty", (), SessionOutcome("unknown", UNKNOWN))
+    result = _verify_with_fake_reader(empty, source_present=False)
+    assert result["verification_state"] == "failed"
+    assert any(item["rule"] == "source_missing" for item in result["violations"])
+
+
+@pytest.mark.parametrize("mutation", [
+    "text", "raw_input", "raw_output", "correlation", "error", "question_link",
+    "usage", "outcome",
+])
+def test_reader_comparison_rejects_same_seq_type_with_changed_content(mutation):
+    snapshot = _reader_comparison_snapshot()
+    altered = list(snapshot.events)
+    outcome = None
+    if mutation == "text":
+        altered[0] = replace(altered[0], text="different")
+    elif mutation == "raw_input":
+        altered[2] = replace(altered[2], raw_input={"command": "different"})
+    elif mutation == "raw_output":
+        altered[3] = replace(altered[3], raw_output="different")
+    elif mutation == "correlation":
+        altered[3] = replace(altered[3], call_id="other-call")
+    elif mutation == "error":
+        altered[3] = replace(altered[3], error=AgentError("provider", "different", NATIVE))
+    elif mutation == "question_link":
+        old = altered[2].interaction
+        altered[2] = replace(altered[2], interaction=replace(old, tool_call_id="other-call"))
+    elif mutation == "usage":
+        altered[1] = replace(altered[1], usage=replace(altered[1].usage, input_tokens=8))
+    elif mutation == "outcome":
+        outcome = SessionOutcome("unknown", UNKNOWN)
+    result = _verify_with_fake_reader(snapshot, altered, poll_outcome=outcome)
+    assert any(item["rule"] == "reader_snapshot_match" for item in result["violations"])
+    assert result["verification_state"] == "failed"
+
+
+def test_reader_comparison_accepts_exact_global_seq_suffix():
+    snapshot = _reader_comparison_snapshot()
+    result = _verify_with_fake_reader(snapshot, snapshot.events[2:])
+    assert result["reader"]["mismatch"] is False
+    assert result["reader"]["page_ok"] is True
+    assert result["verification_state"] == "passed"
+
+
+def test_reader_comparison_rejects_read_state_mismatch():
+    snapshot = _reader_comparison_snapshot()
+    result = _verify_with_fake_reader(snapshot, poll_state="empty")
+    assert any(item["rule"] == "reader_snapshot_match" for item in result["violations"])
+
+
+def test_reader_page_comparison_checks_complete_event_content():
+    snapshot = _reader_comparison_snapshot()
+    altered = list(snapshot.events)
+    altered[3] = replace(altered[3], raw_output="different")
+    result = _verify_with_fake_reader(snapshot, page_events=altered)
+    assert any(item["rule"] == "reader_page_match" for item in result["violations"])
+
+
+def test_live_source_change_makes_cross_view_comparison_inconclusive():
+    result = _verify_with_fake_reader(_reader_comparison_snapshot(), source_changes=True)
+    assert result["source_stable"] is False
+    assert result["comparison_state"] == "inconclusive"
+    assert result["verification_state"] == "inconclusive"
+    assert result["reader"]["page_ok"] is None
+    assert result["violations"] == []
+
+
+def test_reader_generation_change_during_paging_is_inconclusive():
+    result = _verify_with_fake_reader(
+        _reader_comparison_snapshot(), generation_changes_during_pages=True)
+    assert result["reader"]["mismatch"] is False
+    assert result["reader"]["page_ok"] is None
+    assert result["verification_state"] == "inconclusive"
+    assert result["violations"] == []
+
+
+def test_conversation_checks_missing_roles_and_empty_event_view():
+    from sesskit.models import ConversationMessage
+
+    user = ActivityEvent(1, "user_message", NATIVE, text="hello")
+    conversation = [ConversationMessage("user", "hello")]
+    assert any(v.rule == "conversation_user_coverage"
+               for v in check_conversation(conversation, []))
+    assert any(v.rule == "conversation_user_coverage"
+               for v in check_conversation([], [user]))
+
+
+def test_typed_conversation_rejects_substrings_duplicates_and_reordering():
+    from sesskit.models import ConversationMessage
+
+    events = [ActivityEvent(1, "user_message", NATIVE, text="hello"),
+              ActivityEvent(2, "assistant_message", NATIVE, text="answer")]
+    altered_text = [ConversationMessage("user", "well hello there"),
+                    ConversationMessage("assistant", "answer")]
+    duplicate = [ConversationMessage("user", "hello"),
+                 ConversationMessage("user", "hello"),
+                 ConversationMessage("assistant", "answer")]
+    reordered = [ConversationMessage("assistant", "answer"),
+                 ConversationMessage("user", "hello")]
+    assert any(v.rule == "conversation_user_coverage"
+               for v in check_conversation(altered_text, events))
+    assert any(v.rule == "conversation_user_coverage"
+               for v in check_conversation(duplicate, events))
+    assert any(v.rule == "conversation_order"
+               for v in check_conversation(reordered, events))
+
+
+def test_kimi_legacy_conversation_allows_documented_assistant_chunk_grouping():
+    from sesskit.models import ConversationMessage
+
+    events = [
+        {"type": "user_message", "seq": 1, "text": "question"},
+        {"type": "assistant_message", "seq": 2, "text": "first chunk"},
+        {"type": "thinking", "seq": 3, "text": "internal"},
+        {"type": "assistant_message", "seq": 4, "text": "second chunk"},
+        {"type": "user_message", "seq": 5, "text": "next"},
+    ]
+    conversation = [ConversationMessage("user", "question"),
+                    ConversationMessage("assistant", "first chunk\n\nsecond chunk"),
+                    ConversationMessage("user", "next")]
+    assert check_conversation(conversation, events) == []
+
+
+def test_conversation_respects_intentionally_hidden_activity():
+    injected = ActivityEvent(1, "user_message", NATIVE, text="injected", origin="injected")
+    lifecycle = ActivityEvent(2, "lifecycle", NATIVE, stop_reason="stop")
+    assert check_conversation([], [injected, lifecycle]) == []
+
+
+def test_empty_snapshot_must_match_empty_v1_view():
+    snapshot = ActivitySnapshot("empty", (), SessionOutcome("unknown", UNKNOWN))
+    mismatch = [{"type": "user_message", "seq": 1, "text": "unexpected"}]
+    assert any(v.rule == "v1_parity"
+               for v in run_conformance("pi", snapshot=snapshot,
+                                        v1_events=mismatch).violations)
+
+
+def test_probe_exception_is_not_reported_as_unchecked_success():
+    with tempfile.TemporaryDirectory() as directory:
+        session = _claude_fixture(Path(directory))
+        with mock.patch.object(conformance, "open_activity_reader", side_effect=RuntimeError):
+            result = conformance.probe_jsonl_reader(session)
+    assert result["checked"] is False
+    assert result["error_kind"] == "RuntimeError"
+
+
+def test_probe_source_mutation_during_temp_copy_is_inconclusive():
+    with tempfile.TemporaryDirectory() as directory:
+        session = _claude_fixture(Path(directory))
+        copyfile = conformance.shutil.copyfile
+
+        def copy_then_append_blank_line(source, destination):
+            result = copyfile(source, destination)
+            with open(source, "ab") as handle:
+                handle.write(b"\n")
+            return result
+
+        with mock.patch.object(conformance.shutil, "copyfile", side_effect=copy_then_append_blank_line):
+            result = conformance.probe_jsonl_reader(session)
+    assert result["checked"] is False
+    assert result["inconclusive"] is True
+    assert result["skip_reason"] == "source_changed_during_copy"
+    assert result["error_kind"] is None
+
+
+def test_verify_runtime_propagates_probe_failure():
+    with tempfile.TemporaryDirectory() as directory:
+        session = _claude_fixture(Path(directory))
+        good_result = verify_session(session)
+        assert good_result["verification_state"] == "passed"
+        registry = ParserRegistry([RuntimeParser(
+            id="claude", display_name="Claude", _scan=lambda limit=50: [session],
+            _load=lambda session: [])])
+        failed_probe = {"checked": False, "append_parity_ok": None,
+                        "nochange_empty_ok": None, "error_kind": "RuntimeError"}
+        with (mock.patch.object(conformance, "verify_session", return_value=good_result),
+              mock.patch.object(conformance, "probe_jsonl_reader", return_value=failed_probe)):
+            report = conformance.verify_runtime(registry, "claude", 1)
+    assert report["verification_state"] == "failed"
+    assert report["violations"]["reader_append_match"] == 1
+
+
 def test_verify_cli_exit_codes(capsys):
     with tempfile.TemporaryDirectory() as directory:
         session = _pi_fixture(Path(directory))
@@ -466,7 +826,15 @@ def test_verify_cli_exit_codes(capsys):
             code = cli.dispatch(["verify", "--sample", "5", "--compact"])
         assert code == 0
         out = json.loads(capsys.readouterr().out)
-        assert out["ok"] is True and out["data"]["passed"] is True
+    assert out["ok"] is True and out["data"]["passed"] is True
+
+    with mock.patch.object(cli, "default_registry", lambda: _fake_registry([])):
+        code = cli.dispatch(["verify", "--runtime", "pi", "--sample", "5", "--compact"])
+    assert code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["data"]["passed"] is False
+    assert out["data"]["verification_state"] == "unverified"
 
     bad_report = {"passed": False, "runtimes": {}, "sample": 1, "totals": {}}
     with mock.patch.object(conformance, "verify_all", lambda *a, **k: bad_report):
@@ -475,3 +843,30 @@ def test_verify_cli_exit_codes(capsys):
         assert code == 1
         out = json.loads(capsys.readouterr().out)
         assert out["ok"] is True and out["data"]["passed"] is False
+
+
+def test_verify_cli_zero_skips_scan_and_negative_is_usage_error(capsys):
+    calls = 0
+
+    def scan(limit=50):
+        nonlocal calls
+        calls += 1
+        return []
+
+    registry = ParserRegistry([RuntimeParser(
+        id="pi", display_name="Pi", _scan=scan, _load=lambda session: [])])
+    with mock.patch.object(cli, "default_registry", lambda: registry):
+        code = cli.dispatch(["verify", "--runtime", "pi", "--sample", "0", "--json"])
+    zero = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert calls == 0
+    assert zero["data"]["verification_state"] == "unverified"
+    assert zero["data"]["runtimes"]["pi"]["skip_reason"] == "sample_limit_zero"
+
+    with mock.patch.object(cli, "default_registry", lambda: registry):
+        code = cli.dispatch(["verify", "--runtime", "pi", "--sample", "-1", "--json"])
+    negative = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert negative["ok"] is False
+    assert negative["error"]["code"] == "usage_error"
+    assert calls == 0

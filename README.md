@@ -35,10 +35,16 @@ sesskit verify --sample 30
 ```
 
 After changing parsers or load wiring, `sesskit verify` is the required
-real-history gate: per-runtime load counts, typed-vs-v1 parity, invariant
-violations, event/evidence/outcome distributions, and scan/load timings —
-counts and timings only, never content or paths. It exits non-zero on
-parity or invariant failures.
+real-history consistency gate. It checks conversation, v1 events, typed
+activity, and supported incremental readers against one another, and reports
+per-runtime counts, outcomes, violations, and timings — never content or
+paths. Scan/load/reader/probe failures prevent a pass; a runtime with no
+samples is marked unverified, not passed. Kimi's documented lack of typed
+activity and incremental readers is expected, while its legacy checks still
+run. Reads overlapping a live source change are inconclusive, not passes.
+This verifies internal consistency, not semantic correctness against an
+independent oracle. The command exits non-zero when verification fails or is
+unverified.
 
 Every command prints one JSON envelope:
 

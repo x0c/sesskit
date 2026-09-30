@@ -12,10 +12,12 @@ v2（2.x）新增 session_v2/session_message 两表：老会话会被迁移进 s
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import sys
+from collections import OrderedDict
 from itertools import groupby
 
 from sesskit import titles
@@ -662,21 +664,58 @@ def _build_session_info_v2(
     )
 
 
-def scan_signature() -> tuple | None:
-    """候选数据库元数据与存活进程快照，供后台重扫廉价判断是否需要重新查询。
+# The list fingerprint hashes every list-driving v1/v2 row in stable key order.
+# Timestamp extrema miss tied/older appends and edits/deletions of non-maximum
+# rows. The part table is intentionally excluded: streaming changes there do not
+# invalidate the list signature, as documented in CONTRACT's preview-freshness
+# tradeoff. Read-only connections use a short timeout; busy/locked/old schemas
+# fall back to the legacy mtime signature.
+_SIGNATURE_TABLES = (
+    ("session", ("id", "directory", "title", "time_created", "time_updated",
+                  "parent_id", "time_archived")),
+    ("session_v2", ("id", "directory", "title", "time_created", "time_updated",
+                     "parent_id", "time_archived")),
+    ("message", ("id", "session_id", "time_created", "time_updated", "data")),
+    ("session_message", ("id", "session_id", "type", "seq", "time_created",
+                          "time_updated", "data")),
+)
 
-    OpenCode 历史存在单个 SQLite 文件里，任何写入都会更新该文件自身（或其 -wal
-    边车文件，WAL 模式下 checkpoint 前主文件 mtime 可能滞后）的 mtime，属于可靠的
-    单文件场景，不像 Claude/Codex 那样有"祖先目录 mtime 不冒泡"的问题。
+_SIGNATURE_CACHE_LIMIT = 8
+_SIGNATURE_FINGERPRINT_CACHE: OrderedDict[
+    str, tuple[tuple, tuple]
+] = OrderedDict()
 
-    `live`/`pid` 来自独立的进程探测，进程退出后数据库通常也不再变化；若签名只看
-    文件 mtime，最后一次运行状态会永久冻结。因此签名同时带上排序后的
-    ``(pid, cwd)`` 全量进程快照（不再按 cwd 折叠成单 pid），让进程启停、
-    同目录多 TUI 和探活恢复都能触发一次完整扫描。
-    """
-    paths = _db_paths()
-    if not paths:
+
+def _stat_version(path: str, *, optional: bool = False) -> tuple | None:
+    """Return file identity/version fields, or None when a required stat fails."""
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return ("missing",) if optional else None
+    except OSError:
         return None
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _source_version(db_path: str) -> tuple | None:
+    """Stat the database and WAL identity/version without opening SQLite."""
+    database = _stat_version(db_path)
+    wal = _stat_version(db_path + "-wal", optional=True)
+    if database is None or wal is None:
+        return None
+    return database, wal
+
+
+def _file_mtime_signature(paths: list[str]) -> list[tuple[str, float]] | None:
+    """Return legacy database/WAL mtimes when the content fingerprint is unavailable."""
     file_signature: list[tuple[str, float]] = []
     for path in paths:
         try:
@@ -688,8 +727,130 @@ def scan_signature() -> tuple | None:
             file_signature.append((wal_path, os.stat(wal_path).st_mtime))
         except OSError:
             pass  # 没有 WAL 边车文件（未开 WAL 或已 checkpoint）是正常情况
+    return file_signature
+
+
+def _content_fingerprint(db_path: str) -> tuple | None:
+    """Hash list-driving rows from one database through a read-only connection.
+
+    Open with a `mode=ro` URI and `query_only`, then read each table in stable
+    key order and hash rows incrementally. Return None on busy, locked, missing
+    tables, or other SQLite errors so the caller can use the conservative mtime
+    fallback. The connection timeout is 0.5 seconds (`connect_ro`).
+    """
+    try:
+        conn = connect_ro(db_path)
+    except (sqlite3.Error, OSError):
+        return None
+    if conn is None:
+        return None
+    try:
+        try:
+            conn.execute("PRAGMA query_only=ON")
+        except sqlite3.Error:
+            pass
+        result = []
+        for table, columns in _SIGNATURE_TABLES:
+            projection = ", ".join(f'"{column}"' for column in columns)
+            query = (
+                f'SELECT {projection} FROM "{table}" '
+                f'ORDER BY "{columns[0]}"'
+            )
+            try:
+                cursor = conn.execute(query)
+                digest = hashlib.sha256()
+                row_count = 0
+                while batch := cursor.fetchmany(512):
+                    for row in batch:
+                        row_count += 1
+                        digest.update(b"R")
+                        for value in row:
+                            if value is None:
+                                encoded = b"N"
+                            elif isinstance(value, bytes):
+                                encoded = b"B" + value
+                            elif isinstance(value, int):
+                                encoded = b"I" + str(value).encode("ascii")
+                            elif isinstance(value, float):
+                                encoded = b"F" + value.hex().encode("ascii")
+                            else:
+                                encoded = b"T" + str(value).encode("utf-8")
+                            digest.update(len(encoded).to_bytes(8, "big"))
+                            digest.update(encoded)
+                result.append((table, row_count, digest.hexdigest()))
+            except sqlite3.Error:
+                return None
+    finally:
+        conn.close()
+    return tuple(result)
+
+
+def _cached_content_fingerprint(db_path: str) -> tuple | None:
+    """Reuse a fingerprint only while main-file and WAL stamps remain stable.
+
+    A miss is cached only if both stamps match before and after hashing. A cache
+    hit is checked with a second stat as well, so a source transition during
+    lookup invalidates the entry. Returning None requests the conservative mtime
+    fallback for an unstable or unavailable source.
+    """
+    before = _source_version(db_path)
+    if before is None:
+        _SIGNATURE_FINGERPRINT_CACHE.pop(db_path, None)
+        return None
+
+    cached = _SIGNATURE_FINGERPRINT_CACHE.get(db_path)
+    if cached is not None and cached[0] == before:
+        after = _source_version(db_path)
+        if after == before:
+            _SIGNATURE_FINGERPRINT_CACHE.move_to_end(db_path)
+            return cached[1]
+        _SIGNATURE_FINGERPRINT_CACHE.pop(db_path, None)
+        return None
+    if cached is not None:
+        _SIGNATURE_FINGERPRINT_CACHE.pop(db_path, None)
+
+    fingerprint = _content_fingerprint(db_path)
+    after = _source_version(db_path)
+    if fingerprint is None or after != before:
+        _SIGNATURE_FINGERPRINT_CACHE.pop(db_path, None)
+        return None
+
+    _SIGNATURE_FINGERPRINT_CACHE[db_path] = (before, fingerprint)
+    _SIGNATURE_FINGERPRINT_CACHE.move_to_end(db_path)
+    while len(_SIGNATURE_FINGERPRINT_CACHE) > _SIGNATURE_CACHE_LIMIT:
+        _SIGNATURE_FINGERPRINT_CACHE.popitem(last=False)
+    return fingerprint
+
+
+def scan_signature() -> tuple | None:
+    """Return a cached read-only content fingerprint and live-process snapshot.
+
+    The in-memory cache is keyed by database and complete main/WAL stat stamps,
+    including nanosecond mtime/ctime. It avoids reopening an unchanged database;
+    any observed source change forces a fresh fingerprint. Changes limited to
+    the part table do not trigger a list rescan. Busy/locked/unsupported schemas
+    use the legacy file-mtime signature.
+
+    Process state is observed on every call, independently of the database
+    cache. The sorted full `(pid, cwd)` snapshot ensures process starts/exits,
+    multiple TUIs in one directory, and liveness recovery still trigger scans.
+    """
+    paths = _db_paths()
+    if not paths:
+        return None
+    fingerprints: list[tuple[str, tuple | None]] = []
+    for path in paths:
+        fingerprints.append((path, _cached_content_fingerprint(path)))
+    if all(fp is not None for _, fp in fingerprints):
+        content: tuple = tuple(fp for _, fp in fingerprints)
+    else:
+        # 任一库指纹不可用：整体回退到文件 mtime，保守地触发额外扫描。
+        file_signature = _file_mtime_signature(paths)
+        if file_signature is None:
+            return None
+        content = (("files", tuple(file_signature)),)
     live_signature = tuple(sorted(live_processes("opencode")))
-    return (tuple(file_signature), live_signature)
+    return (content, live_signature)
 
 
 def scan_sessions(

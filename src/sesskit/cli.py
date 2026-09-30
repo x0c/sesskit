@@ -611,8 +611,11 @@ def cmd_verify(args, registry: ParserRegistry):
     requested = getattr(args, "runtime", None) or []
     runtime_ids = list(requested) if isinstance(requested, list) else [requested]
     runtime_ids = [r for r in runtime_ids if r] or list(registry.ids)
-    sample = getattr(args, "sample", 200) or 200
-    report = _conformance.verify_all(registry, runtime_ids, max(1, int(sample)))
+    raw_sample = getattr(args, "sample", 200)
+    sample = 200 if raw_sample is None else int(raw_sample)
+    if sample < 0:
+        raise ApiError("usage_error", "--sample must be zero or greater", EXIT_USAGE)
+    report = _conformance.verify_all(registry, runtime_ids, sample)
     code = _EXIT_OK if report["passed"] else _EXIT_ERROR
     return ok(report), code
 

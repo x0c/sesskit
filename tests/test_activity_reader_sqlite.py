@@ -87,24 +87,25 @@ def _v1_db(db_path, session_id, messages):
         """
         CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS message (
-            id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+            id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT,
+            time_updated INTEGER);
         CREATE TABLE IF NOT EXISTS part (
             id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
-            time_created INTEGER, data TEXT);
+            time_created INTEGER, data TEXT, time_updated INTEGER);
         """
     )
     conn.execute("INSERT OR IGNORE INTO session VALUES (?)", (session_id,))
     for index, (message_id, message, parts) in enumerate(messages):
         created = message.get("time", {}).get("created", (index + 1) * 1000)
         conn.execute(
-            "INSERT OR REPLACE INTO message VALUES (?,?,?,?)",
-            (message_id, session_id, created, json.dumps(message)),
+            "INSERT OR REPLACE INTO message VALUES (?,?,?,?,?)",
+            (message_id, session_id, created, json.dumps(message), created),
         )
         for part_index, (part_id, part) in enumerate(parts):
             conn.execute(
-                "INSERT OR REPLACE INTO part VALUES (?,?,?,?,?)",
+                "INSERT OR REPLACE INTO part VALUES (?,?,?,?,?,?)",
                 (part_id, message_id, session_id, created + part_index,
-                 json.dumps(part)),
+                 json.dumps(part), created + part_index),
             )
     conn.commit()
     conn.close()
@@ -113,14 +114,14 @@ def _v1_db(db_path, session_id, messages):
 def _v1_append_message(db_path, session_id, message_id, message, parts, created):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        "INSERT OR REPLACE INTO message VALUES (?,?,?,?)",
-        (message_id, session_id, created, json.dumps(message)),
+        "INSERT OR REPLACE INTO message VALUES (?,?,?,?,?)",
+        (message_id, session_id, created, json.dumps(message), created),
     )
     for part_index, (part_id, part) in enumerate(parts):
         conn.execute(
-            "INSERT OR REPLACE INTO part VALUES (?,?,?,?,?)",
+            "INSERT OR REPLACE INTO part VALUES (?,?,?,?,?,?)",
             (part_id, message_id, session_id, created + part_index,
-             json.dumps(part)),
+             json.dumps(part), created + part_index),
         )
     conn.commit()
     conn.close()
@@ -133,14 +134,14 @@ def _v2_db(db_path, session_id, rows):
         CREATE TABLE IF NOT EXISTS session_v2 (id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS session_message (
             id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
-            time_created INTEGER, data TEXT);
+            time_created INTEGER, time_updated INTEGER, data TEXT);
         """
     )
     conn.execute("INSERT OR IGNORE INTO session_v2 VALUES (?)", (session_id,))
     for row_id, seq, kind, data in rows:
         conn.execute(
-            "INSERT OR REPLACE INTO session_message VALUES (?,?,?,?,?,?)",
-            (row_id, session_id, kind, seq, seq * 1000, json.dumps(data)),
+            "INSERT OR REPLACE INTO session_message VALUES (?,?,?,?,?,?,?)",
+            (row_id, session_id, kind, seq, seq * 1000, seq * 1000, json.dumps(data)),
         )
     conn.commit()
     conn.close()
@@ -149,8 +150,8 @@ def _v2_db(db_path, session_id, rows):
 def _v2_append(db_path, session_id, row_id, seq, kind, data, *, keep_open=False):
     conn = sqlite3.connect(db_path)
     conn.execute(
-        "INSERT OR REPLACE INTO session_message VALUES (?,?,?,?,?,?)",
-        (row_id, session_id, kind, seq, seq * 1000, json.dumps(data)),
+        "INSERT OR REPLACE INTO session_message VALUES (?,?,?,?,?,?,?)",
+        (row_id, session_id, kind, seq, seq * 1000, seq * 1000, json.dumps(data)),
     )
     conn.commit()
     if keep_open:
@@ -418,11 +419,11 @@ def test_opencode_v1_concurrent_append(tmp_path):
     reader = open_activity_reader(session)
     reader.poll()
     writer = sqlite3.connect(db)
-    writer.execute("INSERT INTO message VALUES (?,?,?,?)",
-                   ("u9", "v1", 9000, json.dumps({"role": "user"})))
-    writer.execute("INSERT INTO part VALUES (?,?,?,?,?)",
+    writer.execute("INSERT INTO message VALUES (?,?,?,?,?)",
+                   ("u9", "v1", 9000, json.dumps({"role": "user"}), 9000))
+    writer.execute("INSERT INTO part VALUES (?,?,?,?,?,?)",
                    ("p-u9", "u9", "v1", 9000,
-                    json.dumps({"type": "text", "text": "Late question?"})))
+                    json.dumps({"type": "text", "text": "Late question?"}), 9000))
     writer.commit()
     writer.close()
     result = reader.poll()
@@ -563,8 +564,8 @@ def test_opencode_v2_seq_reorder_resets(tmp_path):
     conn = sqlite3.connect(db)
     conn.execute("DELETE FROM session_message WHERE id = 'a1'")
     conn.execute(
-        "INSERT INTO session_message VALUES (?,?,?,?,?,?)",
-        ("a1", "v2", "assistant", 2, 2000, json.dumps({
+        "INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+        ("a1", "v2", "assistant", 2, 2000, 2001, json.dumps({
             "finish": "stop", "content": [{"type": "text", "text": "Rewritten."}],
         })),
     )
@@ -584,3 +585,293 @@ def test_opencode_bad_cursor_falls_back(tmp_path):
     result = open_activity_reader(session, cursor="not-json{{{").poll()
     assert result.reset is True
     assert _kinds(result.events) == _kinds(full.events)
+
+
+# --- Cursor prompt-history fallback reader ----------------------------------
+
+
+def _cursor_prompt_session(tmp_path, prompts):
+    """Prompt-only session: store holds one non-JSON blob, prompts carry text."""
+    store = tmp_path / "store.db"
+    _cursor_write(store, [b"\x00\x01not-json"])
+    (tmp_path / "prompt_history.json").write_text(
+        json.dumps(prompts), encoding="utf-8")
+    return _cursor_session(store)
+
+
+def test_cursor_prompt_fallback_cold_open_matches_snapshot(tmp_path):
+    session = _cursor_prompt_session(tmp_path, ["only prompt"])
+    snapshot = load_activity(session)
+    assert snapshot.state == "available"
+    assert [e.text for e in snapshot.events] == ["only prompt"]
+    reader = open_activity_reader(session)
+    result = reader.poll()
+    assert result.reset is True
+    assert result.state == "available"
+    assert _kinds(result.events) == _kinds(snapshot.events)
+    assert [e.text for e in result.events] == ["only prompt"]
+    assert result.outcome == snapshot.outcome
+    assert to_v1_dicts(snapshot) == load_events(session)
+    opens = reader.db_opens
+    quiet = reader.poll()
+    assert quiet.events == ()
+    assert quiet.reset is False
+    assert reader.db_opens == opens
+
+
+def test_cursor_prompt_fallback_page_reassembly(tmp_path):
+    session = _cursor_prompt_session(tmp_path, ["newer", "older"])
+    reader = open_activity_reader(session)
+    full = reader.poll().events
+    assert [e.seq for e in full] == [1, 2]
+    assert [e.text for e in full] == ["older", "newer"]
+    newest = reader.page(limit=1)
+    assert [e.seq for e in newest.events] == [2]
+    assert newest.has_more is True
+    assert isinstance(newest.before, str)
+    older = reader.page(before=newest.before, limit=1)
+    assert [e.seq for e in older.events] == [1]
+    assert older.has_more is False
+    assert _kinds(list(older.events) + list(newest.events)) == _kinds(full)
+    snapshot = load_activity(session)
+    assert _kinds(full) == _kinds(snapshot.events)
+
+
+def test_cursor_prompt_append_extends_without_reset(tmp_path):
+    session = _cursor_prompt_session(tmp_path, ["first"])
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    (tmp_path / "prompt_history.json").write_text(
+        json.dumps(["second", "first"]), encoding="utf-8")
+    result = reader.poll()
+    assert result.reset is False
+    assert result.generation == first.generation
+    assert _seqs(result.events) == [len(first.events) + 1]
+    combined = list(first.events) + list(result.events)
+    assert [e.text for e in combined] == ["first", "second"]
+    snapshot = load_activity(session)
+    assert _kinds(combined) == _kinds(snapshot.events)
+    assert reader.poll().events == ()
+    # The changed prompt file invalidates the old cursor fingerprint.
+    stale = open_activity_reader(session, cursor=first.cursor).poll()
+    assert stale.reset is True
+    assert _kinds(stale.events) == _kinds(snapshot.events)
+
+
+def test_cursor_store_rows_supersede_fallback_with_reset(tmp_path):
+    session = _cursor_prompt_session(tmp_path, ["fallback prompt"])
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    assert [e.text for e in first.events] == ["fallback prompt"]
+    _cursor_write(tmp_path / "store.db",
+                  [_cursor_user("hello"), _cursor_assistant("hi")])
+    result = reader.poll()
+    assert result.reset is True
+    assert result.generation != first.generation
+    assert [e.text for e in result.events] == ["hello", "hi"]
+    snapshot = load_activity(session)
+    assert _kinds(result.events) == _kinds(snapshot.events)
+    assert result.outcome == snapshot.outcome
+
+
+# --- Append-only delta proofs (F2) -------------------------------------------
+#
+# Warm append polls must read only rows after the committed position (plus
+# the bounded recheck window), never the whole store window. `rows_parsed`
+# counts blob/session rows JSON-decoded for event building; recheck
+# signature reads are excluded.
+
+
+def test_cursor_append_reads_only_new_rows(tmp_path):
+    store = tmp_path / "store.db"
+    _cursor_write(store, [_cursor_user("hello"), _cursor_assistant("hi")])
+    session = _cursor_session(store)
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    assert reader.rows_parsed == 2
+    opens = reader.db_opens
+    _cursor_write(store, [_cursor_call("r9"), _cursor_result("r9", "done output")])
+    result = reader.poll()
+    assert result.reset is False
+    assert result.generation == first.generation
+    assert reader.db_opens == opens + 1
+    assert reader.rows_parsed - 2 == 2
+    assert _seqs(result.events) == [len(first.events) + 1, len(first.events) + 2]
+    combined = list(first.events) + list(result.events)
+    snapshot = load_activity(session)
+    assert _kinds(combined) == _kinds(snapshot.events)
+    assert result.outcome == snapshot.outcome
+
+
+def test_cursor_inplace_update_resets(tmp_path):
+    store = tmp_path / "store.db"
+    _cursor_write(store, [_cursor_user("alpha"), _cursor_assistant("beta")])
+    session = _cursor_session(store)
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    conn = sqlite3.connect(store)
+    rowid = conn.execute(
+        "SELECT rowid FROM blobs ORDER BY rowid LIMIT 1").fetchone()[0]
+    conn.execute("UPDATE blobs SET data = ? WHERE rowid = ?",
+                 (json.dumps(_cursor_user("alpha edited longer")).encode(), rowid))
+    conn.commit()
+    conn.close()
+    result = reader.poll()
+    assert result.reset is True
+    assert result.generation != first.generation
+    snapshot = load_activity(session)
+    assert _kinds(result.events) == _kinds(snapshot.events)
+    assert [e.text for e in result.events] == [e.text for e in snapshot.events]
+    assert result.outcome == snapshot.outcome
+
+
+def test_cursor_vacuum_without_content_change_keeps_generation(tmp_path):
+    store = tmp_path / "store.db"
+    _cursor_write(store, [_cursor_user("hello"), _cursor_assistant("hi")])
+    session = _cursor_session(store)
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    conn = sqlite3.connect(store)
+    conn.execute("VACUUM")
+    conn.close()
+    result = reader.poll()
+    assert result.reset is False
+    assert result.generation == first.generation
+    assert result.events == ()
+
+
+def test_opencode_v1_append_reads_only_new_rows(tmp_path):
+    db = tmp_path / "opencode.db"
+    _v1_db(db, "v1", _v1_seed())
+    session = _opencode_session(db, "v1")
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    assert reader.rows_parsed == 3
+    opens = reader.db_opens
+    _v1_append_message(
+        db, "v1", "a2",
+        {"role": "assistant", "time": {"created": 3000}, "finish": "stop"},
+        [("p-t2", {"type": "text", "text": "Finished."})], 3000)
+    result = reader.poll()
+    assert result.reset is False
+    assert result.generation == first.generation
+    assert reader.db_opens == opens + 1
+    assert reader.rows_parsed - 3 == 1
+    assert _seqs(result.events) == [len(first.events) + 1]
+    combined = list(first.events) + list(result.events)
+    snapshot = load_activity(session)
+    assert _kinds(combined) == _kinds(snapshot.events)
+    assert result.outcome == snapshot.outcome
+
+
+def test_opencode_v1_inplace_update_resets(tmp_path):
+    db = tmp_path / "opencode.db"
+    _v1_db(db, "v1", _v1_seed())
+    session = _opencode_session(db, "v1")
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE part SET data = ?, time_updated = ? WHERE id = ?",
+                 (json.dumps({"type": "text", "text": "Starting, edited longer."}),
+                  9999, "p-text"))
+    conn.commit()
+    conn.close()
+    result = reader.poll()
+    assert result.reset is True
+    assert result.generation != first.generation
+    snapshot = load_activity(session)
+    assert _kinds(result.events) == _kinds(snapshot.events)
+    assert [e.text for e in result.events] == [e.text for e in snapshot.events]
+    assert result.outcome == snapshot.outcome
+
+
+def test_opencode_v1_other_session_write_is_no_change(tmp_path):
+    db = tmp_path / "opencode.db"
+    _v1_db(db, "v1", _v1_seed())
+    session = _opencode_session(db, "v1")
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    parsed = reader.rows_parsed
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT OR IGNORE INTO session VALUES (?)", ("other",))
+    conn.execute(
+        "INSERT OR REPLACE INTO message VALUES (?,?,?,?,?)",
+        ("u-other", "other", 5000, json.dumps({"role": "user"}), 5000))
+    conn.execute(
+        "INSERT OR REPLACE INTO part VALUES (?,?,?,?,?,?)",
+        ("p-other", "u-other", "other", 5000,
+         json.dumps({"type": "text", "text": "Elsewhere."}), 5000))
+    conn.commit()
+    conn.close()
+    result = reader.poll()
+    assert result.reset is False
+    assert result.generation == first.generation
+    assert result.events == ()
+    assert reader.rows_parsed == parsed
+    assert result.outcome == load_activity(session).outcome
+
+
+def test_opencode_v2_append_reads_only_new_rows(tmp_path):
+    db = tmp_path / "opencode.db"
+    _v2_db(db, "v2", _v2_seed())
+    session = _opencode_session(db, "v2")
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    assert reader.rows_parsed == 2
+    opens = reader.db_opens
+    _v2_append(db, "v2", "a2", 3, "assistant", {
+        "time": {"created": 3000}, "finish": "stop",
+        "content": [{"type": "text", "text": "All done."}],
+    })
+    result = reader.poll()
+    assert result.reset is False
+    assert result.generation == first.generation
+    assert reader.db_opens == opens + 1
+    assert reader.rows_parsed - 2 == 1
+    assert _seqs(result.events) == [len(first.events) + 1]
+    combined = list(first.events) + list(result.events)
+    snapshot = load_activity(session)
+    assert _kinds(combined) == _kinds(snapshot.events)
+    assert result.outcome == snapshot.outcome
+
+
+def test_opencode_v2_inplace_update_resets(tmp_path):
+    db = tmp_path / "opencode.db"
+    _v2_db(db, "v2", _v2_seed())
+    session = _opencode_session(db, "v2")
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?",
+        (json.dumps({"time": {"created": 1000}, "text": "Run, edited longer."}),
+         9999, "u1"))
+    conn.commit()
+    conn.close()
+    result = reader.poll()
+    assert result.reset is True
+    assert result.generation != first.generation
+    snapshot = load_activity(session)
+    assert _kinds(result.events) == _kinds(snapshot.events)
+    assert result.outcome == snapshot.outcome
+
+
+def test_opencode_v2_backfill_seq_resets(tmp_path):
+    db = tmp_path / "opencode.db"
+    _v2_db(db, "v2", _v2_seed())
+    session = _opencode_session(db, "v2")
+    reader = open_activity_reader(session)
+    first = reader.poll()
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+        ("backfill", "v2", "user", 0, 500, 500,
+         json.dumps({"text": "Older row arriving late."})))
+    conn.commit()
+    conn.close()
+    result = reader.poll()
+    assert result.reset is True
+    assert result.generation != first.generation
+    snapshot = load_activity(session)
+    assert _kinds(result.events) == _kinds(snapshot.events)
+    assert result.outcome == snapshot.outcome

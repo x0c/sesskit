@@ -251,8 +251,11 @@ key. Pi uses the same normalization as `load_activity()`, preserving v1 bytes.
 Cursor and OpenCode readers keep the same protocol over SQLite: read-only
 connections with WAL-visible tails, an opaque versioned cursor carrying a
 database fingerprint plus the last committed row position and boundary
-checksum, metadata-only no-change polls (main file plus `-wal` sidecar, no
-database open), generation resets on vacuum/rowid reuse/replacement, stable
+checksum plus compact interpreter aux state (pending calls/results, emitted
+call ids, open-turn tail flags), metadata-only no-change polls (main file plus `-wal` sidecar, no
+database open), append polls that read only rows after the committed position
+plus a bounded recheck window for in-place updates (reset only on evidence),
+generation resets on vacuum/rowid reuse/replacement, stable
 `seq` within a generation, backward paging that preserves call/result pairing,
 and poll/page output equal to the `load_activity()` snapshot on the same data.
 The Cursor reader shares exactly the snapshot's `prompt_history.json` fallback
