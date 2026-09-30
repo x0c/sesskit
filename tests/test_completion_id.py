@@ -415,6 +415,78 @@ class ClaudeFinalityTests(unittest.TestCase):
             self.assertEqual(second["status_tag"], titles.STATUS_DONE)
             self.assertEqual(first["completion_id"], second["completion_id"])
 
+    def test_window_boundary_shift_keeps_terminal_identity(self) -> None:
+        """Rolling 64 KB window losing the user excerpt must not change identity.
+
+        2026-10-01 acceptance rejection: a 20 KB user prompt plus one final
+        assistant event parses DONE; after ~45 KB of metadata rows push the
+        user text out of the tail window, the rescan is still DONE with the
+        identical terminal event/text but the id changed — one genuine
+        completion, two notifications. Identity inputs must come from the
+        anchored terminal event only, never from window excerpt availability.
+        """
+        from sesskit.parsers import claude
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                tmp,
+                "s.jsonl",
+                [
+                    self._user("x" * 20000),
+                    self._assistant("done", "end_turn", "a-final"),
+                ],
+            )
+            first = claude._build_session_info(path, tmp)
+            assert first is not None
+            self.assertEqual(first["status_tag"], titles.STATUS_DONE)
+            self.assertTrue(first.get("completion_id"))
+            self.assertTrue(first["last_user_msg"])
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.writelines(json.dumps({"type": "progress", "data": "m" * 500}) + "\n" for _ in range(90))
+            self.assertGreater(Path(path).stat().st_size, 65536)
+            second = claude._build_session_info(path, tmp)
+            assert second is not None
+            self.assertEqual(second["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(second["last_agent_msg"], "done")
+            # The user excerpt is genuinely gone from the rolling tail now.
+            self.assertFalse(second["last_user_msg"])
+            # Same terminal event, same text: same id; rescan again for restart.
+            self.assertEqual(first["completion_id"], second["completion_id"])
+            third = claude._build_session_info(path, tmp)
+            assert third is not None
+            self.assertEqual(first["completion_id"], third["completion_id"])
+
+    def test_error_identity_survives_window_shift(self) -> None:
+        """ABORTED error identity also comes from the anchored error event."""
+        from sesskit.parsers import claude
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                tmp,
+                "s.jsonl",
+                [
+                    self._user("y" * 20000),
+                    {
+                        "type": "system",
+                        "error": {
+                            "formatted": "Credit balance too low",
+                            "status": 402,
+                        },
+                        "timestamp": "2026-09-30T20:02:00.000Z",
+                        "uuid": "e-1",
+                    },
+                ],
+            )
+            first = claude._build_session_info(path, tmp)
+            assert first is not None
+            self.assertEqual(first["status_tag"], titles.STATUS_ABORTED)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.writelines(json.dumps({"type": "progress", "data": "m" * 500}) + "\n" for _ in range(90))
+            second = claude._build_session_info(path, tmp)
+            assert second is not None
+            self.assertEqual(second["status_tag"], titles.STATUS_ABORTED)
+            self.assertEqual(first["completion_id"], second["completion_id"])
+
     def test_same_text_different_turns_have_distinct_ids(self) -> None:
         from sesskit.parsers import claude
 

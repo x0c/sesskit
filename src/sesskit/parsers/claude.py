@@ -452,11 +452,20 @@ def _build_session_info(
     last_text_stop_present = False
     last_text_idx: int | None = None
     last_text_anchor = ""
+    # Identity tail material is the text of the same terminal event that set
+    # last_text_anchor — never window excerpts. A rolling-window boundary shift
+    # (user rows pushed out of the 64 KB tail) must not re-key the id of the
+    # same terminal event (2026-10-01 acceptance rejection: excerpt text in the
+    # hash caused a double push for one completion).
+    last_text_msg = ""
     # 报错只属于当前未收束的一轮：新用户消息/助手正文之后才算，旧轮的残留不算。
     last_content_idx = -1
     last_error_text = ""
     last_error_idx = -1
     last_error_anchor = ""
+    # Identity tail material for the ABORTED path: the human-readable text of
+    # the same error event that set last_error_anchor.
+    last_error_msg = ""
 
     for idx, e in enumerate(tail_entries):
         entry_time = _entry_time(e)
@@ -501,6 +510,7 @@ def _build_session_info(
                         last_text_stop_present = isinstance(message, dict) and "stop_reason" in message
                         last_text_idx = idx
                         last_text_anchor = str(e.get("uuid") or e.get("timestamp") or "")
+                        last_text_msg = part["text"]
                         break
         elif t == "system":
             err_text = system_error_text(e)
@@ -508,6 +518,7 @@ def _build_session_info(
                 last_error_text = err_text
                 last_error_idx = idx
                 last_error_anchor = str(e.get("uuid") or e.get("timestamp") or "")
+                last_error_msg = err_text
 
     stat = os.stat(fpath)
     for e in head_entries:
@@ -523,27 +534,38 @@ def _build_session_info(
         status_tag = titles.STATUS_ABORTED
         last_agent_msg = last_error_text
         id_anchor = last_error_anchor
+        id_tail_text = (last_error_msg or "")[:120]
     elif last_was_user == "aborted":
         status_tag = titles.STATUS_ABORTED
         id_anchor = ""
+        id_tail_text = ""
     elif last_was_user is True:
         status_tag = titles.STATUS_PENDING
         id_anchor = ""
+        id_tail_text = ""
     elif last_was_user is False and (last_agent_msg or "").startswith(_SESSION_LIMIT_PREFIX):
         status_tag = titles.STATUS_ABORTED
         id_anchor = last_text_anchor
+        id_tail_text = (last_text_msg or "")[:120]
     elif last_was_user is False and (last_text_stop == "end_turn" or (last_text_stop is None and not last_text_stop_present)) and not _continued_after(tail_entries, last_text_idx):
         status_tag = titles.STATUS_DONE
         id_anchor = last_text_anchor
+        id_tail_text = (last_text_msg or "")[:120]
     else:
         # progress 文本 + tool_use/截断/后续工具活动 = 执行中；无文本 = 未知。
         # 宁可 unknown 也不报假 DONE（假 DONE 会直接触发完成通知）。
         status_tag = titles.STATUS_NONE
         id_anchor = ""
+        id_tail_text = ""
 
     from sesskit.models import completion_id_for
 
-    tail_text = f"{(last_user_msg or '')[:120]}\n{(last_agent_msg or '')[:120]}"
+    # Identity tail material is the anchored terminal event's own text
+    # (window-stable); window excerpts must never be mixed back in
+    # (last_user_msg vanishes across the 64 KB boundary and would re-key
+    # the same terminal event). Display excerpts still use the wider-window
+    # backfill below; they just no longer feed identity.
+    tail_text = id_tail_text
     if not last_agent_msg:
         # List excerpts only; status and completion_id above stay on the 64 KB window.
         wider_user, wider_agent = _backfill_excerpts(fpath)
