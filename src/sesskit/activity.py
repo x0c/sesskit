@@ -373,12 +373,14 @@ def _build_pi_events(
                 native_http_status(message_error_text),
             )
         emitted = False
+        surfaced_error = False
         if isinstance(content, str):
             text = content.strip()
             if text:
                 add("assistant_message", ts, message_id, record, text=text, usage=usage,
                     stop_reason=message_stop, error=message_error)
                 emitted = True
+                surfaced_error = message_error is not None
         elif isinstance(content, list):
             for part in content:
                 if not isinstance(part, dict):
@@ -396,6 +398,7 @@ def _build_pi_events(
                         add("assistant_message", ts, message_id, record, text=text, usage=usage,
                             stop_reason=message_stop, error=message_error)
                         emitted = True
+                        surfaced_error = message_error is not None
                 elif part_type == "toolCall":
                     raw = part.get("arguments") if part.get("arguments") is not None else part.get("input")
                     add("tool_call", ts, message_id, record,
@@ -403,6 +406,14 @@ def _build_pi_events(
                         call_id=str(part.get("id") or ""),
                         raw_input=_coerce_input(raw))
                     emitted = True
+        if message_error is not None and emitted and not surfaced_error:
+            # Thinking-only (or tool-call-only) error turn: the thinking
+            # event carries the stop reason but no error text, so the
+            # failure would vanish from typed activity. Emit one typed-only
+            # lifecycle error event (v1 skips lifecycle, so projection
+            # bytes stay identical).
+            add("lifecycle", ts, message_id, record, text=message_error_text,
+                stop_reason=message_stop, error=message_error)
         if not emitted:
             stop_reason = str(message.get("stopReason") or "").strip()
             error_text = str(message.get("errorMessage") or "").strip()
@@ -619,6 +630,187 @@ def _claude_upstream_error(err_text: str, err_record: str, err_code: str | None)
     )
 
 
+class _ClaudeFeed:
+    """Stateful row-sequence interpreter shared by snapshots and readers.
+
+    ``_build_claude_events`` feeds every row at once; incremental readers
+    feed one appended batch per poll while this object carries the pending
+    upstream error, the tool call/result maps, and emission state across
+    polls, so both paths run the same interpretation row for row. Linking
+    (question answers) re-runs idempotently after each batch: a call whose
+    result has not materialized yet keeps ``unknown`` resolution in the
+    delivered stream and is enriched in the materialized list only.
+    """
+
+    def __init__(self, seq_start: int = 0) -> None:
+        self._seq_start = seq_start
+        self.events: list[ActivityEvent] = []
+        self.pending_error: tuple[str, float | None, str, str | None] | None = None
+        # call_id -> (event index, tool name, raw input, use row)
+        self.calls: dict[str, tuple[int, str, object, int]] = {}
+        # call_id -> (output, typed outcome, result row)
+        self.results: dict[str, tuple[Any, ToolResultOutcome, int]] = {}
+
+    def _add(self, event_type: str, ts: float | None, record: str, **fields: Any) -> int | None:
+        text = fields.get("text")
+        if event_type in {"user_message", "assistant_message", "thinking"} and (
+            not isinstance(text, str) or not text.strip()
+        ):
+            return None
+        self.events.append(ActivityEvent(
+            seq=self._seq_start + len(self.events) + 1,
+            type=event_type,  # type: ignore[arg-type]
+            evidence=Evidence(_NATIVE, record=record),
+            ts=ts,
+            **fields,
+        ))
+        return len(self.events) - 1
+
+    def feed(self, rows: list[tuple[int, dict]]) -> list[ActivityEvent]:
+        """Interpret one batch of ``(lineno, entry)`` rows, appending events."""
+        before = len(self.events)
+        for lineno, entry in rows:
+            if not isinstance(entry, dict) or entry.get("isMeta") or entry.get("isSidechain"):
+                continue
+            record = _claude_record(lineno)
+            if entry.get("type") == "system":
+                err_text = scan_claude.system_error_text(entry)
+                if err_text:
+                    self.pending_error = (err_text, scan_claude.entry_time(entry), record,
+                                          _claude_entry_error_code(entry))
+                continue
+            if entry.get("type") == "attachment":
+                text = scan_claude.queued_command_text(entry)
+                if text:
+                    if self.pending_error is not None:
+                        err_text, err_ts, err_record, err_code = self.pending_error
+                        self._add("assistant_message", err_ts, err_record, text=err_text,
+                                  error=_claude_upstream_error(err_text, err_record, err_code))
+                        self.pending_error = None
+                    # queued_command_text admits only explicit human evidence.
+                    self._add("user_message", scan_claude.entry_time(entry), record,
+                              text=text, origin="human")
+                continue
+            message = entry.get("message")
+            if not isinstance(message, dict):
+                continue
+            ts = scan_claude.entry_time(entry)
+            entry_type = entry.get("type")
+            content = message.get("content")
+            if entry_type == "user":
+                if isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, dict) or part.get("type") != "tool_result":
+                            continue
+                        call_id = str(part.get("tool_use_id") or "")
+                        output = part.get("content")
+                        is_error = part.get("is_error")
+                        # Claude 只在失败时写 is_error=True；成功（含已回答的提问）
+                        # 大多缺该键。缺键不是原生成功证据：空输出记 unknown，
+                        # 非空按文本启发式记 inferred，投影到 v1 时仍为 "ok"。
+                        if isinstance(is_error, bool):
+                            outcome = ToolResultOutcome(
+                                "error" if is_error else "ok",
+                                Evidence(_NATIVE, field="message.content.is_error", record=record),
+                            )
+                        elif _is_empty_output(output):
+                            outcome = ToolResultOutcome("unknown", Evidence(_UNKNOWN))
+                        else:
+                            outcome = ToolResultOutcome(
+                                _heuristic_status(output),  # type: ignore[arg-type]
+                                Evidence(_INFERRED, field="message.content", record=record),
+                            )
+                        self._add("tool_result", ts, record,
+                                  call_id=call_id,
+                                  raw_output=output,
+                                  result=outcome)
+                        self.results[call_id] = (output, outcome, lineno)
+                origin = entry.get("origin")
+                origin_kind = origin.get("kind") if isinstance(origin, dict) else None
+                if origin_kind not in (None, "human"):
+                    continue
+                compact = entry.get("isCompactSummary") is True
+                text = scan_claude.extract_text(content or "")
+                if text and text != scan_claude.INTERRUPTED_MARKER:
+                    if self.pending_error is not None:
+                        err_text, err_ts, err_record, err_code = self.pending_error
+                        self._add("assistant_message", err_ts, err_record, text=err_text,
+                                  error=_claude_upstream_error(err_text, err_record, err_code))
+                        self.pending_error = None
+                    if compact:
+                        # System-generated continuation summary in the user
+                        # channel: kept projected (as today) but marked so
+                        # consumers do not mistake it for typed human input.
+                        self._add("user_message", ts, record, text=text, origin="system",
+                                  compaction=CompactionInfo(
+                                      Evidence(_NATIVE, field="isCompactSummary", record=record)))
+                    elif origin_kind == "human":
+                        self._add("user_message", ts, record, text=text, origin="human")
+                    else:
+                        self._add("user_message", ts, record, text=text)
+                elif (compact or (isinstance(content, str) and content.strip())) and text != scan_claude.INTERRUPTED_MARKER:
+                    # Command/caveat wrappers strip to nothing: native injected
+                    # chrome with no human text. Surfaced typed-only (v1 skips
+                    # injected user messages, so projection bytes do not change).
+                    raw = content.strip() if isinstance(content, str) else ""
+                    if raw:
+                        self._add("user_message", ts, record, text=raw, origin="injected")
+                continue
+            if entry_type != "assistant" or not isinstance(content, list):
+                continue
+            usage = _claude_usage(message, record)
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "thinking":
+                    self._add("thinking", ts, record,
+                              text=str(part.get("thinking") or part.get("text") or "").strip())
+                elif part_type == "text":
+                    text = str(part.get("text") or "").strip()
+                    if text:
+                        self.pending_error = None
+                    self._add("assistant_message", ts, record, text=text, usage=usage)
+                elif part_type == "tool_use":
+                    call_id = str(part.get("id") or "")
+                    name = str(part.get("name") or "tool")
+                    raw = _coerce_input(part.get("input"))
+                    index = self._add("tool_call", ts, record, name=name, call_id=call_id, raw_input=raw)
+                    if index is not None and call_id:
+                        self.calls[call_id] = (index, name, raw, lineno)
+        self._link_interactions()
+        return self.events[before:]
+
+    def flush_trailing_error(self) -> list[ActivityEvent]:
+        """Emit a still-pending upstream error (snapshot end, or poll end).
+
+        Readers call this at each poll end (optimistic emit): a live tail
+        ending on an upstream failure surfaces immediately instead of
+        waiting for rows that may never arrive. If the agent later recovers
+        with reply text, the delivered stream keeps both while a later
+        snapshot over the same bytes shows only the text; that edge is
+        documented in the incremental-reader contract.
+        """
+        before = len(self.events)
+        if self.pending_error is not None:
+            err_text, err_ts, err_record, err_code = self.pending_error
+            last = self.events[-1] if self.events else None
+            if last is None or last.type != "assistant_message" or last.text != err_text:
+                self._add("assistant_message", err_ts, err_record, text=err_text,
+                          error=_claude_upstream_error(err_text, err_record, err_code))
+            self.pending_error = None
+        return self.events[before:]
+
+    def _link_interactions(self) -> None:
+        _attach_claude_interactions(self.events, self.calls, self.results)
+
+    def finish_snapshot(self) -> list[ActivityEvent]:
+        """End-of-history step for full loads: flush plus a final link pass."""
+        flushed = self.flush_trailing_error()
+        self._link_interactions()
+        return flushed
+
+
 def _build_claude_events(rows: list[tuple[int, dict]]) -> list[ActivityEvent]:
     """Mirror ``transcript._parse_claude`` emission order, with typed evidence.
 
@@ -626,145 +818,10 @@ def _build_claude_events(rows: list[tuple[int, dict]]) -> list[ActivityEvent]:
     the last one, a real assistant text discards the pending error, and a
     pending error flushes on real user text and at the end.
     """
-    events: list[ActivityEvent] = []
-    pending_error: tuple[str, float | None, str, str | None] | None = None
-    # call_id -> (event index, tool name, raw input, use row)
-    calls: dict[str, tuple[int, str, object, int]] = {}
-    # call_id -> (output, typed outcome, result row)
-    results: dict[str, tuple[Any, ToolResultOutcome, int]] = {}
-
-    def add(event_type: str, ts: float | None, record: str, **fields: Any) -> int | None:
-        text = fields.get("text")
-        if event_type in {"user_message", "assistant_message", "thinking"} and (
-            not isinstance(text, str) or not text.strip()
-        ):
-            return None
-        events.append(ActivityEvent(
-            seq=len(events) + 1,
-            type=event_type,  # type: ignore[arg-type]
-            evidence=Evidence(_NATIVE, record=record),
-            ts=ts,
-            **fields,
-        ))
-        return len(events) - 1
-
-    for lineno, entry in rows:
-        if not isinstance(entry, dict) or entry.get("isMeta") or entry.get("isSidechain"):
-            continue
-        record = _claude_record(lineno)
-        if entry.get("type") == "system":
-            err_text = scan_claude.system_error_text(entry)
-            if err_text:
-                pending_error = (err_text, scan_claude.entry_time(entry), record,
-                                 _claude_entry_error_code(entry))
-            continue
-        if entry.get("type") == "attachment":
-            text = scan_claude.queued_command_text(entry)
-            if text:
-                if pending_error is not None:
-                    err_text, err_ts, err_record, err_code = pending_error
-                    add("assistant_message", err_ts, err_record, text=err_text,
-                        error=_claude_upstream_error(err_text, err_record, err_code))
-                    pending_error = None
-                # queued_command_text admits only explicit human evidence.
-                add("user_message", scan_claude.entry_time(entry), record,
-                    text=text, origin="human")
-            continue
-        message = entry.get("message")
-        if not isinstance(message, dict):
-            continue
-        ts = scan_claude.entry_time(entry)
-        entry_type = entry.get("type")
-        content = message.get("content")
-        if entry_type == "user":
-            if isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict) or part.get("type") != "tool_result":
-                        continue
-                    call_id = str(part.get("tool_use_id") or "")
-                    output = part.get("content")
-                    is_error = part.get("is_error")
-                    # Claude 只在失败时写 is_error=True；成功（含已回答的提问）
-                    # 大多缺该键。缺键不是原生成功证据：空输出记 unknown，
-                    # 非空按文本启发式记 inferred，投影到 v1 时仍为 "ok"。
-                    if isinstance(is_error, bool):
-                        outcome = ToolResultOutcome(
-                            "error" if is_error else "ok",
-                            Evidence(_NATIVE, field="message.content.is_error", record=record),
-                        )
-                    elif _is_empty_output(output):
-                        outcome = ToolResultOutcome("unknown", Evidence(_UNKNOWN))
-                    else:
-                        outcome = ToolResultOutcome(
-                            _heuristic_status(output),  # type: ignore[arg-type]
-                            Evidence(_INFERRED, field="message.content", record=record),
-                        )
-                    add("tool_result", ts, record,
-                        call_id=call_id,
-                        raw_output=output,
-                        result=outcome)
-                    results[call_id] = (output, outcome, lineno)
-            origin = entry.get("origin")
-            origin_kind = origin.get("kind") if isinstance(origin, dict) else None
-            if origin_kind not in (None, "human"):
-                continue
-            compact = entry.get("isCompactSummary") is True
-            text = scan_claude.extract_text(content or "")
-            if text and text != scan_claude.INTERRUPTED_MARKER:
-                if pending_error is not None:
-                    err_text, err_ts, err_record, err_code = pending_error
-                    add("assistant_message", err_ts, err_record, text=err_text,
-                        error=_claude_upstream_error(err_text, err_record, err_code))
-                    pending_error = None
-                if compact:
-                    # System-generated continuation summary in the user
-                    # channel: kept projected (as today) but marked so
-                    # consumers do not mistake it for typed human input.
-                    add("user_message", ts, record, text=text, origin="system",
-                        compaction=CompactionInfo(
-                            Evidence(_NATIVE, field="isCompactSummary", record=record)))
-                elif origin_kind == "human":
-                    add("user_message", ts, record, text=text, origin="human")
-                else:
-                    add("user_message", ts, record, text=text)
-            elif (compact or (isinstance(content, str) and content.strip())) and text != scan_claude.INTERRUPTED_MARKER:
-                # Command/caveat wrappers strip to nothing: native injected
-                # chrome with no human text. Surfaced typed-only (v1 skips
-                # injected user messages, so projection bytes do not change).
-                raw = content.strip() if isinstance(content, str) else ""
-                if raw:
-                    add("user_message", ts, record, text=raw, origin="injected")
-            continue
-        if entry_type != "assistant" or not isinstance(content, list):
-            continue
-        usage = _claude_usage(message, record)
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = part.get("type")
-            if part_type == "thinking":
-                add("thinking", ts, record,
-                    text=str(part.get("thinking") or part.get("text") or "").strip())
-            elif part_type == "text":
-                text = str(part.get("text") or "").strip()
-                if text:
-                    pending_error = None
-                add("assistant_message", ts, record, text=text, usage=usage)
-            elif part_type == "tool_use":
-                call_id = str(part.get("id") or "")
-                name = str(part.get("name") or "tool")
-                raw = _coerce_input(part.get("input"))
-                index = add("tool_call", ts, record, name=name, call_id=call_id, raw_input=raw)
-                if index is not None and call_id:
-                    calls[call_id] = (index, name, raw, lineno)
-    if pending_error is not None:
-        err_text, err_ts, err_record, err_code = pending_error
-        last = events[-1] if events else None
-        if last is None or last.type != "assistant_message" or last.text != err_text:
-            add("assistant_message", err_ts, err_record, text=err_text,
-                error=_claude_upstream_error(err_text, err_record, err_code))
-    _attach_claude_interactions(events, calls, results)
-    return events
+    feed = _ClaudeFeed()
+    feed.feed(rows)
+    feed.finish_snapshot()
+    return feed.events
 
 
 def _claude_question_items(raw_input: object) -> tuple[QuestionItem, ...] | None:
@@ -854,6 +911,117 @@ def _attach_claude_interactions(
         )
 
 
+class _ClaudeOutcomeAcc:
+    """Stateful tail-outcome accumulator; ``_claude_outcome`` runs it over rows.
+
+    Readers feed one appended batch per poll and read ``result()`` after
+    each batch, so the incremental outcome always equals the snapshot
+    outcome function over the same materialized rows.
+    """
+
+    def __init__(self) -> None:
+        self.last_was_user: bool | str | None = None
+        self.last_agent_msg: str | None = None
+        self.last_content_lineno = -1
+        self.last_error_text = ""
+        self.last_error_lineno = -1
+        self.last_error_code: str | None = None
+        self.issued_calls: set[str] = set()
+        self.answered_calls: set[str] = set()
+
+    def add(self, lineno: int, entry: dict) -> None:
+        if not isinstance(entry, dict) or entry.get("isMeta") or entry.get("isSidechain"):
+            return
+        kind = entry.get("type")
+        if kind == "user":
+            content = (entry.get("message") or {}).get("content", "")
+            if isinstance(content, list):
+                for part in content:
+                    if (isinstance(part, dict) and part.get("type") == "tool_result"
+                            and part.get("tool_use_id")):
+                        self.answered_calls.add(str(part.get("tool_use_id")))
+            text = scan_claude.extract_text(content)
+            if text == scan_claude.INTERRUPTED_MARKER:
+                self.last_was_user = "aborted"
+                self.last_content_lineno = lineno
+            elif text:
+                self.last_was_user = True
+                self.last_content_lineno = lineno
+        elif kind == "attachment":
+            if scan_claude.queued_command_text(entry):
+                self.last_was_user = True
+                self.last_content_lineno = lineno
+        elif kind == "assistant":
+            content = (entry.get("message") or {}).get("content", [])
+            if isinstance(content, list):
+                issued_here = False
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "tool_use" and part.get("id"):
+                        self.issued_calls.add(str(part.get("id")))
+                        issued_here = True
+                    if part.get("type") == "text" and (part.get("text") or "").strip():
+                        self.last_agent_msg = part["text"]
+                        self.last_was_user = False
+                        self.last_content_lineno = lineno
+                        break
+                else:
+                    # 纯工具调用轮（无正文）：仍是助手侧回合，不能回落到
+                    # 更早的用户文本去判 pending/done；done 路径再查是否有结果。
+                    if issued_here:
+                        self.last_was_user = False
+                        self.last_content_lineno = lineno
+        elif kind == "system":
+            err_text = scan_claude.system_error_text(entry)
+            if err_text:
+                self.last_error_text = err_text
+                self.last_error_lineno = lineno
+                self.last_error_code = _claude_entry_error_code(entry)
+
+    def result(self) -> SessionOutcome:
+        if self.last_error_text and self.last_error_lineno > self.last_content_lineno:
+            code = self.last_error_code
+            return SessionOutcome(
+                "aborted",
+                Evidence(_NATIVE, field="error.formatted", record=_claude_record(self.last_error_lineno)),
+                error=AgentError("provider", self.last_error_text,
+                                 Evidence(_NATIVE, field="error.formatted",
+                                          record=_claude_record(self.last_error_lineno)),
+                                 code=code),
+            )
+        if self.last_was_user == "aborted":
+            return SessionOutcome(
+                "aborted",
+                Evidence(_NATIVE, field="message.content", record=_claude_record(self.last_content_lineno)),
+                error=AgentError("aborted", scan_claude.INTERRUPTED_MARKER,
+                                 Evidence(_NATIVE, field="message.content",
+                                          record=_claude_record(self.last_content_lineno))),
+            )
+        if self.last_was_user is True:
+            return SessionOutcome(
+                "pending",
+                Evidence(_INFERRED, field="tail_role", record=_claude_record(self.last_content_lineno)))
+        if self.last_was_user is False:
+            # Same private prefix the list scan checks; kept as a module-attribute
+            # reference so the two stay in sync.
+            if (self.last_agent_msg or "").startswith(scan_claude._SESSION_LIMIT_PREFIX):
+                return SessionOutcome(
+                    "aborted",
+                    Evidence(_NATIVE, field="message.content",
+                             record=_claude_record(self.last_content_lineno)),
+                    error=AgentError("provider", self.last_agent_msg or "",
+                                     Evidence(_NATIVE, field="message.content",
+                                              record=_claude_record(self.last_content_lineno))),
+                )
+            if self.issued_calls - self.answered_calls:
+                return SessionOutcome("unknown", Evidence(_UNKNOWN))
+            return SessionOutcome(
+                "done",
+                Evidence(_INFERRED, field="tail_role", record=_claude_record(self.last_content_lineno)))
+        return SessionOutcome("unknown", Evidence(_UNKNOWN))
+
+
 def _claude_outcome(rows: list[tuple[int, dict]]) -> SessionOutcome:
     """Tail outcome mirroring the Claude ``status_tag`` rules with typed evidence.
 
@@ -866,103 +1034,10 @@ def _claude_outcome(rows: list[tuple[int, dict]]) -> SessionOutcome:
     that only issued calls (e.g. an unanswered ``AskUserQuestion``) stays
     ``unknown`` instead of ``done``.
     """
-    last_was_user: bool | str | None = None
-    last_agent_msg: str | None = None
-    last_content_lineno = -1
-    last_error_text = ""
-    last_error_lineno = -1
-    issued_calls: set[str] = set()
-    answered_calls: set[str] = set()
-
+    acc = _ClaudeOutcomeAcc()
     for lineno, entry in rows:
-        if not isinstance(entry, dict) or entry.get("isMeta") or entry.get("isSidechain"):
-            continue
-        kind = entry.get("type")
-        if kind == "user":
-            content = (entry.get("message") or {}).get("content", "")
-            if isinstance(content, list):
-                for part in content:
-                    if (isinstance(part, dict) and part.get("type") == "tool_result"
-                            and part.get("tool_use_id")):
-                        answered_calls.add(str(part.get("tool_use_id")))
-            text = scan_claude.extract_text(content)
-            if text == scan_claude.INTERRUPTED_MARKER:
-                last_was_user = "aborted"
-                last_content_lineno = lineno
-            elif text:
-                last_was_user = True
-                last_content_lineno = lineno
-        elif kind == "attachment":
-            if scan_claude.queued_command_text(entry):
-                last_was_user = True
-                last_content_lineno = lineno
-        elif kind == "assistant":
-            content = (entry.get("message") or {}).get("content", [])
-            if isinstance(content, list):
-                issued_here = False
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") == "tool_use" and part.get("id"):
-                        issued_calls.add(str(part.get("id")))
-                        issued_here = True
-                    if part.get("type") == "text" and (part.get("text") or "").strip():
-                        last_agent_msg = part["text"]
-                        last_was_user = False
-                        last_content_lineno = lineno
-                        break
-                else:
-                    # 纯工具调用轮（无正文）：仍是助手侧回合，不能回落到
-                    # 更早的用户文本去判 pending/done；done 路径再查是否有结果。
-                    if issued_here:
-                        last_was_user = False
-                        last_content_lineno = lineno
-        elif kind == "system":
-            err_text = scan_claude.system_error_text(entry)
-            if err_text:
-                last_error_text = err_text
-                last_error_lineno = lineno
-
-    if last_error_text and last_error_lineno > last_content_lineno:
-        code = _claude_system_error_code(rows, last_error_lineno)
-        return SessionOutcome(
-            "aborted",
-            Evidence(_NATIVE, field="error.formatted", record=_claude_record(last_error_lineno)),
-            error=AgentError("provider", last_error_text,
-                             Evidence(_NATIVE, field="error.formatted",
-                                      record=_claude_record(last_error_lineno)),
-                             code=code),
-        )
-    if last_was_user == "aborted":
-        return SessionOutcome(
-            "aborted",
-            Evidence(_NATIVE, field="message.content", record=_claude_record(last_content_lineno)),
-            error=AgentError("aborted", scan_claude.INTERRUPTED_MARKER,
-                             Evidence(_NATIVE, field="message.content",
-                                      record=_claude_record(last_content_lineno))),
-        )
-    if last_was_user is True:
-        return SessionOutcome(
-            "pending",
-            Evidence(_INFERRED, field="tail_role", record=_claude_record(last_content_lineno)))
-    if last_was_user is False:
-        # Same private prefix the list scan checks; kept as a module-attribute
-        # reference so the two stay in sync.
-        if (last_agent_msg or "").startswith(scan_claude._SESSION_LIMIT_PREFIX):
-            return SessionOutcome(
-                "aborted",
-                Evidence(_NATIVE, field="message.content",
-                         record=_claude_record(last_content_lineno)),
-                error=AgentError("provider", last_agent_msg or "",
-                                 Evidence(_NATIVE, field="message.content",
-                                          record=_claude_record(last_content_lineno))),
-            )
-        if issued_calls - answered_calls:
-            return SessionOutcome("unknown", Evidence(_UNKNOWN))
-        return SessionOutcome(
-            "done",
-            Evidence(_INFERRED, field="tail_role", record=_claude_record(last_content_lineno)))
-    return SessionOutcome("unknown", Evidence(_UNKNOWN))
+        acc.add(lineno, entry)
+    return acc.result()
 
 
 def _claude_system_error_code(rows: list[tuple[int, dict]], lineno: int) -> str | None:
@@ -1088,6 +1163,219 @@ def _codex_injected_user_text(entry: dict) -> str | None:
     return None
 
 
+class _CodexFeed:
+    """Stateful row-sequence interpreter shared by snapshots and readers.
+
+    ``_build_codex_events`` feeds every row at once; incremental readers
+    feed one appended batch per poll while this object carries the open
+    native turn, the usage/verified maps, the tool call/result maps, and
+    emission state across polls, so both paths run the same interpretation
+    row for row. Usage and interaction linking re-run idempotently after
+    each batch: linkage whose row has not materialized yet enriches the
+    materialized list only, never re-emitted polls.
+    """
+
+    def __init__(self, seq_start: int = 0) -> None:
+        self._seq_start = seq_start
+        self.events: list[ActivityEvent] = []
+        self.calls: dict[str, tuple[int, str, object, int]] = {}
+        self.results: dict[str, tuple[Any, ToolResultOutcome, int]] = {}
+        self.usages: dict[str, Usage] = {}
+        self.turn_event_index: dict[str, int] = {}
+        self.verified: dict[str, tuple[list[dict], int]] = {}
+        # Native turn linkage: item_completed/task_complete/turn_aborted and
+        # usage records carry turn_id; rows are chronological, so the last id
+        # seen stamps every following event until the next native turn starts.
+        self.current_turn: str | None = None
+
+    def _add(self, event_type: str, ts: float | None, record: str, **fields: Any) -> int | None:
+        text = fields.get("text")
+        if event_type in {"user_message", "assistant_message", "thinking"} and (
+            not isinstance(text, str) or not text.strip()
+        ):
+            return None
+        if "turn_id" not in fields:
+            fields["turn_id"] = self.current_turn
+        self.events.append(ActivityEvent(
+            seq=self._seq_start + len(self.events) + 1,
+            type=event_type,  # type: ignore[arg-type]
+            evidence=Evidence(_NATIVE, record=record),
+            ts=ts,
+            **fields,
+        ))
+        return len(self.events) - 1
+
+    def _add_dedup(self, event_type: str, ts: float | None, record: str, text: str,
+                   error: AgentError | None = None, origin: str = "unknown",
+                   turn_id: str | None = None) -> None:
+        # Match the legacy adjacent-event rule. Non-text events break adjacency.
+        if self.events and self.events[-1].type == event_type and self.events[-1].text == text:
+            return
+        if error is None:
+            index = self._add(event_type, ts, record, text=text, origin=origin)  # type: ignore[arg-type]
+        else:
+            index = self._add(event_type, ts, record, text=text, error=error,
+                              origin=origin)  # type: ignore[arg-type]
+        if index is not None and turn_id is not None and event_type == "assistant_message":
+            self.turn_event_index[turn_id] = index
+
+    def feed(self, rows: list[tuple[int, dict]]) -> list[ActivityEvent]:
+        """Interpret one batch of ``(lineno, entry)`` rows, appending events."""
+        before = len(self.events)
+        for lineno, entry in rows:
+            payload = entry.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if str(entry.get("type")) == "token_usage_record":
+                turn_id = _codex_turn_id(payload)
+                usage = _codex_usage_from_record(payload, _codex_record(lineno))
+                if turn_id is not None and usage is not None:
+                    self.usages.setdefault(turn_id, usage)
+        for lineno, entry in rows:
+            if str(entry.get("type")) == "compacted":
+                payload = entry.get("payload")
+                record = _codex_record(lineno)
+                summary = ""
+                if isinstance(payload, dict):
+                    raw_message = payload.get("message")
+                    summary = raw_message.strip() if isinstance(raw_message, str) else ""
+                self.events.append(ActivityEvent(
+                    seq=self._seq_start + len(self.events) + 1,
+                    type="compaction",
+                    evidence=Evidence(_NATIVE, record=record),
+                    ts=scan_codex.entry_time(entry),
+                    text=summary or None,
+                    compaction=CompactionInfo(
+                        Evidence(_NATIVE, field="payload.replacement_history", record=record)),
+                ))
+                continue
+            payload = entry.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            ts = scan_codex.entry_time(entry)
+            record = _codex_record(lineno)
+            kind = payload.get("type")
+            native_turn = _codex_turn_id(payload)
+            if native_turn is not None:
+                self.current_turn = native_turn
+            if kind == "turn_aborted":
+                reason = str(payload.get("reason") or "").strip() or "turn_aborted"
+                self._add("lifecycle", ts, record, text=f"turn_aborted: {reason}",
+                          stop_reason=reason,
+                          error=AgentError("user_interrupt", reason,
+                                           Evidence(_NATIVE, field="payload.reason", record=record),
+                                           None, False, "turn"))
+                continue
+            user_text = scan_codex.user_message_text(entry)
+            if user_text:
+                self._add_dedup("user_message", ts, record, user_text, origin="human")
+                continue
+            injected_text = _codex_injected_user_text(entry)
+            if injected_text:
+                # Dropped from the conversation view; typed-only here.
+                self._add("user_message", ts, record, text=injected_text, origin="injected")
+                continue
+            assistant_text = scan_codex.assistant_message_text(entry)
+            if assistant_text:
+                self._add_dedup("assistant_message", ts, record, assistant_text,
+                                origin="human", turn_id=native_turn)
+                continue
+            if kind == "verified_answer":
+                # Native answer record for a request_user_input call: linked by
+                # call id in _attach_codex_interactions. No chat content, so no
+                # event (v1 parity); only interaction metadata.
+                call_id = str(payload.get("call_id") or "")
+                questions = payload.get("questions")
+                if call_id and isinstance(questions, list):
+                    self.verified[call_id] = (
+                        [q for q in questions if isinstance(q, dict)], lineno,
+                    )
+            if kind == "reasoning":
+                self._add("thinking", ts, record, text=_codex_reasoning(payload))
+            elif kind == "function_call":
+                call_id = str(payload.get("call_id") or payload.get("id") or "")
+                name = str(payload.get("name") or "tool")
+                raw = _coerce_input(payload.get("arguments"))
+                index = self._add("tool_call", ts, record, name=name, call_id=call_id, raw_input=raw)
+                if index is not None and call_id:
+                    self.calls[call_id] = (index, name, raw, lineno)
+            elif kind == "custom_tool_call":
+                call_id = str(payload.get("call_id") or payload.get("id") or "")
+                name = str(payload.get("name") or "tool")
+                raw_input = str(payload.get("input") or "")
+                coerced = _codex_coerce_custom(raw_input)
+                index = self._add("tool_call", ts, record,
+                                  name=name, call_id=call_id, raw_input=coerced)
+                if index is not None and call_id:
+                    self.calls[call_id] = (index, name, coerced, lineno)
+            elif kind in {"function_call_output", "custom_tool_call_output"}:
+                output = payload.get("output")
+                call_id = str(payload.get("call_id") or "")
+                if _is_empty_output(output):
+                    outcome = ToolResultOutcome("unknown", Evidence(_UNKNOWN))
+                else:
+                    outcome = ToolResultOutcome(
+                        _heuristic_status(output),  # type: ignore[arg-type]
+                        Evidence(_INFERRED, field="payload.output", record=record),
+                    )
+                self._add("tool_result", ts, record,
+                          call_id=call_id, raw_output=output, result=outcome)
+                self.results[call_id] = (output, outcome, lineno)
+            elif kind == "task_complete":
+                text = str(payload.get("last_agent_message") or "").strip()
+                error: AgentError | None = None
+                if not text:
+                    err_text = scan_codex.task_complete_error_text(payload)
+                    if err_text:
+                        text = err_text
+                        raw_err = payload.get("error")
+                        code = (
+                            str(raw_err.get("codex_error_info") or "").strip()
+                            if isinstance(raw_err, dict) else None) or None
+                        error_kind, retryable = classify_error(
+                            runtime="codex", kind="provider", code=code,
+                            message=err_text,
+                        )
+                        error = AgentError(
+                            error_kind, err_text,
+                            Evidence(_NATIVE, field="payload.error", record=record),
+                            code, retryable, "turn",
+                            native_http_status(code, err_text),
+                        )
+                if text:
+                    self._add_dedup("assistant_message", ts, record, text, error,
+                                    origin="human", turn_id=native_turn)
+                else:
+                    # Bare completion marker: no chat content, but native
+                    # completion evidence for turn derivation (typed-only).
+                    self._add("lifecycle", ts, record, text="task_complete",
+                              stop_reason="task_complete")
+        self._link_late()
+        return self.events[before:]
+
+    def finish_snapshot(self) -> list[ActivityEvent]:
+        """End-of-history step for full loads; Codex rows need no end flush."""
+        return []
+
+    def _link_late(self) -> None:
+        """Attach usage/interaction rows that have materialized so far.
+
+        Idempotent: re-running over the full materialized maps only fills
+        linkage whose row arrived after the linked event was emitted. The
+        delivered poll stream is never rewritten; the materialized list
+        converges toward the snapshot over the same bytes.
+        """
+        for turn_id, usage in self.usages.items():
+            index = self.turn_event_index.get(turn_id)
+            if index is None:
+                continue
+            event = self.events[index]
+            if event.usage is not None:
+                continue
+            self.events[index] = replace(event, usage=usage)
+        _attach_codex_interactions(self.events, self.calls, self.results, self.verified)
+
+
 def _build_codex_events(rows: list[tuple[int, dict]]) -> list[ActivityEvent]:
     """Mirror ``transcript._parse_codex`` emission order, with typed evidence.
 
@@ -1095,196 +1383,9 @@ def _build_codex_events(rows: list[tuple[int, dict]]) -> list[ActivityEvent]:
     空输出记 unknown；v1 投影时仍为 "ok"/启发式值，与旧发射一致。相邻重复
     的用户/助手/task_complete 文本去重规则与旧发射相同。
     """
-    events: list[ActivityEvent] = []
-    calls: dict[str, tuple[int, str, object, int]] = {}
-    results: dict[str, tuple[Any, ToolResultOutcome, int]] = {}
-    usages: dict[str, Usage] = {}
-    turn_event_index: dict[str, int] = {}
-    verified: dict[str, tuple[list[dict], int]] = {}
-    for lineno, entry in rows:
-        payload = entry.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        if str(entry.get("type")) == "token_usage_record":
-            turn_id = _codex_turn_id(payload)
-            usage = _codex_usage_from_record(payload, _codex_record(lineno))
-            if turn_id is not None and usage is not None:
-                usages.setdefault(turn_id, usage)
-    for lineno, entry in rows:
-        payload = entry.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        if str(entry.get("type")) == "token_usage_record":
-            turn_id = _codex_turn_id(payload)
-            usage = _codex_usage_from_record(payload, _codex_record(lineno))
-            if turn_id is not None and usage is not None:
-                usages.setdefault(turn_id, usage)
-
-    # Native turn linkage: item_completed/task_complete/turn_aborted and
-    # usage records carry turn_id; rows are chronological, so the last id
-    # seen stamps every following event until the next native turn starts.
-    current_turn: list[str | None] = [None]
-
-    def add(event_type: str, ts: float | None, record: str, **fields: Any) -> int | None:
-        text = fields.get("text")
-        if event_type in {"user_message", "assistant_message", "thinking"} and (
-            not isinstance(text, str) or not text.strip()
-        ):
-            return None
-        if "turn_id" not in fields:
-            fields["turn_id"] = current_turn[0]
-        events.append(ActivityEvent(
-            seq=len(events) + 1,
-            type=event_type,  # type: ignore[arg-type]
-            evidence=Evidence(_NATIVE, record=record),
-            ts=ts,
-            **fields,
-        ))
-        return len(events) - 1
-
-    def add_dedup(event_type: str, ts: float | None, record: str, text: str,
-                  error: AgentError | None = None, origin: str = "unknown",
-                   turn_id: str | None = None) -> None:
-        # Match the legacy adjacent-event rule. Non-text events break adjacency.
-        if events and events[-1].type == event_type and events[-1].text == text:
-            return
-        if error is None:
-            index = add(event_type, ts, record, text=text, origin=origin)  # type: ignore[arg-type]
-        else:
-            index = add(event_type, ts, record, text=text, error=error,
-                        origin=origin)  # type: ignore[arg-type]
-        if index is not None and turn_id is not None and event_type == "assistant_message":
-            turn_event_index[turn_id] = index
-
-    for lineno, entry in rows:
-        if str(entry.get("type")) == "compacted":
-            payload = entry.get("payload")
-            record = _codex_record(lineno)
-            summary = ""
-            if isinstance(payload, dict):
-                raw_message = payload.get("message")
-                summary = raw_message.strip() if isinstance(raw_message, str) else ""
-            events.append(ActivityEvent(
-                seq=len(events) + 1,
-                type="compaction",
-                evidence=Evidence(_NATIVE, record=record),
-                ts=scan_codex.entry_time(entry),
-                text=summary or None,
-                compaction=CompactionInfo(
-                    Evidence(_NATIVE, field="payload.replacement_history", record=record)),
-            ))
-            continue
-        payload = entry.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        ts = scan_codex.entry_time(entry)
-        record = _codex_record(lineno)
-        kind = payload.get("type")
-        native_turn = _codex_turn_id(payload)
-        if native_turn is not None:
-            current_turn[0] = native_turn
-        if kind == "turn_aborted":
-            reason = str(payload.get("reason") or "").strip() or "turn_aborted"
-            add("lifecycle", ts, record, text=f"turn_aborted: {reason}",
-                stop_reason=reason,
-                error=AgentError("user_interrupt", reason,
-                                 Evidence(_NATIVE, field="payload.reason", record=record),
-                                 None, False, "turn"))
-            continue
-        user_text = scan_codex.user_message_text(entry)
-        if user_text:
-            add_dedup("user_message", ts, record, user_text, origin="human")
-            continue
-        injected_text = _codex_injected_user_text(entry)
-        if injected_text:
-            # Dropped from the conversation view; typed-only here.
-            add("user_message", ts, record, text=injected_text, origin="injected")
-            continue
-        assistant_text = scan_codex.assistant_message_text(entry)
-        if assistant_text:
-            add_dedup("assistant_message", ts, record, assistant_text,
-                      origin="human", turn_id=native_turn)
-            continue
-        if kind == "verified_answer":
-            # Native answer record for a request_user_input call: linked by
-            # call id in _attach_codex_interactions. No chat content, so no
-            # event (v1 parity); only interaction metadata.
-            call_id = str(payload.get("call_id") or "")
-            questions = payload.get("questions")
-            if call_id and isinstance(questions, list):
-                verified[call_id] = (
-                    [q for q in questions if isinstance(q, dict)], lineno,
-                )
-        if kind == "reasoning":
-            add("thinking", ts, record, text=_codex_reasoning(payload))
-        elif kind == "function_call":
-            call_id = str(payload.get("call_id") or payload.get("id") or "")
-            name = str(payload.get("name") or "tool")
-            raw = _coerce_input(payload.get("arguments"))
-            index = add("tool_call", ts, record, name=name, call_id=call_id, raw_input=raw)
-            if index is not None and call_id:
-                calls[call_id] = (index, name, raw, lineno)
-        elif kind == "custom_tool_call":
-            call_id = str(payload.get("call_id") or payload.get("id") or "")
-            name = str(payload.get("name") or "tool")
-            raw_input = str(payload.get("input") or "")
-            coerced = _codex_coerce_custom(raw_input)
-            index = add("tool_call", ts, record,
-                        name=name, call_id=call_id, raw_input=coerced)
-            if index is not None and call_id:
-                calls[call_id] = (index, name, coerced, lineno)
-        elif kind in {"function_call_output", "custom_tool_call_output"}:
-            output = payload.get("output")
-            call_id = str(payload.get("call_id") or "")
-            if _is_empty_output(output):
-                outcome = ToolResultOutcome("unknown", Evidence(_UNKNOWN))
-            else:
-                outcome = ToolResultOutcome(
-                    _heuristic_status(output),  # type: ignore[arg-type]
-                    Evidence(_INFERRED, field="payload.output", record=record),
-                )
-            add("tool_result", ts, record,
-                call_id=call_id, raw_output=output, result=outcome)
-            results[call_id] = (output, outcome, lineno)
-        elif kind == "task_complete":
-            text = str(payload.get("last_agent_message") or "").strip()
-            error: AgentError | None = None
-            if not text:
-                err_text = scan_codex.task_complete_error_text(payload)
-                if err_text:
-                    text = err_text
-                    raw_err = payload.get("error")
-                    code = (
-                        str(raw_err.get("codex_error_info") or "").strip()
-                        if isinstance(raw_err, dict) else None) or None
-                    error_kind, retryable = classify_error(
-                        runtime="codex", kind="provider", code=code,
-                        message=err_text,
-                    )
-                    error = AgentError(
-                        error_kind, err_text,
-                        Evidence(_NATIVE, field="payload.error", record=record),
-                        code, retryable, "turn",
-                        native_http_status(code, err_text),
-                    )
-            if text:
-                add_dedup("assistant_message", ts, record, text, error,
-                          origin="human", turn_id=native_turn)
-            else:
-                # Bare completion marker: no chat content, but native
-                # completion evidence for turn derivation (typed-only).
-                add("lifecycle", ts, record, text="task_complete",
-                    stop_reason="task_complete")
-    for turn_id, usage in usages.items():
-        index = turn_event_index.get(turn_id)
-        if index is None:
-            continue
-        event = events[index]
-        if event.usage is not None:
-            continue
-        events[index] = replace(event, usage=usage)
-    _attach_codex_interactions(events, calls, results, verified)
-    return events
+    feed = _CodexFeed()
+    feed.feed(rows)
+    return feed.events
 
 
 def _codex_question_items(raw_input: object) -> tuple[QuestionItem, ...] | None:
@@ -1458,6 +1559,118 @@ def _attach_codex_interactions(
         )
 
 
+class _CodexOutcomeAcc:
+    """Stateful turn-outcome accumulator; ``_codex_outcome`` runs it over rows.
+
+    Readers feed one appended batch per poll and read ``result()`` after
+    each batch, so the incremental outcome always equals the snapshot
+    outcome function over the same materialized rows.
+    """
+
+    def __init__(self) -> None:
+        self.last_kind: str | None = None
+        self.last_record = "line:0"
+        self.last_error_text = ""
+        self.last_error_code: str | None = None
+        self.issued_calls: set[str] = set()
+        self.answered_calls: set[str] = set()
+
+    def add(self, lineno: int, entry: dict) -> None:
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            return
+        record = _codex_record(lineno)
+        kind = payload.get("type")
+        if scan_codex.user_message_text(entry):
+            # Older and newer Codex records can both represent the same prompt.
+            # Resetting twice is harmless; this keeps unanswered calls from an
+            # earlier completed turn from contaminating the latest turn.
+            self.issued_calls.clear()
+            self.answered_calls.clear()
+            self.last_kind = "user_message"
+            self.last_record = record
+            self.last_error_text = ""
+            self.last_error_code = None
+            return
+        if kind in {"function_call", "custom_tool_call"}:
+            call_id = str(payload.get("call_id") or payload.get("id") or "")
+            if call_id:
+                self.issued_calls.add(call_id)
+            if self.last_kind in {"task_complete", "task_complete_error", "turn_aborted"}:
+                self.last_kind = "tool_activity"
+                self.last_record = record
+                self.last_error_text = ""
+                self.last_error_code = None
+            return
+        elif kind in {"function_call_output", "custom_tool_call_output"}:
+            call_id = str(payload.get("call_id") or "")
+            if call_id:
+                self.answered_calls.add(call_id)
+            if self.last_kind in {"task_complete", "task_complete_error", "turn_aborted"}:
+                self.last_kind = "tool_activity"
+                self.last_record = record
+                self.last_error_text = ""
+                self.last_error_code = None
+            return
+        if scan_codex.assistant_message_text(entry):
+            self.last_kind = "agent_message"
+            self.last_record = record
+            self.last_error_text = ""
+            self.last_error_code = None
+        elif entry.get("type") == "event_msg" and kind == "task_complete":
+            err_text = scan_codex.task_complete_error_text(payload)
+            if err_text:
+                self.last_kind = "task_complete_error"
+                self.last_error_text = err_text
+                err = payload.get("error")
+                self.last_error_code = (
+                    str(err.get("codex_error_info") or "").strip()
+                    if isinstance(err, dict) else None) or None
+            else:
+                self.last_kind = "task_complete"
+                self.last_error_text = ""
+                self.last_error_code = None
+            # A terminal marker closes this turn. Its unresolved calls must
+            # not leak into a later assistant-only turn in the same thread.
+            self.issued_calls.clear()
+            self.answered_calls.clear()
+            self.last_record = record
+        elif entry.get("type") == "event_msg" and kind == "turn_aborted":
+            self.last_kind = "turn_aborted"
+            self.issued_calls.clear()
+            self.answered_calls.clear()
+            self.last_record = record
+            self.last_error_text = ""
+            self.last_error_code = None
+
+    def result(self) -> SessionOutcome:
+        if self.last_kind in ("turn_aborted", "task_complete_error"):
+            kind = "aborted" if self.last_kind == "turn_aborted" else "provider"
+            detail = self.last_error_text or self.last_kind
+            field = "payload.type" if self.last_kind == "turn_aborted" else "payload.error"
+            return SessionOutcome(
+                "aborted",
+                Evidence(_NATIVE, field=field, record=self.last_record),
+                error=AgentError(kind, detail,
+                                 Evidence(_NATIVE, field=field, record=self.last_record),
+                                 code=self.last_error_code),
+            )
+        if self.last_kind == "task_complete":
+            return SessionOutcome(
+                "done", Evidence(_NATIVE, field="payload.type", record=self.last_record))
+        if self.last_kind == "user_message":
+            if self.issued_calls - self.answered_calls:
+                return SessionOutcome("unknown", Evidence(_UNKNOWN))
+            return SessionOutcome(
+                "pending", Evidence(_INFERRED, field="tail_role", record=self.last_record))
+        if self.last_kind == "agent_message":
+            if self.issued_calls - self.answered_calls:
+                return SessionOutcome("unknown", Evidence(_UNKNOWN))
+            return SessionOutcome(
+                "done", Evidence(_INFERRED, field="tail_role", record=self.last_record))
+        return SessionOutcome("unknown", Evidence(_UNKNOWN))
+
+
 def _codex_outcome(rows: list[tuple[int, dict]]) -> SessionOutcome:
     """Infer the latest Codex turn outcome from its tail records.
 
@@ -1465,101 +1678,7 @@ def _codex_outcome(rows: list[tuple[int, dict]]) -> SessionOutcome:
     otherwise pending/assistant tail unknown, but a later native
     ``task_complete`` is authoritative completion evidence for that turn.
     """
-    last_kind: str | None = None
-    last_record = "line:0"
-    last_error_text = ""
-    last_error_code: str | None = None
-    issued_calls: set[str] = set()
-    answered_calls: set[str] = set()
+    acc = _CodexOutcomeAcc()
     for lineno, entry in rows:
-        payload = entry.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        record = _codex_record(lineno)
-        kind = payload.get("type")
-        if scan_codex.user_message_text(entry):
-            # Older and newer Codex records can both represent the same prompt.
-            # Resetting twice is harmless; this keeps unanswered calls from an
-            # earlier completed turn from contaminating the latest turn.
-            issued_calls.clear()
-            answered_calls.clear()
-            last_kind = "user_message"
-            last_record = record
-            last_error_text = ""
-            last_error_code = None
-            continue
-        if kind in {"function_call", "custom_tool_call"}:
-            call_id = str(payload.get("call_id") or payload.get("id") or "")
-            if call_id:
-                issued_calls.add(call_id)
-            if last_kind in {"task_complete", "task_complete_error", "turn_aborted"}:
-                last_kind = "tool_activity"
-                last_record = record
-                last_error_text = ""
-                last_error_code = None
-            continue
-        elif kind in {"function_call_output", "custom_tool_call_output"}:
-            call_id = str(payload.get("call_id") or "")
-            if call_id:
-                answered_calls.add(call_id)
-            if last_kind in {"task_complete", "task_complete_error", "turn_aborted"}:
-                last_kind = "tool_activity"
-                last_record = record
-                last_error_text = ""
-                last_error_code = None
-            continue
-        if scan_codex.assistant_message_text(entry):
-            last_kind = "agent_message"
-            last_record = record
-            last_error_text = ""
-            last_error_code = None
-        elif entry.get("type") == "event_msg" and kind == "task_complete":
-            err_text = scan_codex.task_complete_error_text(payload)
-            if err_text:
-                last_kind = "task_complete_error"
-                last_error_text = err_text
-                err = payload.get("error")
-                last_error_code = (
-                    str(err.get("codex_error_info") or "").strip()
-                    if isinstance(err, dict) else None) or None
-            else:
-                last_kind = "task_complete"
-                last_error_text = ""
-                last_error_code = None
-            # A terminal marker closes this turn. Its unresolved calls must
-            # not leak into a later assistant-only turn in the same thread.
-            issued_calls.clear()
-            answered_calls.clear()
-            last_record = record
-        elif entry.get("type") == "event_msg" and kind == "turn_aborted":
-            last_kind = "turn_aborted"
-            issued_calls.clear()
-            answered_calls.clear()
-            last_record = record
-            last_error_text = ""
-            last_error_code = None
-    if last_kind in ("turn_aborted", "task_complete_error"):
-        kind = "aborted" if last_kind == "turn_aborted" else "provider"
-        detail = last_error_text or last_kind
-        field = "payload.type" if last_kind == "turn_aborted" else "payload.error"
-        return SessionOutcome(
-            "aborted",
-            Evidence(_NATIVE, field=field, record=last_record),
-            error=AgentError(kind, detail,
-                             Evidence(_NATIVE, field=field, record=last_record),
-                             code=last_error_code),
-        )
-    if last_kind == "task_complete":
-        return SessionOutcome(
-            "done", Evidence(_NATIVE, field="payload.type", record=last_record))
-    if last_kind == "user_message":
-        if issued_calls - answered_calls:
-            return SessionOutcome("unknown", Evidence(_UNKNOWN))
-        return SessionOutcome(
-            "pending", Evidence(_INFERRED, field="tail_role", record=last_record))
-    if last_kind == "agent_message":
-        if issued_calls - answered_calls:
-            return SessionOutcome("unknown", Evidence(_UNKNOWN))
-        return SessionOutcome(
-            "done", Evidence(_INFERRED, field="tail_role", record=last_record))
-    return SessionOutcome("unknown", Evidence(_UNKNOWN))
+        acc.add(lineno, entry)
+    return acc.result()

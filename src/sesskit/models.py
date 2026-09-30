@@ -419,7 +419,7 @@ def completion_id_for(
 
 
 def format_message_time(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+    return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")  # noqa: DTZ006 - Display uses local time.
 
 
 def session_key(session: SessionInfo | dict) -> str:

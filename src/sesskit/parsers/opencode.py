@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """扫描 OpenCode 会话历史（SQLite opencode.db），输出统一会话结构。
 
 OpenCode v1.2.0 起把历史存进单个 SQLite 数据库（session/message/part 三表，

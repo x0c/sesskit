@@ -412,6 +412,21 @@ def _fake_registry(sessions: list[dict]) -> ParserRegistry:
                                          _scan=scan, _load=load)])
 
 
+def test_verify_session_reader_suffix_semantics():
+    # Tail-window readers report a suffix with snapshot-global seqs; the
+    # gate accepts full equality or exact-suffix equality, and requires
+    # backward pages to reassemble the full snapshot.
+    for builder in (_claude_fixture, _codex_fixture):
+        with tempfile.TemporaryDirectory() as directory:
+            session = builder(Path(directory))
+            result = verify_session(session)
+            assert result["reader"]["supported"] is True
+            assert result["reader"]["ok"] is True
+            assert result["reader"]["mismatch"] is False
+            assert result["reader"]["page_ok"] is True
+            assert result["violations"] == []
+
+
 def test_verify_session_counts_only_no_paths():
     with tempfile.TemporaryDirectory() as directory:
         session = _pi_fixture(Path(directory))

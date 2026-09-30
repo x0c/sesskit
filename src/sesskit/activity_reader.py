@@ -94,9 +94,12 @@ class ActivityReader:
         raise NotImplementedError
 
 
+_INCREMENTAL_RUNTIMES = ("pi", "claude", "codex", "cursor", "opencode")
+
+
 def supports_incremental(session: dict) -> bool:
     """Return true when this session's runtime has an incremental reader."""
-    return str(session.get("source") or "") == "pi"
+    return str(session.get("source") or "") in _INCREMENTAL_RUNTIMES
 
 
 def open_activity_reader(session: dict, cursor: str | Mapping[str, Any] | None = None) -> ActivityReader:
@@ -105,12 +108,52 @@ def open_activity_reader(session: dict, cursor: str | Mapping[str, Any] | None =
     Raises ``IncrementalUnsupported`` for runtimes without an implementation
     (including Kimi); callers fall back to ``load_activity`` snapshots.
     """
-    if not supports_incremental(session):
-        runtime_id = str(session.get("source") or "")
-        raise IncrementalUnsupported(
-            f"incremental reading is unsupported for runtime {runtime_id!r}; use load_activity instead",
-        )
-    return PiActivityReader(session, cursor)
+    runtime_id = str(session.get("source") or "")
+    if runtime_id == "pi":
+        return PiActivityReader(session, cursor)
+    if runtime_id == "claude":
+        from sesskit.activity_reader_jsonl import ClaudeActivityReader
+
+        return ClaudeActivityReader(session, cursor)
+    if runtime_id == "codex":
+        from sesskit.activity_reader_jsonl import CodexActivityReader
+
+        return CodexActivityReader(session, cursor)
+    if runtime_id == "cursor":
+        from sesskit.activity_cursor import CursorActivityReader
+
+        return CursorActivityReader(session, cursor)
+    if runtime_id == "opencode":
+        from sesskit.activity_opencode import OpenCodeActivityReader
+
+        return OpenCodeActivityReader(session, cursor)
+    raise IncrementalUnsupported(
+        f"incremental reading is unsupported for runtime {runtime_id!r}; use load_activity instead",
+    )
+
+
+def decode_reader_cursor(
+    cursor: str | Mapping[str, Any] | None, runtime: str,
+) -> dict[str, Any] | None:
+    """Decode an opaque reader cursor for ``runtime``; None when unusable.
+
+    Cursors are JSON-safe, versioned, and self-validating: callers persist
+    and return them without interpreting their contents.
+    """
+    if isinstance(cursor, Mapping):
+        data = dict(cursor)
+    elif isinstance(cursor, str):
+        try:
+            data = json.loads(cursor)
+        except ValueError:
+            return None
+        if not isinstance(data, dict):
+            return None
+    else:
+        return None
+    if data.get("v") != _READER_CURSOR_VERSION or data.get("runtime") != runtime:
+        return None
+    return data
 
 
 def _encode_cursor(payload: dict[str, Any]) -> str:
@@ -504,3 +547,54 @@ class PiActivityReader(ActivityReader):
         if not isinstance(data, dict) or data.get("v") != _PAGE_TOKEN_VERSION:
             return None
         return data
+
+
+def decode_page_token(before: str | None) -> dict[str, Any] | None:
+    """Decode an opaque backward-page token; None when missing or invalid."""
+    if not before:
+        return None
+    try:
+        data = json.loads(before)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("v") != _PAGE_TOKEN_VERSION:
+        return None
+    return data
+
+
+def page_window(
+    events: list[ActivityEvent],
+    generation: int,
+    before: str | None = None,
+    limit: int = _PAGE_DEFAULT_LIMIT,
+) -> PageResult:
+    """Return one backward page over cached generation events, newest last.
+
+    Shared by the SQLite readers so paging preserves call/result pairing
+    across page edges: pages are slices of the same stable-``seq`` list the
+    polls extend, never a re-query.
+    """
+    total = len(events)
+    end = total + 1
+    token = decode_page_token(before)
+    if token is not None:
+        try:
+            if int(token.get("gen", -1)) == generation:
+                end = min(max(int(token.get("end", total + 1)), 1), total + 1)
+        except (TypeError, ValueError):
+            end = total + 1
+    try:
+        count = int(limit)
+    except (TypeError, ValueError):
+        count = _PAGE_DEFAULT_LIMIT
+    count = min(max(count, 1), _PAGE_MAX_LIMIT)
+    start = max(end - count, 1)
+    window = tuple(event for event in events if start <= event.seq < end)
+    has_more = start > 1
+    next_before = (
+        _encode_cursor({"v": _PAGE_TOKEN_VERSION, "gen": generation, "end": start})
+        if has_more
+        else None
+    )
+    return PageResult(events=window, before=next_before, has_more=has_more,
+                      generation=str(generation))

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """扫描 Kimi Code CLI 会话历史（~/.kimi-code/sessions/），输出统一会话结构。
 
 Kimi Code 的会话按「工作区 / 会话」两级目录存放：

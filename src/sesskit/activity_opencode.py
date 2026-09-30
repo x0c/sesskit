@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 from dataclasses import replace
 from typing import Any
 
+from sesskit.activity_reader import (
+    ActivityReader,
+    PageResult,
+    PollResult,
+    _encode_cursor,
+    decode_reader_cursor,
+    page_window,
+)
 from sesskit.errors import classify_error, native_http_status
 from sesskit.models import (
     ActivityEvent,
@@ -609,6 +618,454 @@ def _build_v2(
 
 def _copy_with_error(event: ActivityEvent, error: AgentError) -> ActivityEvent:
     return replace(event, error=error)
+
+
+def _copy_with_error(event: ActivityEvent, error: AgentError) -> ActivityEvent:
+    return replace(event, error=error)
+
+
+# --- Incremental reader -----------------------------------------------------
+
+
+class _RowShim:
+    """Mapping-style row view over cached plain tuples for the builders."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = data
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+
+def _file_state(path: str) -> tuple[int, int, int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _checksum(payload: str) -> str:
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+
+def _event_key(event: ActivityEvent) -> tuple:
+    """Stable identity for prefix comparison across rebuilds (no content)."""
+    result = getattr(event, "result", None)
+    interaction = getattr(event, "interaction", None)
+    return (
+        event.type,
+        event.text,
+        event.call_id,
+        event.name,
+        json.dumps(event.raw_input, sort_keys=True, default=str)
+        if event.raw_input is not None else None,
+        json.dumps(event.raw_output, sort_keys=True, default=str)
+        if event.raw_output is not None else None,
+        result.status if result is not None else None,
+        getattr(event, "origin", None),
+        getattr(interaction, "resolution", None) if interaction is not None else None,
+    )
+
+
+class OpenCodeActivityReader(ActivityReader):
+    """Incremental reader over one OpenCode session's SQLite rows.
+
+    Both schema families are supported: v1 ``message``/``part`` rows keyed
+    by ``(time_created, id)`` ordering, and v2 ``session_message`` rows keyed
+    by ``(seq, id)``. The shared database is opened read-only with
+    WAL-visible tails (never ``immutable=1``); every query filters on the
+    session id, so opening never scans other sessions. The opaque cursor
+    carries a database fingerprint (file identity plus WAL state plus SQLite
+    ``data_version``), the schema family, the last committed row position
+    (ordering keys plus boundary checksum plus row count), and the event
+    count. A no-change poll stats the main file and its ``-wal`` sidecar
+    only and never opens the database. A vacuum, rowid reuse, checkpoint
+    reshuffle that moves the boundary, file replacement, family change, or
+    invalid cursor starts a new generation: the returned events replace, not
+    extend, the previous generation. Deltas rebuild through the same
+    ``_build_v1``/``_build_v2`` builders as the snapshot, so ``seq`` stays
+    stable within a generation and ``to_v1_dicts`` parity holds.
+    """
+
+    def __init__(self, session: dict, cursor: Any = None) -> None:
+        self._db_path = str(session.get("path") or "")
+        self._session_id = str(session.get("id") or "")
+        saved = decode_reader_cursor(cursor, "opencode")
+        if saved is not None and (
+            saved.get("path") != self._db_path or saved.get("session") != self._session_id
+        ):
+            saved = None
+        self._pending_cursor = saved
+        self._gen = 0
+        self._family: str | None = None
+        self._events: list[ActivityEvent] = []
+        self._rows: list[dict[str, Any]] = []
+        self._previous_rows: list[dict[str, Any]] = []
+        self._previous_events: list[ActivityEvent] = []
+        self._position = ""
+        self._boundary = hashlib.sha256(b"").hexdigest()
+        self._outcome = SessionOutcome("unknown", Evidence(_UNKNOWN))
+        self._state: LoadState = "unavailable"
+        self._file: tuple[int, int, int, int] | None = None
+        self._wal: tuple[int, int, int, int] | None = None
+        self._data_version = 0
+        self._initialized = False
+        # Test/observability counters: database opens and session rows read
+        # (file stat calls excluded).
+        self.db_opens = 0
+        self.rows_parsed = 0
+
+    # -- public protocol -------------------------------------------------
+
+    def poll(self) -> PollResult:
+        self._sync()
+        return PollResult(
+            events=tuple(self._new_events),
+            reset=self._last_reset,
+            generation=str(self._gen),
+            cursor=self._export_cursor(),
+            outcome=self._outcome,
+            state=self._state,
+        )
+
+    def page(self, before: str | None = None, limit: int = 50) -> PageResult:
+        self._sync()
+        return page_window(self._events, self._gen, before, limit)
+
+    # -- sync machinery --------------------------------------------------
+
+    def _sync(self) -> None:
+        self._new_events: list[ActivityEvent] = []
+        self._last_reset = False
+        if not self._db_path or not self._session_id:
+            self._mark_unavailable()
+            return
+        file_state = _file_state(self._db_path)
+        wal_state = _file_state(self._db_path + "-wal")
+        if file_state is None:
+            self._mark_unavailable()
+            return
+        if not self._initialized:
+            self._cold_open(file_state, wal_state)
+            return
+        cached_file = self._file or (-1, -1, -1, -1)
+        if file_state[0] != cached_file[0] or file_state[1] != cached_file[1]:
+            self._rebuild(file_state, wal_state)
+            return
+        if file_state == self._file and wal_state == self._wal:
+            return
+        self._refresh(file_state, wal_state)
+
+    def _open(self) -> sqlite3.Connection | None:
+        conn = scan_opencode.connect_ro(self._db_path)
+        if conn is not None:
+            self.db_opens += 1
+        return conn
+
+    @staticmethod
+    def _fetch_data_version(conn: sqlite3.Connection) -> int:
+        try:
+            row = conn.execute("PRAGMA data_version").fetchone()
+        except sqlite3.Error:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError, IndexError):
+            return 0
+
+    def _read_session_rows(
+        self, conn: sqlite3.Connection, family: str,
+    ) -> list[dict[str, Any]] | None:
+        try:
+            if family == "v1":
+                fetched = conn.execute(_V1_ROWS, (self._session_id,)).fetchall()
+                rows = [
+                    {
+                        "message_id": row["message_id"],
+                        "time_created": row["time_created"],
+                        "msg_data": row["msg_data"],
+                        "part_id": row["part_id"],
+                        "part_time": row["part_time"],
+                        "part_data": row["part_data"],
+                    }
+                    for row in fetched
+                ]
+            else:
+                fetched = conn.execute(_V2_ROWS, (self._session_id,)).fetchall()
+                rows = [
+                    {
+                        "type": row["type"],
+                        "seq": row["seq"],
+                        "time_created": row["time_created"],
+                        "id": row["id"],
+                        "data": row["data"],
+                    }
+                    for row in fetched
+                ]
+        except sqlite3.Error:
+            return None
+        self.rows_parsed += len(rows)
+        return rows
+
+    def _rebuild_events(
+        self, family: str, rows: list[dict[str, Any]],
+    ) -> tuple[list[ActivityEvent], SessionOutcome]:
+        shims = [_RowShim(row) for row in rows]
+        if family == "v1":
+            events, tail = _build_v1(shims, self._session_id)  # type: ignore[arg-type]
+            return events, _v1_outcome(tail)
+        events, outcome = _build_v2(shims, self._session_id)  # type: ignore[arg-type]
+        return events, outcome
+
+    def _position_of(self, family: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
+        if not rows:
+            return "", hashlib.sha256(b"").hexdigest()
+        if family == "v1":
+            last = rows[-1]
+            position = (
+                f"{last.get('time_created')}\x00{last.get('message_id')}"
+                f"\x00{last.get('part_time')}\x00{last.get('part_id')}"
+            )
+            return position, _checksum(
+                f"{position}\x00{last.get('msg_data')}\x00{last.get('part_data')}")
+        last = rows[-1]
+        position = f"{last.get('seq')}\x00{last.get('id')}"
+        return position, _checksum(f"{position}\x00{last.get('data')}")
+
+    def _cold_open(
+        self,
+        file_state: tuple[int, int, int, int],
+        wal_state: tuple[int, int, int, int] | None,
+    ) -> None:
+        conn = self._open()
+        if conn is None:
+            self._mark_unavailable()
+            return
+        try:
+            family = _history_family(conn, self._session_id)
+            if family is None:
+                self._adopt_unsupported()
+                return
+            data_version = self._fetch_data_version(conn)
+            rows = self._read_session_rows(conn, family)
+        finally:
+            conn.close()
+        if rows is None:
+            self._mark_unavailable()
+            return
+        saved = self._pending_cursor
+        self._pending_cursor = None
+        position, boundary = self._position_of(family, rows)
+        events, outcome = self._rebuild_events(family, rows)
+        self._adopt_state(family, rows, position, boundary, events, outcome,
+                          data_version, file_state, wal_state, fresh_gen=1)
+        self._initialized = True
+        if saved is not None and self._cursor_matches(saved):
+            try:
+                self._gen = max(int(saved.get("gen", 1)), 1)
+            except (TypeError, ValueError):
+                self._gen = 1
+            self._last_reset = False
+            self._new_events = []
+        else:
+            if saved is not None:
+                self._gen += 1
+            self._last_reset = True
+            self._new_events = list(self._events)
+
+    def _refresh(
+        self,
+        file_state: tuple[int, int, int, int],
+        wal_state: tuple[int, int, int, int] | None,
+    ) -> None:
+        """Stat changed: re-read the bounded per-session window and diff."""
+        conn = self._open()
+        if conn is None:
+            # Transient lock or checkpoint race: keep the cached generation
+            # and report no change rather than flapping to unavailable.
+            return
+        try:
+            family = _history_family(conn, self._session_id)
+            if family is None:
+                self._adopt_unsupported()
+                return
+            data_version = self._fetch_data_version(conn)
+            rows = self._read_session_rows(conn, family)
+        finally:
+            conn.close()
+        if rows is None:
+            return
+        if family != self._family:
+            self._adopt_new_generation(family, rows, data_version,
+                                       file_state, wal_state)
+            return
+        position, boundary = self._position_of(family, rows)
+        events, outcome = self._rebuild_events(family, rows)
+        self._previous_rows = list(self._rows)
+        self._previous_events = list(self._events)
+        self._rows = rows
+        self._events = events
+        self._outcome = outcome
+        self._state = "available" if events else "empty"
+        self._position = position
+        self._boundary = boundary
+        self._file = file_state
+        self._wal = wal_state
+        self._data_version = data_version
+        if self._prefix_matches(rows):
+            self._last_reset = False
+            self._new_events = list(self._events[len(self._previous_events):])
+        else:
+            self._gen += 1
+            self._last_reset = True
+            self._new_events = list(self._events)
+
+    def _rebuild(
+        self,
+        file_state: tuple[int, int, int, int],
+        wal_state: tuple[int, int, int, int] | None,
+    ) -> None:
+        conn = self._open()
+        if conn is None:
+            self._mark_unavailable()
+            return
+        try:
+            family = _history_family(conn, self._session_id)
+            if family is None:
+                self._adopt_unsupported()
+                return
+            data_version = self._fetch_data_version(conn)
+            rows = self._read_session_rows(conn, family)
+        finally:
+            conn.close()
+        if rows is None:
+            self._mark_unavailable()
+            return
+        self._adopt_new_generation(family, rows, data_version,
+                                   file_state, wal_state)
+        self._initialized = True
+
+    def _adopt_new_generation(
+        self,
+        family: str,
+        rows: list[dict[str, Any]],
+        data_version: int,
+        file_state: tuple[int, int, int, int],
+        wal_state: tuple[int, int, int, int] | None,
+    ) -> None:
+        position, boundary = self._position_of(family, rows)
+        events, outcome = self._rebuild_events(family, rows)
+        self._adopt_state(family, rows, position, boundary, events, outcome,
+                          data_version, file_state, wal_state,
+                          fresh_gen=self._gen + 1)
+        self._initialized = True
+        self._last_reset = True
+        self._new_events = list(self._events)
+
+    def _adopt_state(
+        self,
+        family: str,
+        rows: list[dict[str, Any]],
+        position: str,
+        boundary: str,
+        events: list[ActivityEvent],
+        outcome: SessionOutcome,
+        data_version: int,
+        file_state: tuple[int, int, int, int],
+        wal_state: tuple[int, int, int, int] | None,
+        fresh_gen: int,
+    ) -> None:
+        self._previous_rows = list(self._rows)
+        self._previous_events = list(self._events)
+        self._family = family
+        self._rows = rows
+        self._events = events
+        self._outcome = outcome
+        self._state = "available" if events else "empty"
+        self._position = position
+        self._boundary = boundary
+        self._file = file_state
+        self._wal = wal_state
+        self._data_version = data_version
+        self._gen = fresh_gen
+
+    def _adopt_unsupported(self) -> None:
+        self._state = "unsupported"
+        self._events = []
+        self._outcome = SessionOutcome("unknown", Evidence(_UNKNOWN))
+        self._initialized = True
+        self._gen = 1
+        self._last_reset = True
+        self._new_events = []
+
+    def _prefix_matches(self, rows: list[dict[str, Any]]) -> bool:
+        """True when the rebuild only appended: vacuum, reuse, replacement,
+        family change, or reorder change the cached rows or event prefix and
+        must start a new generation.
+        """
+        old_rows = self._previous_rows
+        old = self._previous_events
+        if len(rows) < len(old_rows) or list(rows[: len(old_rows)]) != old_rows:
+            return False
+        if len(self._events) < len(old):
+            return False
+        old_keys = [_event_key(event) for event in old]
+        new_keys = [_event_key(event) for event in self._events[: len(old)]]
+        return old_keys == new_keys
+
+    def _mark_unavailable(self) -> None:
+        had_history = self._initialized and self._gen > 0 and self._state != "unavailable"
+        self._state = "unavailable"
+        self._outcome = SessionOutcome("unknown", Evidence(_UNKNOWN))
+        self._new_events = []
+        self._last_reset = had_history
+
+    def _cursor_matches(self, saved: dict[str, Any]) -> bool:
+        try:
+            if saved.get("family") != self._family:
+                return False
+            if int(saved.get("dev", -1)) != (self._file or (-1,))[0]:
+                return False
+            if int(saved.get("ino", -1)) != (self._file or (-1, -1))[1]:
+                return False
+            if int(saved.get("data_version", -1)) != self._data_version:
+                return False
+            if saved.get("position") != self._position:
+                return False
+            if saved.get("boundary") != self._boundary:
+                return False
+            if int(saved.get("events", -1)) != len(self._events):
+                return False
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _export_cursor(self) -> str | None:
+        if self._state in {"unavailable", "unsupported"}:
+            return None
+        dev, ino, size, mtime_ns = self._file or (0, 0, 0, 0)
+        return _encode_cursor({
+            "v": 1,
+            "runtime": "opencode",
+            "path": self._db_path,
+            "session": self._session_id,
+            "family": self._family,
+            "dev": dev,
+            "ino": ino,
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "wal_size": self._wal[2] if self._wal else None,
+            "wal_mtime_ns": self._wal[3] if self._wal else None,
+            "data_version": self._data_version,
+            "position": self._position,
+            "boundary": self._boundary,
+            "rows": len(self._rows),
+            "events": len(self._events),
+            "gen": self._gen,
+        })
 
 
 def _v2_outcome(

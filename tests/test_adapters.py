@@ -150,9 +150,16 @@ def test_registry_lists_six_adapters():
 
 def test_capability_declarations():
     caps = {a.id: a.capabilities for a in list_adapters()}
-    # Incremental reading is Pi-only; snapshots are the fallback elsewhere.
+    # Incremental reading covers Pi (JSONL tree), Claude and Codex (JSONL
+    # byte offsets), plus Cursor and OpenCode (SQLite row cursors);
+    # snapshots are the fallback elsewhere.
     assert caps["pi"].incremental_reading is True
-    assert all(caps[r].incremental_reading is False for r in caps if r != "pi")
+    assert caps["claude"].incremental_reading is True
+    assert caps["codex"].incremental_reading is True
+    assert caps["cursor"].incremental_reading is True
+    assert caps["opencode"].incremental_reading is True
+    assert all(caps[r].incremental_reading is False
+               for r in caps if r not in {"pi", "claude", "codex", "cursor", "opencode"})
     # Typed activity covers every runtime except Kimi (deferred scope).
     assert caps["kimi"].typed_activity is False
     assert all(caps[r].typed_activity is True for r in caps if r != "kimi")
@@ -258,9 +265,12 @@ def test_open_reader_capability_gate(tmp_path):
     reader = get_adapter("pi").open_reader(session)
     first = reader.poll()
     assert first.state in {"available", "empty"}
-    for runtime_id in ("claude", "codex", "opencode", "kimi", "cursor"):
-        with pytest.raises(IncrementalUnsupported):
-            get_adapter(runtime_id).open_reader({"source": runtime_id, "path": "", "id": "x"})
+    for runtime_id in ("claude", "codex", "cursor", "opencode"):
+        reader = get_adapter(runtime_id).open_reader(
+            {"source": runtime_id, "path": "", "id": "x"})
+        assert reader.poll().state == "unavailable"
+    with pytest.raises(IncrementalUnsupported):
+        get_adapter("kimi").open_reader({"source": "kimi", "path": "", "id": "x"})
 
 
 def test_signature_matches_parser_signature():

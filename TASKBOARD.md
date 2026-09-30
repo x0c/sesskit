@@ -4,3 +4,5 @@
 
 | 任务 | 状态 | 影响范围 | 开始 | 最近更新 | 备注 |
 |---|---|---|---|---|---|
+
+| F1 cursor reader prompt fallback | 进行中 | SessKit activity_cursor.py + tests + docs | 2026-09-30 | 2026-09-30 | reader 与 snapshot 共用 fallback，fingerprint 含 prompt_history |

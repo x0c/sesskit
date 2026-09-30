@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """SessKit CLI: language-agnostic JSON interface for local agent sessions.
 
 Commands are read-only. Output is always a JSON envelope:
@@ -10,7 +9,6 @@ Exit codes: 0 ok, 1 error, 2 usage, 3 not found, 5 ambiguous.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -18,6 +16,7 @@ from datetime import datetime
 
 from sesskit import titles
 from sesskit.adapters import list_adapters
+from sesskit.cache import cache_dir
 from sesskit.envelope import (
     EXIT_AMBIGUOUS,
     EXIT_ERROR,
@@ -29,7 +28,6 @@ from sesskit.envelope import (
     ok,
     print_envelope,
 )
-from sesskit.cache import cache_dir
 from sesskit.models import format_message_time, session_key
 from sesskit.paths import assert_not_history_path, atomic_write_json
 from sesskit.registry import ConversationLoadError, ParserRegistry, default_registry
@@ -426,7 +424,7 @@ def _parse_time_bound(raw: str, *, is_until: bool) -> float:
         return float(raw)
     for fmt, date_only in (("%Y-%m-%d %H:%M:%S", False), ("%Y-%m-%d %H:%M", False), ("%Y-%m-%d", True)):
         try:
-            dt = datetime.strptime(raw, fmt)
+            dt = datetime.strptime(raw, fmt)  # noqa: DTZ007 - Local wall time; convert after end-of-day adjustment.
         except ValueError:
             continue
         if date_only and is_until:

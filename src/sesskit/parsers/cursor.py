@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """扫描 Cursor Agent CLI 会话历史（~/.cursor/chats/），输出统一会话结构。
 
 Cursor CLI 的会话按「工作区哈希 / 会话 UUID」两级目录存放：

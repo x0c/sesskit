@@ -54,7 +54,7 @@ def _title_line(text: str | None) -> str | None:
         return None
     for raw_line in str(text).splitlines():
         line = raw_line.strip()
-        if line.startswith("› ") or line.startswith("> "):
+        if line.startswith(("› ", "> ")):
             line = line[2:].strip()
         if not line:
             continue

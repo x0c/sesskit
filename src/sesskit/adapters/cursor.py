@@ -24,6 +24,7 @@ class CursorAdapter(RuntimeAdapter):
     # normalized where present.
     capabilities = Capabilities(
         typed_activity=True,
+        incremental_reading=True,
         structured_questions=True,
         native_tool_result_status=False,
         native_turn_boundaries=False,
@@ -68,6 +69,11 @@ class CursorAdapter(RuntimeAdapter):
         from sesskit.transcript import _parse_cursor
 
         return _parse_cursor(session)
+
+    def open_reader(self, session: dict, cursor: Any = None) -> Any:
+        from sesskit.activity_reader import open_activity_reader
+
+        return open_activity_reader(session, cursor)
 
     def signature(self) -> Any:
         return _parser.scan_signature()

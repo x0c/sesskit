@@ -221,7 +221,13 @@ Claude, Codex, Cursor, and OpenCode; Kimi remains unchanged. States are
 part order with session-local `message_id` grouping. Tool results carry a
 typed outcome whose evidence distinguishes native from inferred status.
 Structured `AgentError` rides alongside legacy assistant text on error-only
-turns. User-message events carry a native-evidence `origin`
+turns. On Pi, an assistant turn with native `stopReason` in `error`/`aborted`
+plus a non-empty `errorMessage` whose content emits only `thinking` (or
+tool-call) parts — so no assistant text carries the error — additionally
+emits one typed-only `lifecycle` error event (classified kind, `turn` scope,
+native `errorMessage` evidence, verbatim stop reason); the v1 projection
+skips it, so v1 bytes stay identical. The Pi incremental reader shares the
+same builder, so snapshot and reader agree event-for-event. User-message events carry a native-evidence `origin`
 (human/injected/system/unknown); assistant messages carry native `Usage`
 (model plus token/cost fields, never estimated) where recorded; compaction
 boundaries surface as standalone `compaction` events or `CompactionInfo`
@@ -242,6 +248,30 @@ trailing lines are deferred. Branch switches, truncation, replacement, or an
 invalid cursor cause a new generation whose events replace the prior branch.
 Event `seq` remains stable within a generation; entry IDs remain the grouping
 key. Pi uses the same normalization as `load_activity()`, preserving v1 bytes.
+Cursor and OpenCode readers keep the same protocol over SQLite: read-only
+connections with WAL-visible tails, an opaque versioned cursor carrying a
+database fingerprint plus the last committed row position and boundary
+checksum, metadata-only no-change polls (main file plus `-wal` sidecar, no
+database open), generation resets on vacuum/rowid reuse/replacement, stable
+`seq` within a generation, backward paging that preserves call/result pairing,
+and poll/page output equal to the `load_activity()` snapshot on the same data.
+The Cursor reader shares exactly the snapshot's `prompt_history.json` fallback
+through one code path and carries the prompt-file stat plus prompt event count
+and boundary in its fingerprint, so a prompt append extends the generation and
+store rows appearing later switch from fallback to store with a new generation.
+Claude and Codex readers keep the same protocol over JSONL byte offsets with
+the snapshot row-sequence builders (no second interpreter): an opaque
+versioned cursor carries a frozen-prefix head-checksum plus file-identity
+fingerprint, the committed offset of the next unread complete line, and
+compact interpreter aux state (pending error, open turn, dedup tail,
+unresolved calls, outcome summary). Cold open builds the full
+interpretation in one pass but returns only a bounded tail window with
+snapshot-global seqs (the window equals the matching snapshot suffix);
+append polls parse only new bytes; backward pages reassembled equal the
+snapshot. Reader outcome always equals the snapshot outcome over the same
+bytes. Two documented stream-vs-snapshot edges: an optimistic
+trailing-error emit and late-linkage enrichment of the materialized list
+only (consumers join call/result by `call_id`).
 
 ### Outcome and error model
 
@@ -524,7 +554,7 @@ prefix defaults for older direct callers.
 - User / materials: abstraction-layer domain explicitly requested 2026-09-29 alongside the standalone-decoupling ruling; contract evolution sections used as modeling evidence.
 - Multi-source evidence enrichment: model and registry sources read in full; transcript and activity heads plus pilot branches read; schema pairs listed; bounded native question and result-pair observations noted without claiming runtime-wide prevalence.
 - Q&A supplements: 1 domain-scope supplement (abstraction layer requested), 1 decoupling ruling; remaining uncertainty recorded as low-confidence items rather than fabricated experience.
-- To be filled: version-stratified structured-request sampling for unmigrated runtimes; incremental-reader implementations and cold/warm measurements for runtimes beyond the Pi pilot.
+- To be filled: version-stratified structured-request sampling for unmigrated runtimes; incremental readers for the remaining JSONL runtimes (Pi file tree plus Cursor/OpenCode SQLite row cursors landed with cold/warm measurements).
 - Migration sequencing: typed outcome, error, and tool-result models already present are integrated first; parser adaptation follows with native evidence retained; compatibility projections migrate one consumer at a time after parity; any new external schema waits for a separate compatibility review. The application-neutral host boundary and gates are recorded in §1.6 and §6.5.
 - Coupling inventory (current implementation, not a claim of completion): host-specific environment handling, claim formats, isolation conventions, cache overrides, title and handoff markers, notification-oriented fields/comments, and one legacy wire identifier remain to be moved behind consumers or isolated compatibility adapters. The exact interface and retirement gates remain open in §6.5.
 

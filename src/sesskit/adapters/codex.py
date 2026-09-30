@@ -21,6 +21,7 @@ class CodexAdapter(RuntimeAdapter):
     # turn completion/abort markers are native.
     capabilities = Capabilities(
         typed_activity=True,
+        incremental_reading=True,
         structured_questions=True,
         native_tool_result_status=False,
         native_turn_boundaries=True,
@@ -56,6 +57,11 @@ class CodexAdapter(RuntimeAdapter):
         from sesskit.transcript import _parse_codex
 
         return _parse_codex(session)
+
+    def open_reader(self, session: dict, cursor: Any = None) -> Any:
+        from sesskit.activity_reader import open_activity_reader
+
+        return open_activity_reader(session, cursor)
 
     def signature(self) -> Any:
         return _parser.scan_signature()

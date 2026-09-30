@@ -355,7 +355,7 @@ def _cmdline_parts_before_prompt(cmdline: str) -> list[str]:
         index += 1
     while index < len(parts):
         token = parts[index]
-        if token.startswith("--system-prompt=") or token.startswith("--append-system-prompt="):
+        if token.startswith(("--system-prompt=", "--append-system-prompt=")):
             kept.append(token)
             break
         if token in _VALUE_FLAGS:
@@ -459,7 +459,7 @@ def is_pi_tui_cmdline(cmdline: str) -> bool:
         token = parts[index]
         if token in _NON_TUI_FLAGS or token.startswith("--print="):
             return False
-        if token.startswith("--system-prompt=") or token.startswith("--append-system-prompt="):
+        if token.startswith(("--system-prompt=", "--append-system-prompt=")):
             return True
         if token in _NON_TUI_SUBCOMMANDS:
             return False

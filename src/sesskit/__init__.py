@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from sesskit.activity import load_activity, to_v1_dicts
 from sesskit.activity_reader import (
@@ -13,6 +13,10 @@ from sesskit.activity_reader import (
     PollResult,
     open_activity_reader,
     supports_incremental,
+)
+from sesskit.activity_reader_jsonl import (
+    ClaudeActivityReader,
+    CodexActivityReader,
 )
 from sesskit.adapters import Capabilities, RuntimeAdapter, get_adapter, list_adapters
 from sesskit.conformance import ConformanceReport, Violation, run_conformance
@@ -82,6 +86,8 @@ __all__ = [
     "AgentError",
     "AssistantMessage",
     "Capabilities",
+    "ClaudeActivityReader",
+    "CodexActivityReader",
     "CompactionEvent",
     "CompactionInfo",
     "ConformanceReport",

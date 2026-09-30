@@ -311,11 +311,13 @@ def test_appended_compaction_stays_in_sync(tmp_path):
 
 def test_unsupported_runtime_falls_back_to_snapshot():
     assert supports_incremental({"source": "pi"}) is True
+    assert supports_incremental({"source": "claude"}) is True
+    assert supports_incremental({"source": "codex"}) is True
+    assert supports_incremental({"source": "cursor"}) is True
+    assert supports_incremental({"source": "opencode"}) is True
     assert supports_incremental({"source": "kimi"}) is False
     with pytest.raises(IncrementalUnsupported):
         open_activity_reader({"source": "kimi", "path": "/none", "id": "x"})
-    with pytest.raises(IncrementalUnsupported):
-        open_activity_reader({"source": "claude", "path": "/none", "id": "x"})
 
 
 def test_unavailable_history(tmp_path):

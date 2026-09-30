@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """扫描 Codex 会话历史（~/.codex/sessions/），输出统一会话结构。
 
 移植自 agentsync 的 codex-session-continue/scripts/list_sessions.py，
@@ -87,7 +86,7 @@ def _extract_datetime_from_filename(path: str) -> datetime | None:
     m = re.match(r"rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-", fname)
     if m:
         try:
-            return datetime(*[int(x) for x in m.groups()])
+            return datetime(*[int(x) for x in m.groups()])  # noqa: DTZ001 - Filename contains local wall time.
         except ValueError:
             pass
     return None
