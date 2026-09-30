@@ -102,6 +102,16 @@ def entry_time(entry: dict) -> float | None:
 _entry_time = entry_time  # 旧私有名兼容：模块内部与测试仍引用
 
 
+def _native_event_id(entry: dict, payload: dict) -> str:
+    """本行原生事件 id：新版 response_item 必有；旧 event_msg 可能缺失，缺失即空。
+
+    有 id 的不同真实轮次锚点必不同（同文本也不碰撞）；缺 id 的旧格式退回
+    纯文本锚点（历史静态数据，不再新增，不扩大碰撞面）。
+    """
+    pid = payload.get("id") if isinstance(payload, dict) else None
+    return str(pid) if pid else ""
+
+
 def _response_message_text(payload: dict, role: str) -> str:
     """提取新版 response_item message 的指定角色文本，忽略框架注入上下文。"""
     if payload.get("type") != "message" or payload.get("role") != role:
@@ -282,11 +292,11 @@ def _build_session_info(
         if user_text:
             last_user_msg = user_text
             last_event_type = "user_message"
-            tail_fingerprint = f"user:{user_text[:120]}"
+            tail_fingerprint = f"user:{_native_event_id(e, payload)}:{user_text[:120]}"
         elif assistant_text:
             last_agent_msg = assistant_text
             last_event_type = "agent_message"
-            tail_fingerprint = f"agent:{assistant_text[:120]}"
+            tail_fingerprint = f"agent:{_native_event_id(e, payload)}:{assistant_text[:120]}"
         elif t == "event_msg" and pt == "task_complete":
             msg = str(payload.get("last_agent_message") or "").strip()
             err_text = _task_complete_error_text(payload)
@@ -336,9 +346,8 @@ def _build_session_info(
         last_agent_msg=preprocess_excerpt(last_agent_msg, host),
         thread_source=thread_source,  # 运行时私有字段，见 SessionInfo 的 total=False 部分
         completion_id=completion_id_for(
-            file_mtime=mtime,
-            size_bytes=size_bytes,
             status_tag=status,
+            anchor=tail_fingerprint,
             tail_text=tail_fingerprint,
         ),
     )

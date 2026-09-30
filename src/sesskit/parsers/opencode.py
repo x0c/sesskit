@@ -65,6 +65,8 @@ SELECT
   s.id, s.directory, s.title, s.time_created, s.time_updated,
   (SELECT m.data FROM message m WHERE m.session_id = s.id
      ORDER BY m.time_created DESC, m.id DESC LIMIT 1)              AS last_msg_data,
+  (SELECT m.id || ':' || m.time_created FROM message m WHERE m.session_id = s.id
+     ORDER BY m.time_created DESC, m.id DESC LIMIT 1)              AS last_msg_key,
   (SELECT json_extract(p.data, '$.text')
      FROM message m JOIN part p ON p.message_id = m.id
      WHERE m.session_id = s.id
@@ -577,9 +579,8 @@ def _build_session_info(
         last_user_msg=preprocess_excerpt(str(row["last_user_text"] or ""), host),
         last_agent_msg=preprocess_excerpt(last_agent_text, host),
         completion_id=completion_id_for(
-            file_mtime=mtime,
-            size_bytes=size_bytes,
             status_tag=status,
+            anchor=str(row["last_msg_key"] or ""),
             tail_text=tail_text,
         ),
     )
@@ -605,6 +606,7 @@ def _build_session_info_v2(
     typed_rows: list[tuple[str, dict]] = []
     user_texts: list[str] = []
     assistant_datas: list[dict] = []
+    last_anchor = ""
     for msg_row in msg_rows:
         data = _v2_json_dict(msg_row["data"])
         row_type = str(msg_row["type"] or "")
@@ -613,6 +615,8 @@ def _build_session_info_v2(
             user_texts.append(_v2_user_text(data))
         elif row_type == "assistant":
             assistant_datas.append(data)
+            # 原生轮次锚点：同文本不同轮次靠消息 id/seq 区分。
+            last_anchor = f"{msg_row['id']}:{msg_row['seq']}"
     first_user = user_texts[0] if user_texts else ""
     last_user = user_texts[-1] if user_texts else ""
     last_agent_text = (
@@ -656,9 +660,8 @@ def _build_session_info_v2(
         last_user_msg=preprocess_excerpt(last_user, host),
         last_agent_msg=preprocess_excerpt(last_agent_text, host),
         completion_id=completion_id_for(
-            file_mtime=mtime,
-            size_bytes=size_bytes,
             status_tag=status,
+            anchor=last_anchor,
             tail_text=tail_text,
         ),
     )

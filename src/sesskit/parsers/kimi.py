@@ -444,6 +444,14 @@ def _build_session_info(
     if not first_user_msg and not native_title and not fallback:
         return None  # 空会话（刚创建、还没任何用户消息），无展示价值
 
+    # 原生轮次锚点：末条目原生事件时间（毫秒级，同一文件内稳定；元数据触碰
+    # 不改它）。Kimi 暂无 step.end 级终局标记，状态口径不变，只修身份成分。
+    anchor = ""
+    if event_time is not None:
+        try:
+            anchor = f"{float(event_time):.3f}"
+        except (TypeError, ValueError):
+            anchor = ""
     from sesskit.models import completion_id_for
 
     tail_text = f"{(last_user_msg or '')[:120]}\n{(last_agent_msg or '')[:120]}"
@@ -465,9 +473,8 @@ def _build_session_info(
         last_user_msg=preprocess_excerpt(last_user_msg, host),
         last_agent_msg=preprocess_excerpt(last_agent_msg, host),
         completion_id=completion_id_for(
-            file_mtime=file_mtime,
-            size_bytes=stat.st_size,
             status_tag=status_tag,
+            anchor=anchor,
             tail_text=tail_text,
         ),
     )

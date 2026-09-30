@@ -115,6 +115,15 @@ Previously confirmed failures, now covered by parser fixes + `tests/test_abnorma
 
 Until consumers migrate, prefer `status_tag` + `last_agent_msg` together: do not treat `STATUS_DONE` alone as “notify job finished” without confirming the sample is not an older SessKit build.
 
+## Completion identity (native-finality + metadata-invariant)
+
+`completion_id` identifies one genuine native completion within a session. It is the notification dedupe key, so false stability (same id for distinct completions) and false churn (new id without a new completion) both cause user-visible harm — missed notifications or notification floods.
+
+- **Strict native finality (Claude stop semantics):** a reply is terminal only on native end-of-turn evidence. Per the [Claude stop-reason reference](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons), `tool_use` means the turn continues executing — progress text followed by tool calls, or a tool-only tail after earlier assistant text, is mid-turn, never `STATUS_DONE`, even when assistant text is present in the tail window. Unresolved tool calls, retries, and truncation markers are likewise nonterminal. A real user reply may end a native turn; never invent a semantic task-completion classifier on top of text content.
+- **Status and id share one bounded evidence read:** `status_tag` and `completion_id` are computed from the same bounded tail window (list-scan speed; no full-history load per scan). Excerpt backfill from a wider window must never widen the status/id window.
+- **Metadata-invariant identity:** the id derives only from stable native completion/turn/message evidence (terminal record identity, turn/message ids, native stop/finish markers, final text hash) — never from file/DB aggregate `mtime`, byte size, titles, or queued/scheduling metadata. Metadata-only appends, touches, queue records, or title updates must not change the id of an unchanged completion. Identical answer text in different genuine turns must still yield different ids (the turn/message anchor differs). When no exact final anchor is available, return an empty id (`unknown`) rather than fabricating success; Corral treats empty-id `DONE` as non-notifiable.
+- **Same rule in every runtime adapter:** when fixing one adapter's id source, audit all six for the same aggregate-mtime/size/metadata pattern and correct each in scope. Abnormal endings keep their own identity path (`STATUS_ABORTED` with retained error evidence); waiting, device preferences, and per-device receipt dedupe are consumer-side and unchanged.
+
 ## Cross-runtime model evolution contract
 
 This contract governs additive refactoring of sessions, plain conversations, rich activity events, errors, and tool calls. It does not authorize changing the v1 JSON schemas or Corral/iOS wire behavior as the first step.

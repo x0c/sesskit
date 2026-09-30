@@ -211,9 +211,8 @@ def _build_session_info(
         last_user_msg=preprocess_excerpt(last_user, host),
         last_agent_msg=preprocess_excerpt(last_agent, host),
         completion_id=completion_id_for(
-            file_mtime=stat.st_mtime,
-            size_bytes=stat.st_size,
             status_tag=status,
+            anchor=f"{leaf_id or ''}:{(last_stop_reason or '')}",
             tail_text=tail_text,
         ),
     )

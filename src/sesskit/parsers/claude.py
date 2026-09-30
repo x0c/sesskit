@@ -391,6 +391,22 @@ def _is_internal_claude_session(entries: list[dict], session_id: str | None = No
     return False
 
 
+# 终局文本之后出现执行活动记录的行类型。元数据行（ai-title / last-prompt /
+# queue-operation / file-history-* / mode 等）只改文件 mtime/size，不代表
+# turn 继续，必须排除在外——否则元数据追加会把同一真实结束误判成新一轮。
+_CONTINUATION_TYPES = frozenset({"assistant", "user", "attachment"})
+
+
+def _continued_after(entries: list[dict], idx: int | None) -> bool:
+    """终局候选文本行之后是否还有执行活动（工具调用、结果回执、新输入）。"""
+    if idx is None:
+        return False
+    for later in entries[idx + 1:]:
+        if isinstance(later, dict) and later.get("type") in _CONTINUATION_TYPES:
+            return True
+    return False
+
+
 def _build_session_info(
     fpath: str,
     proj: str,
@@ -426,10 +442,21 @@ def _build_session_info(
     last_agent_msg = None
     last_was_user = None
     event_time = None
+    # 终局判定只认原生 turn 结束证据：assistant 文本行的 stop_reason。
+    # end_turn = 本轮真正结束；无该字段是旧历史格式（天然无工具调用行），
+    # 同样视为结束；tool_use / max_tokens / stop_sequence 等 = 执行中/截断，
+    # 字段存在但值缺失（null）= 无终局证据，即使后面还跟着文本也不算结束。
+    # 文本行之后若还有 assistant/user/attachment 行（工具调用、tool 结果回执、
+    # 新一轮输入），说明 turn 在继续，之前那段文本只是 progress。
+    last_text_stop: object = "unset"
+    last_text_stop_present = False
+    last_text_idx: int | None = None
+    last_text_anchor = ""
     # 报错只属于当前未收束的一轮：新用户消息/助手正文之后才算，旧轮的残留不算。
     last_content_idx = -1
     last_error_text = ""
     last_error_idx = -1
+    last_error_anchor = ""
 
     for idx, e in enumerate(tail_entries):
         entry_time = _entry_time(e)
@@ -459,7 +486,8 @@ def _build_session_info(
                 last_was_user = True
                 last_content_idx = idx
         elif t == "assistant":
-            content = e.get("message", {}).get("content", [])
+            message = e.get("message", {})
+            content = message.get("content", []) if isinstance(message, dict) else []
             if isinstance(content, list):
                 for part in content:
                     # part.get("text") 可能是 JSON null（key 存在但值为 null），
@@ -469,12 +497,17 @@ def _build_session_info(
                         title_candidates.append(("last_agent", last_agent_msg))
                         last_was_user = False
                         last_content_idx = idx
+                        last_text_stop = message.get("stop_reason") if isinstance(message, dict) else None
+                        last_text_stop_present = isinstance(message, dict) and "stop_reason" in message
+                        last_text_idx = idx
+                        last_text_anchor = str(e.get("uuid") or e.get("timestamp") or "")
                         break
         elif t == "system":
             err_text = system_error_text(e)
             if err_text:
                 last_error_text = err_text
                 last_error_idx = idx
+                last_error_anchor = str(e.get("uuid") or e.get("timestamp") or "")
 
     stat = os.stat(fpath)
     for e in head_entries:
@@ -489,16 +522,24 @@ def _build_session_info(
         # 报错不进标题候选（标题仍用真实提问），但列表与通知要看到人话。
         status_tag = titles.STATUS_ABORTED
         last_agent_msg = last_error_text
+        id_anchor = last_error_anchor
     elif last_was_user == "aborted":
         status_tag = titles.STATUS_ABORTED
+        id_anchor = ""
     elif last_was_user is True:
         status_tag = titles.STATUS_PENDING
+        id_anchor = ""
     elif last_was_user is False and (last_agent_msg or "").startswith(_SESSION_LIMIT_PREFIX):
         status_tag = titles.STATUS_ABORTED
-    elif last_was_user is False:
+        id_anchor = last_text_anchor
+    elif last_was_user is False and (last_text_stop == "end_turn" or (last_text_stop is None and not last_text_stop_present)) and not _continued_after(tail_entries, last_text_idx):
         status_tag = titles.STATUS_DONE
+        id_anchor = last_text_anchor
     else:
+        # progress 文本 + tool_use/截断/后续工具活动 = 执行中；无文本 = 未知。
+        # 宁可 unknown 也不报假 DONE（假 DONE 会直接触发完成通知）。
         status_tag = titles.STATUS_NONE
+        id_anchor = ""
 
     from sesskit.models import completion_id_for
 
@@ -526,9 +567,8 @@ def _build_session_info(
         last_user_msg=preprocess_excerpt(last_user_msg, host),
         last_agent_msg=preprocess_excerpt(last_agent_msg, host),
         completion_id=completion_id_for(
-            file_mtime=stat.st_mtime,
-            size_bytes=stat.st_size,
             status_tag=status_tag,
+            anchor=id_anchor,
             tail_text=tail_text,
         ),
     )
