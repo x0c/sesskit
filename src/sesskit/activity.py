@@ -1345,6 +1345,14 @@ class _CodexFeed:
                 if text:
                     self._add_dedup("assistant_message", ts, record, text, error,
                                     origin="human", turn_id=native_turn)
+                    # Native turn-end boundary for typed consumers (typed-only):
+                    # the final text card alone cannot distinguish normal
+                    # completion from mid-turn commentary. Always record the
+                    # boundary with its native turn id, mirroring the
+                    # turn_aborted lifecycle above.
+                    self._add("lifecycle", ts, record, text="task_complete",
+                              stop_reason="task_complete", turn_id=native_turn,
+                              error=error)
                 else:
                     # Bare completion marker: no chat content, but native
                     # completion evidence for turn derivation (typed-only).

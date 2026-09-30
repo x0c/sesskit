@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from sesskit import titles
 from sesskit.models import completion_id_for
@@ -189,6 +190,418 @@ class CodexCompletionIdTests(unittest.TestCase):
                 self.assertTrue(info.get("completion_id"))
                 infos.append(info)
             self.assertNotEqual(infos[0]["completion_id"], infos[1]["completion_id"])
+
+
+class CodexModernFinalityTests(unittest.TestCase):
+    """Modern Codex turn/item framing: per-item activity is never turn end.
+
+    Post-install rejection (2026-10-01): a live turn streams `response_item`
+    assistant messages and `item_completed` AgentMessage/CommandExecution
+    records (phase often missing; one earlier final-answer item followed by
+    more activity). The official SDK collects items and returns only after the
+    matching turn-completed notification; final-answer text is response
+    selection, not turn end. Treating any trailing assistant row as DONE mints
+    a fresh completion id per streamed item (~60 s repeat pushes).
+    Rule: with modern turn framing in evidence, assistant rows are activity;
+    terminal states come only from `task_complete` / `turn_aborted`.
+    Legacy files without modern markers keep exact old behavior.
+    """
+
+    SID = "01a0f3e5-b4a0-7912-ba12-f37d06b39289"
+
+    def _write(self, tmp: str, name: str, rows: list[dict]) -> str:
+        path = str(Path(tmp) / name)
+        Path(path).write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+        )
+        return path
+
+    def _path(self, tmp: str) -> str:
+        return str(Path(tmp) / f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl")
+
+    def _meta(self) -> dict:
+        return {
+            "timestamp": "2026-10-01T03:58:32.000Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp/demo", "thread_source": "user"},
+        }
+
+    def _task_started(self) -> dict:
+        return {
+            "timestamp": "2026-10-01T03:58:33.000Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "turn-1"},
+        }
+
+    def _user_item(self, uid: str, text: str, ts: str) -> dict:
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"type": "UserMessage", "id": uid, "content": text},
+                "turn_id": "turn-1",
+            },
+        }
+
+    def _agent_response(self, mid: str, text: str, ts: str) -> dict:
+        return {
+            "timestamp": ts,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "id": mid,
+                "content": [{"type": "output_text", "text": text}],
+            },
+        }
+
+    def _agent_item(self, mid: str, text: str, ts: str, phase: str | None = None) -> dict:
+        item: dict = {"type": "AgentMessage", "id": mid, "content": text}
+        if phase is not None:
+            item["phase"] = phase
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "item": item, "turn_id": "turn-1"},
+        }
+
+    def _cmd_item(self, cid: str, ts: str) -> dict:
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"type": "CommandExecution", "id": cid, "status": "completed"},
+                "turn_id": "turn-1",
+            },
+        }
+
+    def _task_complete(self, ts: str, msg: str = "PONG") -> dict:
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "id": "evt-1", "last_agent_message": msg},
+        }
+
+    def _parse(self, path: str):
+        info = codex._build_session_info(path, {})
+        assert info is not None
+        return info
+
+    def test_midturn_assistant_items_are_not_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._agent_response("msg-a1", "working on it", "2026-10-01T03:58:40.000Z"),
+                self._cmd_item("c-1", "2026-10-01T03:59:00.000Z"),
+                self._agent_response("msg-a2", "still going", "2026-10-01T04:03:41.000Z"),
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info.get("completion_id"), "")
+
+    def test_final_answer_followed_by_activity_is_not_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._agent_response("msg-a1", "working", "2026-10-01T03:58:40.000Z"),
+                self._agent_item("a-2", "all done", "2026-10-01T03:59:30.000Z",
+                                 phase="final_answer"),
+                self._agent_item("a-3", "hmm, more", "2026-10-01T04:03:31.000Z"),
+                self._cmd_item("c-2", "2026-10-01T04:03:40.000Z"),
+                self._agent_response("msg-a3", "still going", "2026-10-01T04:03:41.000Z"),
+                self._cmd_item("c-3", "2026-10-01T04:03:50.000Z"),
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info.get("completion_id"), "")
+
+    def test_phase_none_commentary_never_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._agent_item("a-1", "note one", "2026-10-01T03:58:40.000Z"),
+                self._cmd_item("c-1", "2026-10-01T03:59:00.000Z"),
+                self._agent_item("a-2", "note two", "2026-10-01T04:03:31.000Z"),
+                self._cmd_item("c-2", "2026-10-01T04:03:40.000Z"),
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info.get("completion_id"), "")
+
+    def test_modern_task_complete_still_done_and_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            name = f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl"
+            path = self._write(tmp, name, [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._agent_response("msg-a1", "working", "2026-10-01T03:58:40.000Z"),
+                self._task_complete("2026-10-01T04:04:00.000Z"),
+            ])
+            first = self._parse(path)
+            self.assertEqual(first["status_tag"], titles.STATUS_DONE)
+            self.assertTrue(first.get("completion_id"))
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.writelines(
+                    json.dumps({"timestamp": "2026-10-01T04:04:01.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "token_count", "total": 7}}) + "\n"
+                    for _ in range(20)
+                )
+            second = self._parse(path)
+            self.assertEqual(second["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(first["completion_id"], second["completion_id"])
+
+    def test_modern_turn_aborted_still_aborted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._agent_response("msg-a1", "working", "2026-10-01T03:58:40.000Z"),
+                {
+                    "timestamp": "2026-10-01T04:04:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "turn_aborted", "id": "evt-9"},
+                },
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
+            self.assertTrue(info.get("completion_id"))
+
+    def test_legacy_trailing_assistant_still_done(self) -> None:
+        """Legacy files without modern turn framing keep exact old behavior."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                {
+                    "timestamp": "2026-09-15T08:33:03.000Z",
+                    "type": "session_meta",
+                    "payload": {"cwd": "/tmp/demo", "thread_source": "user"},
+                },
+                {
+                    "timestamp": "2026-09-15T08:33:04.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "do the thing"},
+                },
+                {
+                    "timestamp": "2026-09-15T08:33:05.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "PONG"},
+                },
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_DONE)
+
+
+    def test_new_turn_start_without_messages_is_not_terminal(self) -> None:
+        """An earlier completion followed by a bare new turn start: unknown."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._task_complete("2026-10-01T03:59:00.000Z"),
+                {
+                    "timestamp": "2026-10-01T04:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "next-turn"},
+                },
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info.get("completion_id"), "")
+
+    def test_prior_terminal_invalidated_by_new_turn_command(self) -> None:
+        """REJECTED-2 case 1: earlier task_complete + new turn + command item."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._task_complete("2026-10-01T03:59:00.000Z"),
+                {
+                    "timestamp": "2026-10-01T04:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "next-turn"},
+                },
+                self._cmd_item("c-9", "2026-10-01T04:00:10.000Z"),
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info.get("completion_id"), "")
+
+    def test_prior_terminal_invalidated_by_new_turn_agent_item(self) -> None:
+        """REJECTED-2 case 2: earlier task_complete + new turn + message item."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._task_complete("2026-10-01T03:59:00.000Z"),
+                {
+                    "timestamp": "2026-10-01T04:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "next-turn"},
+                },
+                self._agent_item("a-9", "still working", "2026-10-01T04:00:10.000Z"),
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info.get("completion_id"), "")
+
+    def test_prior_abort_invalidated_by_new_turn_command(self) -> None:
+        """REJECTED-2 case 3: earlier turn_aborted + new turn + command item."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                {
+                    "timestamp": "2026-10-01T03:59:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "turn_aborted", "id": "end-abort"},
+                },
+                {
+                    "timestamp": "2026-10-01T04:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "next-turn"},
+                },
+                self._cmd_item("c-9", "2026-10-01T04:00:10.000Z"),
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info.get("completion_id"), "")
+
+    def test_later_terminal_closes_new_turn_with_new_id(self) -> None:
+        """A genuine later terminal marker ends the new turn with a fresh id."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._task_complete("2026-10-01T03:59:00.000Z"),
+                {
+                    "timestamp": "2026-10-01T04:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "next-turn"},
+                },
+                self._cmd_item("c-9", "2026-10-01T04:00:10.000Z"),
+            ])
+            mid = self._parse(path)
+            self.assertEqual(mid["status_tag"], titles.STATUS_NONE)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(
+                    self._task_complete("2026-10-01T04:01:00.000Z")) + "\n")
+            # New terminal record needs its own native id to mint a new round.
+            raw = Path(path).read_text(encoding="utf-8").splitlines()
+            last = json.loads(raw[-1])
+            last["payload"]["id"] = "end-two"
+            raw[-1] = json.dumps(last)
+            Path(path).write_text("\n".join(raw) + "\n", encoding="utf-8")
+            done = self._parse(path)
+            self.assertEqual(done["status_tag"], titles.STATUS_DONE)
+            self.assertTrue(done.get("completion_id"))
+
+    def test_token_metadata_preserves_completed_identity(self) -> None:
+        """Token counts/metadata after task_complete must not churn the id."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._task_complete("2026-10-01T03:59:00.000Z"),
+            ])
+            first = self._parse(path)
+            self.assertEqual(first["status_tag"], titles.STATUS_DONE)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.writelines(
+                    json.dumps({"timestamp": "2026-10-01T04:00:00.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "token_count", "total": 7}}) + "\n"
+                    for _ in range(20)
+                )
+            second = self._parse(path)
+            self.assertEqual(second["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(first["completion_id"], second["completion_id"])
+
+    def test_evicted_terminal_with_newer_activity_is_not_terminal(self) -> None:
+        """Bounded eviction: old task_complete pushed out of the 8 KB tail by
+        newer item activity leaves no terminal evidence in-window: unknown."""
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                self._meta(),
+                self._task_started(),
+                self._user_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._task_complete("2026-10-01T03:59:00.000Z"),
+            ]
+            for index in range(60):
+                rows.append(self._cmd_item(
+                    f"c-evict-{index}",
+                    f"2026-10-01T04:{10 + index // 60:02d}:{index % 60:02d}.000Z",
+                ))
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", rows)
+            self.assertGreater(Path(path).stat().st_size, 8192)
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info.get("completion_id"), "")
+
+    def _user_response_item(self, uid: str, text: str, ts: str) -> dict:
+        # Dual emission with the item stream (observed in real modern files);
+        # also gives the public scan a readable first user message.
+        return {
+            "timestamp": ts,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "id": uid,
+                "content": [{"type": "input_text", "text": text}],
+            },
+        }
+
+    def test_public_scan_rejects_stale_terminal(self) -> None:
+        """The exact public scan path from the rejection: isolated file with an
+        earlier terminal plus newer turn activity reports nonterminal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            meta = self._meta()
+            meta["payload"] = {"cwd": "/tmp", "thread_source": "user"}
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
+                meta,
+                self._task_started(),
+                self._user_response_item("u-1", "do it", "2026-10-01T03:58:34.000Z"),
+                self._task_complete("2026-10-01T03:59:00.000Z"),
+                {
+                    "timestamp": "2026-10-01T04:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "next-turn"},
+                },
+                self._cmd_item("c-9", "2026-10-01T04:00:10.000Z"),
+            ])
+
+            class _NullCache:
+                def get_session(self, *args, **kwargs):
+                    return None
+
+                def put_session(self, *args, **kwargs):
+                    return None
+
+            with mock.patch.object(codex, "_find_all_session_files", return_value=[path]), \
+                mock.patch.object(codex, "_load_index", return_value={}), \
+                mock.patch.object(codex, "_live_session_ids", return_value={}), \
+                mock.patch.object(codex, "get_cache", return_value=_NullCache()):
+                out = codex.scan_sessions(limit=10)
+            self.assertEqual(len(out), 1)
+            self.assertNotIn(out[0]["status_tag"],
+                             (titles.STATUS_DONE, titles.STATUS_ABORTED))
+            self.assertEqual(out[0].get("completion_id"), "")
 
 
 class PiCompletionIdTests(unittest.TestCase):

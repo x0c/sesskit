@@ -221,7 +221,15 @@ Claude, Codex, Cursor, and OpenCode; Kimi remains unchanged. States are
 part order with session-local `message_id` grouping. Tool results carry a
 typed outcome whose evidence distinguishes native from inferred status.
 Structured `AgentError` rides alongside legacy assistant text on error-only
-turns. On Pi, an assistant turn with native `stopReason` in `error`/`aborted`
+turns. On Codex, every native `task_complete` row additionally emits one
+typed-only turn-end `lifecycle` event (`text="task_complete"`,
+`stop_reason="task_complete"`, native `turn_id`, attached `AgentError` when the
+turn ended abnormally): the final text card alone cannot distinguish normal
+completion from mid-turn commentary, and consumers must settle per-turn pending
+state on this boundary, never on trailing text. Bare completions (no text)
+already emitted exactly this marker; text completions now carry both the card
+and the marker, in order. Native `turn_aborted` rows keep their existing
+`lifecycle` marker. On Pi, an assistant turn with native `stopReason` in `error`/`aborted`
 plus a non-empty `errorMessage` whose content emits only `thinking` (or
 tool-call) parts — so no assistant text carries the error — additionally
 emits one typed-only `lifecycle` error event (classified kind, `turn` scope,

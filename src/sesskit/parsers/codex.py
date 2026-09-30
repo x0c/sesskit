@@ -226,6 +226,26 @@ def _status_tag(last_event_type: str | None) -> str:
     return titles.STATUS_NONE
 
 
+# Modern turn/item stream markers. The official SDK collects per-item
+# notifications and returns only after the matching turn-completed
+# notification; a final-answer item only selects the response text, it never
+# closes the running turn. When these markers are present, assistant message
+# rows are mid-turn activity (commentary, reasoning, tool chatter), never
+# terminal evidence on their own.
+_MODERN_TURN_TYPES = frozenset({"task_started", "item_completed"})
+
+
+def _has_modern_turn_framing(entries: list[dict]) -> bool:
+    """True when the read window shows the modern turn/item stream."""
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "event_msg":
+            continue
+        payload = entry.get("payload") or {}
+        if isinstance(payload, dict) and payload.get("type") in _MODERN_TURN_TYPES:
+            return True
+    return False
+
+
 def task_complete_error_text(payload: dict) -> str:
     """Human-readable summary from a Codex ``task_complete`` error payload."""
     err = payload.get("error")
@@ -280,7 +300,14 @@ def _build_session_info(
 
     # 尾事件指纹：本轮最后一组结束事件的稳定字段，供 completion_id 区分轮次。
     tail_fingerprint = ""
-    for e in tail_entries:
+    # Ordered-evidence positions: earlier terminal marker vs newer turn
+    # activity. In the modern turn stream, later turn activity invalidates an
+    # earlier terminal verdict (the new turn is running); only a later genuine
+    # terminal marker can close the new turn. Token counts and other metadata
+    # rows are not turn activity and never invalidate.
+    last_terminal_idx: int | None = None
+    last_turn_activity_idx: int | None = None
+    for idx, e in enumerate(tail_entries):
         entry_time = _entry_time(e)
         if entry_time is not None:
             event_time = entry_time
@@ -289,6 +316,11 @@ def _build_session_info(
         pt = payload.get("type", "")
         user_text = _user_message_text(e)
         assistant_text = _assistant_message_text(e)
+        if t == "event_msg" and pt in ("task_started", "item_completed"):
+            # Newer modern turn activity: ordered evidence for invalidating
+            # an earlier terminal verdict below. Separate branch (not elif):
+            # activity rows carry no excerpt text of their own.
+            last_turn_activity_idx = idx
         if user_text:
             last_user_msg = user_text
             last_event_type = "user_message"
@@ -306,12 +338,14 @@ def _build_session_info(
                 # Quota / provider failures often complete with null last_agent_message.
                 last_agent_msg = err_text
             last_event_type = "task_complete_error" if err_text else "task_complete"
+            last_terminal_idx = idx
             tail_fingerprint = (
                 f"{last_event_type}:{payload.get('id') or ''!s}:"
                 f"{(msg or err_text)[:120]}"
             )
         elif t == "event_msg" and pt == "turn_aborted":
             last_event_type = "turn_aborted"
+            last_terminal_idx = idx
             tail_fingerprint = f"turn_aborted:{payload.get('id') or ''!s}"
 
     mtime = os.path.getmtime(path)
@@ -325,6 +359,37 @@ def _build_session_info(
         fallback = "Codex 新会话"
 
     status = _status_tag(last_event_type)
+    if (
+        status == titles.STATUS_DONE
+        and last_event_type == "agent_message"
+        and (
+            _has_modern_turn_framing(head_entries)
+            or _has_modern_turn_framing(tail_entries)
+        )
+    ):
+        # Modern turn in progress: the trailing assistant row is per-item
+        # activity inside an unclosed turn, not completion. Genuine terminal
+        # evidence (`task_complete` / `turn_aborted`) keeps its own branches
+        # above; a user-owned tail stays pending. Missing terminal evidence
+        # is unknown with an empty id — never a fake success that notifies.
+        status = titles.STATUS_NONE
+    if (
+        status in (titles.STATUS_DONE, titles.STATUS_ABORTED)
+        and last_turn_activity_idx is not None
+        and (
+            last_terminal_idx is None
+            or last_turn_activity_idx > last_terminal_idx
+        )
+    ):
+        # Ordered evidence: newer modern turn activity supersedes the earlier
+        # terminal verdict — the new turn is still running, so the old DONE /
+        # ABORTED and its completion identity must not survive. Only a later
+        # genuine terminal marker can close the new turn. Token counts and
+        # other metadata rows never count as activity, so a completed turn's
+        # identity stays stable under metadata appends. The fingerprint is
+        # cleared alongside the status so no stale identity leaks downstream.
+        status = titles.STATUS_NONE
+        tail_fingerprint = ""
     from sesskit.models import completion_id_for
 
     return make_session_info(

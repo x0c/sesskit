@@ -257,6 +257,13 @@ def test_codex_quota_error_only_and_explicit_abort(
     assert (snapshot.outcome.error.kind, snapshot.outcome.error.code,
             snapshot.outcome.error.message) == (error_kind, error_code, error_text)
     ending = snapshot.events[-1]
+    if event_type == "assistant_message":
+        # task_complete with text also records the typed-only turn-end
+        # boundary after the text card (lifecycle-aware settlement needs it;
+        # turn_aborted already ended with its own lifecycle).
+        assert ending.type == "lifecycle"
+        assert ending.text == "task_complete"
+        ending = snapshot.events[-2]
     assert ending.type == event_type
     assert ending.text == event_text
     if event_type == "assistant_message":
@@ -533,6 +540,7 @@ def test_codex_prior_error_does_not_poison_later_clean_turn(tmp_path):
     assert _events(snapshot) == [
         ("user_message", "First attempt.", None),
         ("assistant_message", "Temporary outage.", None),
+        ("lifecycle", "task_complete", None),
         ("user_message", "Try again.", None),
         ("assistant_message", "It worked.", None),
         ("lifecycle", "task_complete", None),

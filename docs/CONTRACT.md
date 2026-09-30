@@ -117,6 +117,34 @@ Until consumers migrate, prefer `status_tag` + `last_agent_msg` together: do not
 
 ## Completion identity (native-finality + metadata-invariant)
 
+Post-install acceptance rejection (2026-10-01, provider 0.2.4):
+modern Codex `event_msg/item_completed` records for `AgentMessage` and
+`CommandExecution` are individual activity completions, not turn completion.
+A final-answer item followed by further native command/message activity must
+not leave `STATUS_DONE` or a notifiable completion id; missing modern message
+phase must not activate legacy assistant-text completion fallback. A stable
+232 KB live history had one `task_started`, 57 completed items (31 messages,
+25 commands, one user item), and no `task_complete`/`turn_aborted`; further
+messages and commands followed the one final-answer item, yet the installed
+consumer projected DONE and accepted multiple completion pushes. Preserve
+bounded status/id reads; absent terminal evidence stays unknown. Official
+reference: [Codex turn collector](https://github.com/openai/codex/blob/main/sdk/python/src/openai_codex/_run.py)
+collects individual items and returns only after the matching completed turn;
+[native items](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/items.rs)
+carry optional message phases. Physical phone reception is not inferred from
+APNs acceptance.
+
+A newer modern `task_started` or `item_completed` record also invalidates an
+earlier terminal verdict: the new running turn must not inherit DONE,
+ABORTED, or the previous turn's completion identity. Coordinator acceptance
+of the first candidate reproduced all three failures through the public scan
+API: an earlier `task_complete` followed by a new turn and command item;
+an earlier `task_complete` followed by a new turn and message item; and an
+earlier `turn_aborted` followed by a new turn and command item. All returned
+the old terminal state and nonempty identity. Process native activity in
+order; a later genuine terminal event can close the new turn. Token counts
+and other metadata alone must preserve the completed turn's identity.
+
 `completion_id` identifies one genuine native completion within a session. It is the notification dedupe key, so false stability (same id for distinct completions) and false churn (new id without a new completion) both cause user-visible harm — missed notifications or notification floods.
 
 - **Strict native finality (Claude stop semantics):** a reply is terminal only on native end-of-turn evidence. Per the [Claude stop-reason reference](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons), `tool_use` means the turn continues executing — progress text followed by tool calls, or a tool-only tail after earlier assistant text, is mid-turn, never `STATUS_DONE`, even when assistant text is present in the tail window. Unresolved tool calls, retries, and truncation markers are likewise nonterminal. A real user reply may end a native turn; never invent a semantic task-completion classifier on top of text content.
