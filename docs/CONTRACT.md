@@ -145,6 +145,15 @@ the old terminal state and nonempty identity. Process native activity in
 order; a later genuine terminal event can close the new turn. Token counts
 and other metadata alone must preserve the completed turn's identity.
 
+The correction is published in 0.2.5: ordered modern activity invalidates the
+earlier terminal state and identity, and standalone modern assistant text stays
+nonterminal. Coordinator verification passed 516 tests plus the public scan to
+an isolated real notification-consumer path: ongoing work/restart added zero,
+a genuine later terminal event added one, metadata/rescan/finished restart added
+zero. Bounded evidence remains a limit: if every modern framing marker is
+outside both head/tail windows, legacy assistant-text fallback can still apply;
+a structural probe reproduced that case, with no matching live failure observed.
+
 `completion_id` identifies one genuine native completion within a session. It is the notification dedupe key, so false stability (same id for distinct completions) and false churn (new id without a new completion) both cause user-visible harm — missed notifications or notification floods.
 
 - **Strict native finality (Claude stop semantics):** a reply is terminal only on native end-of-turn evidence. Per the [Claude stop-reason reference](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons), `tool_use` means the turn continues executing — progress text followed by tool calls, or a tool-only tail after earlier assistant text, is mid-turn, never `STATUS_DONE`, even when assistant text is present in the tail window. Unresolved tool calls, retries, and truncation markers are likewise nonterminal. A real user reply may end a native turn; never invent a semantic task-completion classifier on top of text content.
