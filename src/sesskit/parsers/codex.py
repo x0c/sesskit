@@ -103,13 +103,46 @@ _entry_time = entry_time  # 旧私有名兼容：模块内部与测试仍引用
 
 
 def _native_event_id(entry: dict, payload: dict) -> str:
-    """本行原生事件 id：新版 response_item 必有；旧 event_msg 可能缺失，缺失即空。
+    """Native per-row event id when the record carries one.
 
-    有 id 的不同真实轮次锚点必不同（同文本也不碰撞）；缺 id 的旧格式退回
-    纯文本锚点（历史静态数据，不再新增，不扩大碰撞面）。
+    Newer `response_item` rows always have one; older `event_msg` rows may
+    not. A missing id does NOT imply static legacy history: current native
+    terminal records (`task_complete` / `turn_aborted`) carry `turn_id` and
+    timestamps instead of `payload.id`, so terminal identity must fall back
+    to that evidence (see `_terminal_fingerprint`) rather than collapsing to
+    text alone. Message-row excerpts keep the legacy text fallback.
     """
     pid = payload.get("id") if isinstance(payload, dict) else None
     return str(pid) if pid else ""
+
+
+def _terminal_fingerprint(kind: str, entry: dict, payload: dict, text: str) -> str:
+    """Identity material for a genuine native terminal marker.
+
+    Anchored to the event's own stable native evidence, in preference order:
+    the native event id; else the native turn id plus a stable terminal
+    timestamp (the record's own `completed_at`, else the row's outer
+    timestamp). Terminal text alone never mints an identity: a marker with no
+    event id, no turn id, and no terminal timestamp yields an empty anchor
+    (conservative unknown), never fabricated uniqueness. Rows that already
+    carry a native event id keep their established shape so existing
+    identities do not rotate.
+    """
+    pid = str(payload.get("id") or "")
+    if pid:
+        if kind == "turn_aborted":
+            return f"{kind}:{pid}"
+        return f"{kind}:{pid}:{(text or '')[:120]}"
+    turn = str(payload.get("turn_id") or "")
+    stamp = str(payload.get("completed_at") or entry.get("timestamp") or "")
+    short = (text or "")[:120]
+    if kind == "turn_aborted":
+        if turn or stamp:
+            return f"{kind}:{turn}:{stamp}"
+        return ""
+    if turn or stamp:
+        return f"{kind}:{turn}:{stamp}:{short}"
+    return ""
 
 
 def _response_message_text(payload: dict, role: str) -> str:
@@ -213,6 +246,25 @@ def _read_session_tail(path: str, max_bytes: int = 8192) -> list[dict]:
     except OSError:
         pass
     return entries
+
+
+_BACKFILL_WINDOWS = (256 * 1024, 4 * 1024 * 1024)
+
+
+def _backfill_excerpts(path: str) -> tuple[str | None, str | None]:
+    """Newest user prompt / assistant reply beyond the status tail, bounded."""
+    user = agent = None
+    size = os.path.getsize(path)
+    for window in _BACKFILL_WINDOWS:
+        user = agent = None
+        for entry in reversed(_read_session_tail(path, max_bytes=window)):
+            user = user or _user_message_text(entry) or None
+            agent = agent or _assistant_message_text(entry) or None
+            if user and agent:
+                break
+        if agent or window >= size:
+            break
+    return user, agent
 
 
 def _status_tag(last_event_type: str | None) -> str:
@@ -339,14 +391,13 @@ def _build_session_info(
                 last_agent_msg = err_text
             last_event_type = "task_complete_error" if err_text else "task_complete"
             last_terminal_idx = idx
-            tail_fingerprint = (
-                f"{last_event_type}:{payload.get('id') or ''!s}:"
-                f"{(msg or err_text)[:120]}"
+            tail_fingerprint = _terminal_fingerprint(
+                last_event_type, e, payload, msg or err_text
             )
         elif t == "event_msg" and pt == "turn_aborted":
             last_event_type = "turn_aborted"
             last_terminal_idx = idx
-            tail_fingerprint = f"turn_aborted:{payload.get('id') or ''!s}"
+            tail_fingerprint = _terminal_fingerprint(last_event_type, e, payload, "")
 
     mtime = os.path.getmtime(path)
     resolved_event_time = event_time or (dt.timestamp() if dt else None)
@@ -390,6 +441,21 @@ def _build_session_info(
         # cleared alongside the status so no stale identity leaks downstream.
         status = titles.STATUS_NONE
         tail_fingerprint = ""
+    if last_event_type == "agent_message":
+        # Weak assistant-text-only inference: no native turn-end evidence backs
+        # this verdict, so it must never carry a notification identity — even
+        # when every modern framing marker has fallen outside the bounded head
+        # and tail windows (framing-eviction rejection). Legacy display keeps
+        # the DONE status and excerpts, but the consumer's empty-ID gate stays
+        # shut. Only genuine terminal markers (`task_complete` /
+        # `turn_aborted`) mint notifiable identity from their own stable
+        # native evidence.
+        tail_fingerprint = ""
+    if not last_agent_msg:
+        # List excerpts only; status and completion identity stay on the 8 KB tail.
+        wider_user, wider_agent = _backfill_excerpts(path)
+        last_user_msg = last_user_msg or wider_user
+        last_agent_msg = last_agent_msg or wider_agent
     from sesskit.models import completion_id_for
 
     return make_session_info(

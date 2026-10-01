@@ -161,13 +161,17 @@ class CodexCompletionIdTests(unittest.TestCase):
             self.assertEqual(first["completion_id"], second["completion_id"])
 
     def test_same_text_different_native_ids_have_distinct_ids(self) -> None:
-        """Two genuine turns with identical text: native ids keep them distinct (D3)."""
+        """Two genuine turns with identical text: native ids keep them distinct (D3).
+
+        Weak assistant-text-only inference never mints identity, so this uses
+        genuine `task_complete` terminal markers with distinct native event ids.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             infos = []
-            for index, (sid, msg_id) in enumerate(
+            for index, (sid, evt_id) in enumerate(
                 [
-                    ("01a0a432-a844-7300-951f-c6cc548cb301", "msg-aaa"),
-                    ("01a0a432-a844-7300-951f-c6cc548cb302", "msg-bbb"),
+                    ("01a0a432-a844-7300-951f-c6cc548cb301", "evt-aaa"),
+                    ("01a0a432-a844-7300-951f-c6cc548cb302", "evt-bbb"),
                 ]
             ):
                 path = _codex_session(
@@ -175,12 +179,11 @@ class CodexCompletionIdTests(unittest.TestCase):
                     sid,
                     {
                         "timestamp": "2026-09-15T08:33:06.000Z",
-                        "type": "response_item",
+                        "type": "event_msg",
                         "payload": {
-                            "type": "message",
-                            "role": "assistant",
-                            "id": msg_id,
-                            "content": [{"type": "output_text", "text": "all done"}],
+                            "type": "task_complete",
+                            "id": evt_id,
+                            "last_agent_message": "all done",
                         },
                     },
                 )
@@ -377,8 +380,9 @@ class CodexModernFinalityTests(unittest.TestCase):
             self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
             self.assertTrue(info.get("completion_id"))
 
-    def test_legacy_trailing_assistant_still_done(self) -> None:
-        """Legacy files without modern turn framing keep exact old behavior."""
+    def test_legacy_trailing_assistant_display_done_empty_id(self) -> None:
+        """Weak legacy inference: display stays DONE with excerpts, but the
+        notification identity is empty without native turn-end evidence."""
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", [
                 {
@@ -399,6 +403,55 @@ class CodexModernFinalityTests(unittest.TestCase):
             ])
             info = self._parse(path)
             self.assertEqual(info["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(info.get("completion_id"), "")
+            self.assertEqual(info["last_user_msg"], "do the thing")
+            self.assertEqual(info["last_agent_msg"], "PONG")
+
+    def test_evicted_framing_trailing_text_has_empty_id(self) -> None:
+        """Framing-eviction shape (42 KB rejection): modern markers outside
+        both bounded windows, trailing assistant progress text. Display stays
+        DONE for compatibility, but no notification identity may exist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            rows: list[dict] = [
+                {"type": "session_meta",
+                 "payload": {"cwd": "/tmp", "thread_source": "user"}},
+                {"timestamp": "2026-10-01T04:05:00Z", "type": "event_msg",
+                 "payload": {"type": "user_message", "message": "synthetic task"}},
+            ]
+            for index in range(130):
+                rows.append(
+                    {"timestamp": "2026-10-01T04:05:00Z", "type": "event_msg",
+                     "payload": {"type": "token_count",
+                                 "padding": "metadata" * 8}})
+            rows.append(
+                {"timestamp": "2026-10-01T04:05:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "t1"}})
+            rows.append(
+                {"timestamp": "2026-10-01T04:05:02Z", "type": "event_msg",
+                 "payload": {
+                     "type": "item_completed",
+                     "item": {"type": "CommandExecution", "id": "c-1",
+                              "status": "completed"},
+                     "turn_id": "t1"}})
+            for index in range(12):
+                rows.append(
+                    {"timestamp": "2026-10-01T04:05:03Z", "type": "event_msg",
+                     "payload": {"type": "token_count",
+                                 "padding": "metadata" * 100}})
+            rows.append(
+                {"timestamp": "2026-10-01T04:05:04Z", "type": "response_item",
+                 "payload": {
+                     "type": "message",
+                     "role": "assistant",
+                     "id": "msg-tail",
+                     "content": [{"type": "output_text",
+                                  "text": "trailing progress"}]}})
+            path = self._write(tmp, f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl", rows)
+            self.assertGreater(Path(path).stat().st_size, 8192)
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(info.get("completion_id"), "")
+            self.assertEqual(info["last_agent_msg"], "trailing progress")
 
 
     def test_new_turn_start_without_messages_is_not_terminal(self) -> None:
@@ -602,6 +655,244 @@ class CodexModernFinalityTests(unittest.TestCase):
             self.assertNotIn(out[0]["status_tag"],
                              (titles.STATUS_DONE, titles.STATUS_ABORTED))
             self.assertEqual(out[0].get("completion_id"), "")
+
+
+class CodexTerminalIdentityTests(unittest.TestCase):
+    """Native terminal identity: distinct per actual turn, stable per event.
+
+    Rejection (2026-10-01): two same-session `task_complete` events with
+    distinct turn ids/timestamps, identical final text and NO `payload.id`
+    shared one identity, so the second genuine end never notified. Current
+    native terminal records carry `turn_id` plus a timestamp instead of a
+    payload id; missing id is live format, not static legacy history.
+    """
+
+    SID = "01a0f3e5-b4a0-7912-ba12-f37d06b39289"
+
+    def _write(self, tmp: str, rows: list[dict]) -> str:
+        path = str(Path(tmp) / f"rollout-2026-10-01T03-58-32-{self.SID}.jsonl")
+        Path(path).write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+        )
+        return path
+
+    def _meta(self) -> dict:
+        return {
+            "timestamp": "2026-10-01T05:58:00.000Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp", "thread_source": "user"},
+        }
+
+    def _user(self) -> dict:
+        return {
+            "timestamp": "2026-10-01T05:59:00.000Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "synthetic task"},
+        }
+
+    def _started(self, turn: str, ts: str) -> dict:
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": turn},
+        }
+
+    def _complete(self, turn: str, ts: str, text: str = "identical done") -> dict:
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": turn,
+                "completed_at": ts,
+                "started_at": "2026-10-01T05:59:30.000Z",
+                "last_agent_message": text,
+            },
+        }
+
+    def _abort(self, turn: str, ts: str) -> dict:
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "turn_aborted",
+                "turn_id": turn,
+                "completed_at": ts,
+                "started_at": "2026-10-01T05:59:30.000Z",
+                "reason": "cancelled",
+            },
+        }
+
+    def _error_complete(self, turn: str, ts: str, text: str = "limit hit") -> dict:
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": turn,
+                "completed_at": ts,
+                "started_at": "2026-10-01T05:59:30.000Z",
+                "last_agent_message": None,
+                "error": {"message": text},
+            },
+        }
+
+    def _token(self, ts: str) -> dict:
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "token_count", "total": 7},
+        }
+
+    def _parse(self, path: str):
+        info = codex._build_session_info(path, {})
+        assert info is not None
+        return info
+
+    def test_first_native_turn_done_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                self._meta(), self._user(),
+                self._started("genuine-first", "2026-10-01T05:59:30.000Z"),
+                self._complete("genuine-first", "2026-10-01T06:00:00.000Z"),
+            ])
+            first = self._parse(path)
+            self.assertEqual(first["status_tag"], titles.STATUS_DONE)
+            self.assertTrue(first.get("completion_id"))
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.writelines(
+                    json.dumps(self._token("2026-10-01T06:00:01.000Z")) + "\n"
+                    for _ in range(10)
+                )
+            second = self._parse(path)
+            self.assertEqual(first["completion_id"], second["completion_id"])
+            third = self._parse(path)
+            self.assertEqual(first["completion_id"], third["completion_id"])
+
+    def test_second_native_turn_same_text_distinct_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                self._meta(), self._user(),
+                self._started("genuine-first", "2026-10-01T05:59:30.000Z"),
+                self._complete("genuine-first", "2026-10-01T06:00:00.000Z"),
+            ])
+            first = self._parse(path)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(
+                    self._started("genuine-second", "2026-10-01T06:00:30.000Z")) + "\n")
+                handle.write(json.dumps(
+                    self._complete("genuine-second", "2026-10-01T06:01:00.000Z")) + "\n")
+            second = self._parse(path)
+            self.assertEqual(second["status_tag"], titles.STATUS_DONE)
+            self.assertTrue(second.get("completion_id"))
+            self.assertNotEqual(first["completion_id"], second["completion_id"])
+
+    def test_abort_identity_distinct_per_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                self._meta(), self._user(),
+                self._started("turn-a", "2026-10-01T05:59:30.000Z"),
+                self._abort("turn-a", "2026-10-01T06:00:00.000Z"),
+            ])
+            first = self._parse(path)
+            self.assertEqual(first["status_tag"], titles.STATUS_ABORTED)
+            self.assertTrue(first.get("completion_id"))
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(
+                    self._started("turn-b", "2026-10-01T06:00:30.000Z")) + "\n")
+                handle.write(json.dumps(
+                    self._abort("turn-b", "2026-10-01T06:01:00.000Z")) + "\n")
+            second = self._parse(path)
+            self.assertEqual(second["status_tag"], titles.STATUS_ABORTED)
+            self.assertNotEqual(first["completion_id"], second["completion_id"])
+            self.assertEqual(second["completion_id"], self._parse(path)["completion_id"])
+
+    def test_error_complete_identity_distinct_per_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                self._meta(), self._user(),
+                self._started("turn-a", "2026-10-01T05:59:30.000Z"),
+                self._error_complete("turn-a", "2026-10-01T06:00:00.000Z"),
+            ])
+            first = self._parse(path)
+            self.assertEqual(first["status_tag"], titles.STATUS_ABORTED)
+            self.assertTrue(first.get("completion_id"))
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(
+                    self._started("turn-b", "2026-10-01T06:00:30.000Z")) + "\n")
+                handle.write(json.dumps(
+                    self._error_complete("turn-b", "2026-10-01T06:01:00.000Z")) + "\n")
+            second = self._parse(path)
+            self.assertEqual(second["status_tag"], titles.STATUS_ABORTED)
+            self.assertNotEqual(first["completion_id"], second["completion_id"])
+
+    def test_legacy_timestamp_fallback_stable_and_distinct(self) -> None:
+        """No turn_id/id at all: outer timestamps anchor legacy terminal rows."""
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                self._meta(), self._user(),
+                {
+                    "timestamp": "2026-09-15T08:33:06.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "last_agent_message": "PONG"},
+                },
+            ]
+            path = self._write(tmp, rows)
+            first = self._parse(path)
+            self.assertEqual(first["status_tag"], titles.STATUS_DONE)
+            self.assertTrue(first.get("completion_id"))
+            self.assertEqual(first["completion_id"], self._parse(path)["completion_id"])
+            rows[-1] = {
+                "timestamp": "2026-09-15T08:34:06.000Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": "PONG"},
+            }
+            path = self._write(tmp, rows)
+            second = self._parse(path)
+            self.assertNotEqual(first["completion_id"], second["completion_id"])
+
+    def test_bare_terminal_marker_has_empty_id(self) -> None:
+        """A terminal marker with no id, turn, timestamp, or text fabricates nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                self._meta(), self._user(),
+                {"type": "event_msg", "payload": {"type": "task_complete"}},
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(info.get("completion_id"), "")
+
+    def test_text_only_terminal_has_empty_id(self) -> None:
+        """Terminal text present but every native anchor absent: still empty.
+
+        Rejection case: `task_complete(last_agent_message='identical done')`
+        with no id/turn_id/completed_at/outer timestamp must keep DONE display
+        yet mint no identity.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                self._meta(), self._user(),
+                {"type": "event_msg",
+                 "payload": {"type": "task_complete",
+                             "last_agent_message": "identical done"}},
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(info.get("completion_id"), "")
+            self.assertEqual(info["last_agent_msg"], "identical done")
+
+    def test_text_only_error_terminal_has_empty_id(self) -> None:
+        """Same conservative gate for error-complete terminals."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, [
+                self._meta(), self._user(),
+                {"type": "event_msg",
+                 "payload": {"type": "task_complete",
+                             "error": {"message": "limit hit"}}},
+            ])
+            info = self._parse(path)
+            self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
+            self.assertEqual(info.get("completion_id"), "")
 
 
 class PiCompletionIdTests(unittest.TestCase):

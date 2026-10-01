@@ -41,7 +41,7 @@ Legacy share payloads from a host may carry that host's own schema id (e.g. `cor
 - Cursor sessions whose `store.db` is missing, unreadable, or contains no parseable message events can still have `prompt_history.json`. `load_events` must emit those prompts oldest-first as `user_message` events, matching `load_conversation`; do not append the fallback to a non-empty store event stream or duplicate users.
 - Cursor sessions with no `meta.json` title and no `prompt_history.json` still list when `store.db` exists and holds at least one message blob (newer CLI `--print` one-shots write exactly this shape; verified 2026-09-30). The list path reads only the `meta`-table single row (store `name`, ignoring the generic `"New Agent"` placeholder) plus one blob-existence probe — never a blob scan. Such sessions list with `STATUS_NONE`, empty excerpts, and empty completion id; title and excerpts are backfilled by consumers from the preview conversation, never fabricated at list time.
 - List `first_user_msg` / `last_user_msg` / `last_agent_msg` stay at most 300 characters. When the text is a host handoff wrapper, the host's extension transform extracts the inherited `Task:` line and the conversation digest **before** clipping; core clipping only truncates, otherwise the 300-char window is consumed by pickup boilerplate and title generation never sees the real request. Nested pickups flatten an earlier wrapper into `[Original request]` / `【原始需求】` on one line — peel inward (inner task wins) and drop leftover `You are picking up` on that line. Do not raise the raw slice to recover those bytes.
-- **List excerpts must not go blank in long tool-heavy turns.** Claude reads a bounded tail (64 KB) for status; when that window holds no user or assistant text (only tool calls/results), backfill `last_user_msg` / `last_agent_msg` from a wider backward read (bounded). Status, `status_tag` and `completion_id` stay computed from the original window only — widening them would turn a mid-turn assistant sentence into a false `STATUS_DONE` and a false completion notification.
+- **List excerpts must not go blank in long tool-heavy turns.** Claude (64 KB) and Codex (8 KB) read a bounded tail for status; when that window holds no assistant text — or, for Codex, no user prompt while the first reply is still pending — backfill `last_user_msg` / `last_agent_msg` from a wider backward read (bounded to 4 MB). Phone and TUI previews fall back from assistant reply to user prompt, so a running Codex turn with neither shows a blank row. Status, `status_tag` and `completion_id` stay computed from the original window only — widening them would turn a mid-turn assistant sentence into a false `STATUS_DONE` and a false completion notification.
 - Default scan drops sessions whose project `cwd` no longer exists (resume-oriented; **Corral must keep this default**).
 - Pass `--include-missing-cwd` (or `include_missing_cwd=True` on scanners) for archive/search when history files still exist.
 - Never turn `include_missing_cwd` on inside Corral’s recover / sidebar path.
@@ -164,6 +164,24 @@ terminal inference. Explicit native completion/abort remains notifiable using
 the anchored terminal event's own stable identity; distinct genuine turns must
 stay distinct even when the final text is identical. Metadata must not rekey a
 genuine terminal event. Do not add full-history reads to the status scan.
+
+Native-terminal identity acceptance rejection (2026-10-01): the candidate
+clears weak assistant-only identities correctly, but genuine `task_complete`
+events without `payload.id` still collide when final text is identical.
+A stable read-only sample found 174 native terminal rows, all carrying
+`turn_id` and an outer event timestamp, none carrying `payload.id`. An
+isolated public scan plus real notification-consumer reproduction completed
+two distinct native turns and captured only one send. Terminal identity must
+use the actual native turn/event evidence, including `turn_id` and a terminal
+event timestamp when needed, never assume missing `id` means static legacy
+history. Completion, abort and error terminals must be distinct between
+genuine turns and stable across metadata appends/restarts; display text and
+aggregate file timestamps are not sufficient identity anchors.
+When a native terminal row has no event id, no turn id and no terminal event
+timestamp, terminal text alone must not mint an identity: retain its display
+status/excerpt and return an empty `completion_id`. Candidate acceptance
+reproduced this remaining text-only fallback; it is not a compatibility
+exception to the native identity requirement.
 
 `completion_id` identifies one genuine native completion within a session. It is the notification dedupe key, so false stability (same id for distinct completions) and false churn (new id without a new completion) both cause user-visible harm — missed notifications or notification floods.
 
