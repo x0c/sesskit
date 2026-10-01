@@ -154,6 +154,17 @@ zero. Bounded evidence remains a limit: if every modern framing marker is
 outside both head/tail windows, legacy assistant-text fallback can still apply;
 a structural probe reproduced that case, with no matching live failure observed.
 
+Further acceptance requirement (2026-10-01, framing-eviction rejection): the
+bounded legacy display fallback must not create a notification identity without
+native turn-end evidence. A synthetic 42 KB started-turn history with its modern
+markers outside both read windows returned DONE plus an identity on installed
+0.2.5 and emitted one captured false completion. Preserve legacy text/display
+compatibility, but return an empty `completion_id` for assistant-text-only
+terminal inference. Explicit native completion/abort remains notifiable using
+the anchored terminal event's own stable identity; distinct genuine turns must
+stay distinct even when the final text is identical. Metadata must not rekey a
+genuine terminal event. Do not add full-history reads to the status scan.
+
 `completion_id` identifies one genuine native completion within a session. It is the notification dedupe key, so false stability (same id for distinct completions) and false churn (new id without a new completion) both cause user-visible harm — missed notifications or notification floods.
 
 - **Strict native finality (Claude stop semantics):** a reply is terminal only on native end-of-turn evidence. Per the [Claude stop-reason reference](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons), `tool_use` means the turn continues executing — progress text followed by tool calls, or a tool-only tail after earlier assistant text, is mid-turn, never `STATUS_DONE`, even when assistant text is present in the tail window. Unresolved tool calls, retries, and truncation markers are likewise nonterminal. A real user reply may end a native turn; never invent a semantic task-completion classifier on top of text content.
