@@ -38,6 +38,23 @@ def load_session_conversation(session: dict, *, include_errors: bool = False) ->
     return adapter.load_conversation(session, include_errors=include_errors)
 
 
+def refresh_session(session: dict, *, host: object | None = None) -> SessionInfo | None:
+    """Re-derive one already listed session from its native history.
+
+    Returns the record the next ``scan_sessions`` would produce for the same
+    history bytes (``status_tag``, ``completion_id``, excerpts), so a
+    consumer can follow one hot session between list scans without
+    rescanning every runtime. List membership filters and liveness are not
+    applied: the caller owns ``live``/``pid``. None for an unknown runtime,
+    a missing history, or a history that no longer yields a session.
+    """
+    try:
+        adapter = get_adapter(str(session.get("source") or ""))
+    except KeyError:
+        return None
+    return adapter.refresh_session(session, host=host)
+
+
 @dataclass
 class RuntimeParser:
     id: str
@@ -75,6 +92,13 @@ class RuntimeParser:
         if host is not None and "host" in params:
             kwargs["host"] = host
         return self._scan(**kwargs)
+
+    def refresh_session(self, session: dict, *, host: object | None = None) -> SessionInfo | None:
+        """Re-derive one listed session from its native history (see ``refresh_session``)."""
+        if self.adapter is None:
+            return None
+        payload = session if session.get("source") == self.id else {**session, "source": self.id}
+        return self.adapter.refresh_session(payload, host=host)
 
     def load_conversation(self, session: dict, *, include_errors: bool = False) -> list[ConversationMessage]:
         """Accept a session dict; adapt to path-based parser loaders.

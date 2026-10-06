@@ -26,6 +26,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Mapping
 
 from sesskit import titles
 from sesskit.cache import file_signature, get_cache
@@ -319,6 +320,29 @@ def scan_signature() -> tuple | None:
     return (stat_signature(paths), live_pid_snapshot("agent"))
 
 
+def _cached_session_info(
+    chat_dir: str,
+    chat_id: str,
+    host: HostExtension | None,
+    cache,
+) -> dict | None:
+    """One chat's list record through the derived cache (no list filters)."""
+    meta_path = os.path.join(chat_dir, "meta.json")
+    store_db = os.path.join(chat_dir, "store.db")
+    extra_version = repr((
+        file_signature(os.path.join(chat_dir, "prompt_history.json")),
+        file_signature(store_db),
+        # WAL 里的未 checkpoint 写入不会 bump 主库 mtime；签名必须带上。
+        file_signature(store_db + "-wal"),
+    )) + host_cache_tag(host)
+    info = cache.get_session("cursor", meta_path, extra_version)
+    if info is None:
+        info = _build_session_info(chat_dir, chat_id, host)
+        if info is not None:
+            cache.put_session("cursor", meta_path, info, extra_version)
+    return info
+
+
 def scan_sessions(
     cwd_filter: str | None = None,
     limit: int = 50,
@@ -372,20 +396,7 @@ def scan_sessions(
     for _, chat_dir, chat_id in candidates:
         if len(results) >= limit:
             break
-        meta_path = os.path.join(chat_dir, "meta.json")
-        store_db = os.path.join(chat_dir, "store.db")
-        extra_version = repr((
-            file_signature(os.path.join(chat_dir, "prompt_history.json")),
-            file_signature(store_db),
-            # WAL 里的未 checkpoint 写入不会 bump 主库 mtime；签名必须带上。
-            file_signature(store_db + "-wal"),
-        )) + host_cache_tag(host)
-        cache = session_cache
-        info = cache.get_session("cursor", meta_path, extra_version)
-        if info is None:
-            info = _build_session_info(chat_dir, chat_id, host)
-            if info is not None:
-                cache.put_session("cursor", meta_path, info, extra_version)
+        info = _cached_session_info(chat_dir, chat_id, host, session_cache)
         if info is None:
             continue
         # 标题生成用 `agent -p` 会落盘会话；用宿主标记拦掉自产噪音。
@@ -413,6 +424,26 @@ def scan_sessions(
 
     _apply_live_flags(results, host)
     return results
+
+
+def refresh_session(
+    session: Mapping[str, object],
+    *,
+    host: HostExtension | None = None,
+) -> SessionInfo | None:
+    """Re-derive one already listed session from its native history.
+
+    Same builder and derived cache as ``scan_sessions``; list filters and liveness are
+    skipped (the caller owns ``live``/``pid``). None when the history is gone
+    or no longer yields a session.
+    """
+    path = str(session.get("path") or "")
+    chat_dir = os.path.dirname(path) if os.path.basename(path) == "store.db" else path
+    if not chat_dir or not os.path.isfile(os.path.join(chat_dir, "meta.json")):
+        return None
+    chat_id = str(session.get("id") or "") or os.path.basename(chat_dir)
+    cache = host.cache if (host is not None and host.cache is not None) else get_cache()
+    return _cached_session_info(chat_dir, chat_id, host, cache)
 
 
 def _resume_id_from_cmdline(cmdline: str) -> str | None:

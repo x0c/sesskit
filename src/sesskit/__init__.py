@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 from sesskit.activity import load_activity, to_v1_dicts
 from sesskit.activity_reader import (
@@ -65,7 +65,7 @@ from sesskit.models import (
     turn_id_for,
 )
 from sesskit.parsers.common import HostExtension
-from sesskit.registry import ConversationLoadError, load_session_conversation
+from sesskit.registry import ConversationLoadError, load_session_conversation, refresh_session
 from sesskit.relations import claude_continuation_target, resolve_continuation, session_relations
 from sesskit.transcript import SCHEMA_ID, count_events, load_events
 from sesskit.turns import (
@@ -145,6 +145,7 @@ __all__ = [
     "open_activity_reader",
     "pair_invocations",
     "project_session_conversation",
+    "refresh_session",
     "resolve_continuation",
     "run_conformance",
     "session_key",

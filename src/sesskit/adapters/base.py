@@ -99,6 +99,14 @@ class RuntimeAdapter(ABC):
              *, include_missing_cwd: bool = False) -> Any:
         """Scan native history; mirrors the parser ``scan_sessions`` shape."""
 
+    def refresh_session(self, session: dict, *, host: Any = None) -> Any:
+        """Re-derive one listed session from its native history; None when gone.
+
+        Same record ``scan`` would produce for that history (status,
+        ``completion_id``, excerpts) without list filters or liveness.
+        """
+        return None
+
     @abstractmethod
     def load_conversation(self, session: dict, *, include_errors: bool = False) -> Any:
         """Load plain user/assistant turns for a scanned session dict."""

@@ -18,6 +18,7 @@ import os
 import sqlite3
 import sys
 from collections import OrderedDict
+from collections.abc import Mapping
 from itertools import groupby
 
 from sesskit import titles
@@ -60,7 +61,7 @@ _VALUE_FLAGS = frozenset(
 # 会话创建可能晚于进程启动一两秒；只允许「创建时间 ≥ 启动时间 - 这个余量」。
 _CREATE_AFTER_START_SLACK = 2.0
 
-_SCAN_SQL = """
+_SCAN_SELECT = """
 SELECT
   s.id, s.directory, s.title, s.time_created, s.time_updated,
   (SELECT m.data FROM message m WHERE m.session_id = s.id
@@ -93,9 +94,9 @@ SELECT
 FROM session s
 WHERE s.parent_id IS NULL
   AND s.time_archived IS NULL
-ORDER BY s.time_updated DESC
-LIMIT ?
 """
+_SCAN_SQL = _SCAN_SELECT + "ORDER BY s.time_updated DESC\nLIMIT ?\n"
+_SESSION_SQL = _SCAN_SELECT + "  AND s.id = ?\n"
 
 _CONVERSATION_SQL = """
 SELECT m.id AS message_id, m.time_created, m.data AS msg_data, p.data AS part_data
@@ -113,15 +114,15 @@ ORDER BY m.time_created ASC, m.id ASC, p.id ASC
 # 里混有大量 1.x 迁移行，不能用来区分新老，以表名分支为准。过滤沿用
 # parent_id IS NULL AND time_archived IS NULL，并用 NOT EXISTS 排除已落在 v1
 # session 表里的迁移行（老会话行为零变化，新表只收编 v2 专属会话）。
-_SCAN_SQL_V2 = """
+_SCAN_SELECT_V2 = """
 SELECT s.id, s.directory, s.title, s.time_created, s.time_updated
 FROM session_v2 s
 WHERE s.parent_id IS NULL
   AND s.time_archived IS NULL
   AND NOT EXISTS (SELECT 1 FROM session old WHERE old.id = s.id)
-ORDER BY s.time_updated DESC
-LIMIT ?
 """
+_SCAN_SQL_V2 = _SCAN_SELECT_V2 + "ORDER BY s.time_updated DESC\nLIMIT ?\n"
+_SESSION_SQL_V2 = _SCAN_SELECT_V2 + "  AND s.id = ?\n"
 
 # session_message 列：id/session_id/type/seq/time_created/time_updated/data，
 # UNIQUE(session_id, seq)。seq 不连续（4,5,12 这类跳号），只做排序键。
@@ -963,6 +964,40 @@ def scan_sessions(
     results = results[:limit]
     _apply_live_flags(results, created_ms, host)
     return results
+
+
+def refresh_session(
+    session: Mapping[str, object],
+    *,
+    host: HostExtension | None = None,
+) -> SessionInfo | None:
+    """Re-derive one already listed session from its native database rows.
+
+    Same row builders as ``scan_sessions`` (v1 table first, then v2-only
+    rows); list filters and liveness are skipped (the caller owns
+    ``live``/``pid``). None when the database or the session row is gone.
+    """
+    db_path = str(session.get("path") or "")
+    session_id = str(session.get("id") or "")
+    if not db_path or not session_id or not os.path.isfile(db_path):
+        return None
+    conn = _connect_ro(db_path)
+    if conn is None:
+        return None
+    try:
+        try:
+            row = conn.execute(_SESSION_SQL, (session_id,)).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row is not None:
+            return _build_session_info(row, db_path, host)
+        try:
+            row = conn.execute(_SESSION_SQL_V2, (session_id,)).fetchone()
+            return _build_session_info_v2(conn, row, db_path, host) if row is not None else None
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
 
 
 def _is_v1_session(db_path: str, session_id: str) -> bool:

@@ -45,7 +45,7 @@ sesskit verify --sample 30
 ## Python API
 
 ```python
-from sesskit import load_session_conversation
+from sesskit import load_session_conversation, refresh_session
 from sesskit.registry import default_registry
 from sesskit.transcript import load_events, SCHEMA_ID
 
@@ -55,6 +55,9 @@ for runtime_id, items in sessions.items():
     for session in items[:3]:
         messages = load_session_conversation(session)
         events = load_events(session)  # SCHEMA_ID == "sesskit.transcript/v1"
+
+# 两次扫描之间跟一条正在跑的会话：与下一次扫描列出的记录一致
+fresh = refresh_session(session)  # status_tag / completion_id / excerpts; None if gone
 ```
 
 ## 读哪些本地文件

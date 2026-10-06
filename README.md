@@ -55,7 +55,7 @@ Every command prints one JSON envelope:
 ## Python API
 
 ```python
-from sesskit import load_session_conversation
+from sesskit import load_session_conversation, refresh_session
 from sesskit.registry import default_registry
 from sesskit.transcript import load_events, SCHEMA_ID
 
@@ -65,6 +65,9 @@ for runtime_id, items in sessions.items():
     for session in items[:3]:
         messages = load_session_conversation(session)
         events = load_events(session)  # SCHEMA_ID == "sesskit.transcript/v1"
+
+# one hot session between scans: same record the next scan would list
+fresh = refresh_session(session)  # status_tag / completion_id / excerpts; None if gone
 ```
 
 ## What it reads

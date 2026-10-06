@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Mapping
 
 from sesskit import titles
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
@@ -297,6 +298,27 @@ def scan_sessions(
             break
     _apply_live_flags(results, created_ts, host)
     return results
+
+
+def refresh_session(
+    session: Mapping[str, object],
+    *,
+    host: HostExtension | None = None,
+) -> SessionInfo | None:
+    """Re-derive one already listed session from its native history.
+
+    Same builder as ``scan_sessions``; list filters and liveness are
+    skipped (the caller owns ``live``/``pid``). None when the history is gone
+    or no longer yields a session.
+    """
+    path = str(session.get("path") or "")
+    if not path.endswith(".jsonl") or not os.path.isfile(path):
+        return None
+    try:
+        built = _build_session_info(path, host)
+    except OSError:
+        return None
+    return built[0] if built is not None else None
 
 
 def load_conversation(path: str, *, include_errors: bool = False) -> list[ConversationMessage]:

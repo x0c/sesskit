@@ -575,6 +575,13 @@ def scan_signature() -> tuple | None:
     return (stat_signature(files), live_pid_snapshot("codex"))
 
 
+def _cache_version(host: HostExtension | None) -> str:
+    # 新版记录把真实消息放进 response_item；提升解析缓存版本，让旧版误判为
+    # “新会话”的派生结果自动重读，而不必让用户手动清缓存。
+    index_version = repr((file_signature(SESSION_INDEX), "response-item-v2"))
+    return index_version + host_cache_tag(host)
+
+
 def scan_sessions(
     cwd_filter: str | None = None,
     limit: int = 50,
@@ -597,9 +604,6 @@ def scan_sessions(
     慢，实测是首屏卡顿主因之一（结果与逐次调用字节级一致）。
     """
     index = _load_index()
-    # 新版记录把真实消息放进 response_item；提升解析缓存版本，让旧版误判为
-    # “新会话”的派生结果自动重读，而不必让用户手动清缓存。
-    index_version = repr((file_signature(SESSION_INDEX), "response-item-v2"))
     all_files = _find_all_session_files()
     live_ids = _live_session_ids()
     provider = host_claim_provider
@@ -630,7 +634,7 @@ def scan_sessions(
     host_marker = host.title_prompt_marker if host is not None else None
     host_prefixes = ephemeral_prefixes_for(host)
     session_cache = host.cache if (host is not None and host.cache is not None) else get_cache()
-    cache_version = index_version + host_cache_tag(host)
+    cache_version = _cache_version(host)
     for _, path in candidates:
         cache = session_cache
         info = cache.get_session("codex", path, cache_version)
@@ -667,6 +671,36 @@ def scan_sessions(
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
     return results[:limit]
+
+
+def refresh_session(
+    session: Mapping[str, object],
+    *,
+    host: HostExtension | None = None,
+) -> SessionInfo | None:
+    """Re-derive one already listed session from its native history.
+
+    Same builder and derived cache as ``scan_sessions``; list filters and
+    liveness are skipped (the caller owns ``live``/``pid``). None when the
+    history is gone or no longer yields a session.
+    """
+    path = str(session.get("path") or "")
+    if not path or not os.path.isfile(path):
+        return None
+    cache = host.cache if (host is not None and host.cache is not None) else get_cache()
+    cache_version = _cache_version(host)
+    info = cache.get_session("codex", path, cache_version)
+    if info is None:
+        try:
+            info = _build_session_info(path, _load_index(), host)
+        except OSError:
+            return None
+        if info is None:
+            return None
+        cache.put_session("codex", path, info, cache_version)
+    if not info["first_user_msg"] and info["fallback_title"] == "(无消息)":
+        info["fallback_title"] = "Codex 新会话"
+    return info
 
 
 def delete_session(path: str) -> None:

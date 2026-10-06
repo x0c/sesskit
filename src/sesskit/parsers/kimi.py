@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import sys
+from collections.abc import Mapping
 
 from sesskit import titles
 from sesskit.cache import get_cache
@@ -505,6 +506,29 @@ def scan_signature() -> tuple | None:
     return (stat_signature(paths), live_pid_snapshot("kimi"))
 
 
+def _cached_session_info(
+    session_dir: str,
+    session_id: str,
+    host: HostExtension | None,
+    cache,
+    cache_tag: str,
+) -> dict | None:
+    """One session's list record through the derived cache (no list filters)."""
+    wire_path = _wire_path(session_dir)
+    if cache_tag:
+        info = cache.get_session("kimi", wire_path, cache_tag)
+    else:
+        info = cache.get_session("kimi", wire_path)
+    if info is None:
+        info = _build_session_info(session_dir, session_id, host)
+        if info is not None:
+            if cache_tag:
+                cache.put_session("kimi", wire_path, info, cache_tag)
+            else:
+                cache.put_session("kimi", wire_path, info)
+    return info
+
+
 def scan_sessions(
     cwd_filter: str | None = None,
     limit: int = 50,
@@ -554,19 +578,7 @@ def scan_sessions(
     for _, session_dir, session_id in candidates:
         if len(results) >= limit:
             break
-        wire_path = _wire_path(session_dir)
-        cache = session_cache
-        if cache_tag:
-            info = cache.get_session("kimi", wire_path, cache_tag)
-        else:
-            info = cache.get_session("kimi", wire_path)
-        if info is None:
-            info = _build_session_info(session_dir, session_id, host)
-            if info is not None:
-                if cache_tag:
-                    cache.put_session("kimi", wire_path, info, cache_tag)
-                else:
-                    cache.put_session("kimi", wire_path, info)
+        info = _cached_session_info(session_dir, session_id, host, session_cache, cache_tag)
         if info is None:
             continue
         # 标题生成用 `kimi -p` 会落盘会话；用固定前缀拦掉自产噪音。
@@ -594,6 +606,30 @@ def scan_sessions(
     results = results[:limit]
     _apply_live_flags(results, created_ts, host)
     return results
+
+
+def refresh_session(
+    session: Mapping[str, object],
+    *,
+    host: HostExtension | None = None,
+) -> SessionInfo | None:
+    """Re-derive one already listed session from its native history.
+
+    Same builder and derived cache as ``scan_sessions``; list filters and liveness are
+    skipped (the caller owns ``live``/``pid``). None when the history is gone
+    or no longer yields a session.
+    """
+    path = str(session.get("path") or "")
+    if not path or not os.path.isfile(path):
+        return None
+    # path is <session_dir>/agents/main/wire.jsonl (see ``_wire_path``).
+    session_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+    if _wire_path(session_dir) != path:
+        return None
+    cache = host.cache if (host is not None and host.cache is not None) else get_cache()
+    return _cached_session_info(
+        session_dir, os.path.basename(session_dir), host, cache, host_cache_tag(host),
+    )
 
 
 def delete_session(path: str) -> None:

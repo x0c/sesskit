@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Mapping
 
 from sesskit import titles
 from sesskit.cache import get_cache
@@ -750,6 +751,58 @@ def scan_signature() -> tuple | None:
     return (_jsonl_stat_signature(), _live_pid_file_snapshot())
 
 
+def _cached_session_info(
+    fpath: str,
+    proj: str,
+    host: HostExtension | None,
+    cache,
+    cache_tag: str,
+) -> dict | None:
+    """One history file's list record through the derived cache (no list filters)."""
+    if cache_tag:
+        info = cache.get_session("claude", fpath, cache_tag)
+    else:
+        info = cache.get_session("claude", fpath)
+    if info is not None and (
+        (
+            info.get("fallback_title") == "(仅本地命令)"
+            and _IMAGE_TITLE_PREFIX.match(str(info.get("first_user_msg") or ""))
+        )
+        or (
+            info.get("status_tag") == titles.STATUS_DONE
+            and str(info.get("last_agent_msg") or "").startswith(_SESSION_LIMIT_PREFIX)
+        )
+    ):
+        # Reparse older cached image-first sessions and quota endings.
+        info = None
+    if info is not None:
+        return info
+    try:
+        info = _build_session_info(fpath, proj, host)
+    except OSError:
+        return None
+    if info is None:
+        return None
+    # Forward continuation pointer (`continued-in` may sit outside the
+    # head/tail windows, hence the dedicated full-file sweep with a substring
+    # pre-filter). Runs only on cache miss: the pointer arrives via a file
+    # write, which already invalidates this path's cache entry.
+    from sesskit.relations import claude_continuation_target
+
+    target = claude_continuation_target(fpath)
+    if (
+        target
+        and target != info["id"]
+        and os.path.isfile(os.path.join(os.path.dirname(fpath), target + ".jsonl"))
+    ):
+        info["superseded_by"] = target
+    if cache_tag:
+        cache.put_session("claude", fpath, info, cache_tag)
+    else:
+        cache.put_session("claude", fpath, info)
+    return info
+
+
 def scan_sessions(
     cwd_filter: str | None = None,
     limit: int = 50,
@@ -824,47 +877,7 @@ def scan_sessions(
         if peek_cwd and not include_missing_cwd and not cached_isdir(peek_cwd):
             continue  # 廉价探测已确认 cwd 不存在，跳过整文件解析
 
-        cache = session_cache
-        if cache_tag:
-            info = cache.get_session("claude", fpath, cache_tag)
-        else:
-            info = cache.get_session("claude", fpath)
-        if info is not None and (
-            (
-                info.get("fallback_title") == "(仅本地命令)"
-                and _IMAGE_TITLE_PREFIX.match(str(info.get("first_user_msg") or ""))
-            )
-            or (
-                info.get("status_tag") == titles.STATUS_DONE
-                and str(info.get("last_agent_msg") or "").startswith(_SESSION_LIMIT_PREFIX)
-            )
-        ):
-            # Reparse older cached image-first sessions and quota endings.
-            info = None
-        if info is None:
-            try:
-                info = _build_session_info(fpath, proj, host)
-            except OSError:
-                continue
-            if info is not None:
-                # Forward continuation pointer (`continued-in` may sit outside
-                # the head/tail windows, hence the dedicated full-file sweep
-                # with a substring pre-filter). Runs only on cache miss: the
-                # pointer arrives via a file write, which already invalidates
-                # this path's cache entry.
-                from sesskit.relations import claude_continuation_target
-
-                target = claude_continuation_target(fpath)
-                if (
-                    target
-                    and target != info["id"]
-                    and os.path.isfile(os.path.join(os.path.dirname(fpath), target + ".jsonl"))
-                ):
-                    info["superseded_by"] = target
-                if cache_tag:
-                    cache.put_session("claude", fpath, info, cache_tag)
-                else:
-                    cache.put_session("claude", fpath, info)
+        info = _cached_session_info(fpath, proj, host, session_cache, cache_tag)
         if info is None:
             continue
         if not info["first_user_msg"] or info["fallback_title"] == "(仅本地命令)":
@@ -883,6 +896,27 @@ def scan_sessions(
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
     return results[:limit]
+
+
+def refresh_session(
+    session: Mapping[str, object],
+    *,
+    host: HostExtension | None = None,
+) -> SessionInfo | None:
+    """Re-derive one already listed session from its native history.
+
+    Uses the same builder and derived cache as ``scan_sessions`` so status,
+    ``completion_id`` and excerpts match the next scan exactly. List
+    membership filters and liveness are skipped: the caller listed the
+    session already and owns ``live``/``pid``. None when the history is gone
+    or no longer yields a session.
+    """
+    fpath = str(session.get("path") or "")
+    if not fpath.endswith(".jsonl") or not os.path.isfile(fpath):
+        return None
+    cache = host.cache if (host is not None and host.cache is not None) else get_cache()
+    proj = os.path.basename(os.path.dirname(fpath))
+    return _cached_session_info(fpath, proj, host, cache, host_cache_tag(host))
 
 
 def delete_session(path: str) -> None:
