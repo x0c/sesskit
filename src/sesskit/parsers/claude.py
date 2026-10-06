@@ -395,7 +395,12 @@ def _is_internal_claude_session(entries: list[dict], session_id: str | None = No
 # 终局文本之后出现执行活动记录的行类型。元数据行（ai-title / last-prompt /
 # queue-operation / file-history-* / mode 等）只改文件 mtime/size，不代表
 # turn 继续，必须排除在外——否则元数据追加会把同一真实结束误判成新一轮。
-_CONTINUATION_TYPES = frozenset({"assistant", "user", "attachment"})
+_CONTINUATION_TYPES = frozenset({"assistant", "user"})
+# Attachments are mostly context metadata (``prompt_snapshot``, ``date``,
+# ``deferred_tools_record`` …; Claude Code 2.1.291 writes a ``prompt_snapshot``
+# after the final reply, before ``turn_duration``). Only a queued human prompt
+# continues the turn; any real continuation also writes assistant/user rows.
+_CONTINUATION_ATTACHMENTS = frozenset({"queued_command"})
 
 
 def _continued_after(entries: list[dict], idx: int | None) -> bool:
@@ -403,8 +408,15 @@ def _continued_after(entries: list[dict], idx: int | None) -> bool:
     if idx is None:
         return False
     for later in entries[idx + 1:]:
-        if isinstance(later, dict) and later.get("type") in _CONTINUATION_TYPES:
+        if not isinstance(later, dict):
+            continue
+        kind = later.get("type")
+        if kind in _CONTINUATION_TYPES:
             return True
+        if kind == "attachment":
+            attachment = later.get("attachment")
+            if isinstance(attachment, dict) and attachment.get("type") in _CONTINUATION_ATTACHMENTS:
+                return True
     return False
 
 

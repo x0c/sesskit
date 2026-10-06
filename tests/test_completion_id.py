@@ -1119,6 +1119,42 @@ class ClaudeFinalityTests(unittest.TestCase):
             self.assertEqual(second["status_tag"], titles.STATUS_DONE)
             self.assertEqual(first["completion_id"], second["completion_id"])
 
+    def test_context_attachment_after_final_reply_keeps_done(self) -> None:
+        """Claude Code 2.1.291 writes a prompt_snapshot after the final reply.
+
+        Context-metadata attachments do not continue the turn; the identity
+        stays anchored to the final reply. A queued human prompt still does.
+        """
+        from sesskit.parsers import claude
+
+        snapshot = {
+            "type": "attachment", "timestamp": "2026-09-30T20:01:01.000Z",
+            "attachment": {"type": "prompt_snapshot", "contextRendering": "x"},
+        }
+        duration = {
+            "type": "system", "subtype": "turn_duration",
+            "timestamp": "2026-09-30T20:01:02.000Z",
+        }
+        queued = {
+            "type": "attachment", "timestamp": "2026-09-30T20:01:03.000Z",
+            "attachment": {"type": "queued_command", "prompt": "one more thing"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            base = [self._user("do the thing"), self._assistant("all done", "end_turn", "a-final")]
+            plain = claude._build_session_info(self._write(tmp, "plain.jsonl", base), tmp)
+            snap = claude._build_session_info(
+                self._write(tmp, "snap.jsonl", [*base, snapshot, duration]), tmp,
+            )
+            assert plain is not None and snap is not None
+            self.assertEqual(snap["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(snap["completion_id"], plain["completion_id"])
+            more = claude._build_session_info(
+                self._write(tmp, "queued.jsonl", [*base, snapshot, queued]), tmp,
+            )
+            assert more is not None
+            self.assertNotEqual(more["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(more["completion_id"], "")
+
     def test_window_boundary_shift_keeps_terminal_identity(self) -> None:
         """Rolling 64 KB window losing the user excerpt must not change identity.
 
