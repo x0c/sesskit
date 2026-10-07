@@ -657,6 +657,65 @@ class CodexModernFinalityTests(unittest.TestCase):
             self.assertEqual(out[0].get("completion_id"), "")
 
 
+class CodexLateSameTurnItemTests(unittest.TestCase):
+    """A background command finishing after its turn ended must not reopen it (2026-10-07)."""
+
+    SID = "01a114ca-4323-75a0-938d-048dfebb89d9"
+
+    def _rows(self, tail: list[dict]) -> list[dict]:
+        return [
+            {"timestamp": "2026-10-07T09:40:00.000Z", "type": "session_meta",
+             "payload": {"cwd": "/tmp/demo", "thread_source": "user"}},
+            {"timestamp": "2026-10-07T09:40:01.000Z", "type": "event_msg",
+             "payload": {"type": "user_message", "message": "do the thing"}},
+            {"timestamp": "2026-10-07T09:40:02.000Z", "type": "event_msg",
+             "payload": {"type": "task_started", "turn_id": "turn-a"}},
+            {"timestamp": "2026-10-07T09:48:30.000Z", "type": "event_msg",
+             "payload": {"type": "item_completed", "turn_id": "turn-a",
+                         "item": {"type": "AgentMessage", "id": "i1"}}},
+            {"timestamp": "2026-10-07T09:49:07.000Z", "type": "event_msg",
+             "payload": {"type": "task_complete", "turn_id": "turn-a",
+                         "last_agent_message": None,
+                         "error": {"message": "You've hit your usage limit."}}},
+            *tail,
+        ]
+
+    def _info(self, tmp: str, name: str, tail: list[dict]) -> dict:
+        path = Path(tmp) / f"rollout-2026-10-07T17-40-00-{self.SID}.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in self._rows(tail)) + "\n", encoding="utf-8")
+        info = codex._build_session_info(str(path), {})
+        assert info is not None
+        return info
+
+    def test_late_completion_of_the_same_turn_keeps_the_abort(self) -> None:
+        late = {"timestamp": "2026-10-07T09:50:57.000Z", "type": "event_msg",
+                "payload": {"type": "item_completed", "turn_id": "turn-a",
+                            "item": {"type": "CommandExecution", "id": "cmd1", "status": "completed"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            before = self._info(tmp, "a", [])
+            after = self._info(tmp, "b", [late])
+        self.assertEqual(before["status_tag"], titles.STATUS_ABORTED)
+        self.assertEqual(after["status_tag"], titles.STATUS_ABORTED)
+        self.assertTrue(after["completion_id"])
+        self.assertEqual(after["completion_id"], before["completion_id"])
+
+    def test_new_turn_activity_still_reopens(self) -> None:
+        for kind, row in (
+            ("started", {"timestamp": "2026-10-07T09:51:00.000Z", "type": "event_msg",
+                         "payload": {"type": "task_started", "turn_id": "turn-b"}}),
+            ("other-turn", {"timestamp": "2026-10-07T09:51:00.000Z", "type": "event_msg",
+                            "payload": {"type": "item_completed", "turn_id": "turn-b",
+                                        "item": {"type": "CommandExecution", "id": "cmd2"}}}),
+            ("no-turn", {"timestamp": "2026-10-07T09:51:00.000Z", "type": "event_msg",
+                         "payload": {"type": "item_completed",
+                                     "item": {"type": "CommandExecution", "id": "cmd3"}}}),
+        ):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                info = self._info(tmp, kind, [row])
+                self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+                self.assertEqual(info["completion_id"], "")
+
+
 class CodexTerminalIdentityTests(unittest.TestCase):
     """Native terminal identity: distinct per actual turn, stable per event.
 

@@ -392,6 +392,10 @@ def _build_session_info(
     # rows are not turn activity and never invalidate.
     last_terminal_idx: int | None = None
     last_turn_activity_idx: int | None = None
+    # turn_id of the latest terminal marker: a later item_completed of that
+    # same turn (a background command finishing after the turn ended) closes
+    # an item of the finished turn and is not new turn activity.
+    terminal_turn_id = ""
     tail_has_activity_time = False
     for idx, e in enumerate(tail_entries):
         entry_time = _activity_time(e)
@@ -407,7 +411,13 @@ def _build_session_info(
             # Newer modern turn activity: ordered evidence for invalidating
             # an earlier terminal verdict below. Separate branch (not elif):
             # activity rows carry no excerpt text of their own.
-            last_turn_activity_idx = idx
+            late_same_turn = (
+                pt == "item_completed"
+                and bool(terminal_turn_id)
+                and str(payload.get("turn_id") or "") == terminal_turn_id
+            )
+            if not late_same_turn:
+                last_turn_activity_idx = idx
         if user_text:
             last_user_msg = user_text
             last_event_type = "user_message"
@@ -426,12 +436,14 @@ def _build_session_info(
                 last_agent_msg = err_text
             last_event_type = "task_complete_error" if err_text else "task_complete"
             last_terminal_idx = idx
+            terminal_turn_id = str(payload.get("turn_id") or "")
             tail_fingerprint = _terminal_fingerprint(
                 last_event_type, e, payload, msg or err_text
             )
         elif t == "event_msg" and pt == "turn_aborted":
             last_event_type = "turn_aborted"
             last_terminal_idx = idx
+            terminal_turn_id = str(payload.get("turn_id") or "")
             tail_fingerprint = _terminal_fingerprint(last_event_type, e, payload, "")
 
     mtime = os.path.getmtime(path)
