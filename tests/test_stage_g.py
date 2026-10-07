@@ -379,37 +379,47 @@ def test_real_history_parity_and_usage(runtime, kwargs, min_ratio):
         assert with_usage >= 1
 
 
-def test_real_history_compaction_and_relations():
-    from sesskit.parsers import claude, codex, pi
-
-    compact_events = 0
-    for item in claude.scan_sessions(limit=60, include_missing_cwd=True):
-        for event in load_activity(dict(item)).events:
-            if event.compaction is not None:
-                compact_events += 1
-    assert compact_events >= 1
-    compact_rows = 0
-    usage_turns = 0
-    for item in codex.scan_sessions(limit=120, include_missing_cwd=True):
-        for event in load_activity(dict(item)).events:
-            if event.type == "compaction":
-                compact_rows += 1
-            if event.usage is not None:
-                usage_turns += 1
-    assert compact_rows >= 1
-    assert usage_turns >= 1
-    subagents = 0
-    for item in pi.scan_sessions(limit=188):
-        subagents += sum(
-            1 for relation in session_relations(dict(item))
-            if relation.kind == "subagent")
-    assert subagents >= 1
-    origins = set()
-    for item in codex.scan_sessions(limit=20, include_missing_cwd=True):
-        for event in load_activity(dict(item)).events:
-            if event.type == "user_message":
-                origins.add(event.origin)
+def test_native_history_compaction_and_relations(tmp_path):
+    # A rolling list of private sessions cannot guarantee these event shapes.
+    # Exercise every original assertion through real native-history loaders.
+    claude_root = tmp_path / "claude"
+    codex_root = tmp_path / "codex"
+    pi_root = tmp_path / "pi"
+    for root in (claude_root, codex_root, pi_root):
+        root.mkdir()
+    claude_session = _claude_session(claude_root, [
+        {"type": "user", "message": {"role": "user", "content": "Continue"}},
+        {"type": "user", "isCompactSummary": True,
+         "message": {"role": "user", "content": "Previous conversation summary"}},
+    ])
+    assert any(event.compaction is not None
+               for event in load_activity(claude_session).events)
+    codex_session = _codex_session(codex_root, [
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "# AGENTS.md instructions\nExample rules"}]}},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Continue"}]}},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "Done"}],
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}}},
+        {"type": "token_usage_record", "payload": {
+            "turn_id": "turn-1", "turn_token_usage": {"input_tokens": 7, "output_tokens": 3}}},
+        {"type": "compacted", "payload": {"message": "Summary"}},
+    ])
+    codex_events = load_activity(codex_session).events
+    assert any(event.type == "compaction" for event in codex_events)
+    assert any(event.usage is not None for event in codex_events)
+    origins = {event.origin for event in codex_events if event.type == "user_message"}
     assert "human" in origins and "injected" in origins
+    pi_session = _pi_session(pi_root, [
+        {"type": "message", "id": "m1", "message": {"role": "user", "content": "Continue"}},
+        {"type": "custom", "id": "x1", "parentId": "m1", "customType": "subagents:record",
+         "data": {"id": "child-1", "status": "completed"}},
+    ])
+    assert any(relation.kind == "subagent" for relation in session_relations(pi_session))
 
 
 def test_real_history_opencode_relations_and_usage():

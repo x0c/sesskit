@@ -102,6 +102,26 @@ def entry_time(entry: dict) -> float | None:
 _entry_time = entry_time  # 旧私有名兼容：模块内部与测试仍引用
 
 
+_METADATA_EVENT_TYPES = frozenset({"thread_settings_applied", "token_count", "session_configured"})
+
+
+def _activity_time(entry: dict) -> float | None:
+    """Native turn activity, excluding settings/accounting written on resume."""
+    kind = entry.get("type")
+    payload = entry.get("payload") or {}
+    if kind == "event_msg":
+        if payload.get("type") in _METADATA_EVENT_TYPES:
+            return None
+    elif kind == "response_item":
+        if payload.get("role") in ("system", "developer"):
+            return None
+    elif kind != "compacted":
+        # session_meta, turn_context, token_usage_record and other bookkeeping
+        # records describe a thread, not activity in its conversation.
+        return None
+    return _entry_time(entry)
+
+
 def _native_event_id(entry: dict, payload: dict) -> str:
     """Native per-row event id when the record carries one.
 
@@ -251,6 +271,19 @@ def _read_session_tail(path: str, max_bytes: int = 8192) -> list[dict]:
 _BACKFILL_WINDOWS = (256 * 1024, 4 * 1024 * 1024)
 
 
+def _backfill_activity_time(path: str) -> float | None:
+    """Recover a clock evicted by metadata; never widen terminal evidence."""
+    size = os.path.getsize(path)
+    for window in _BACKFILL_WINDOWS:
+        for entry in reversed(_read_session_tail(path, max_bytes=window)):
+            stamp = _activity_time(entry)
+            if stamp is not None:
+                return stamp
+        if window >= size:
+            break
+    return None
+
+
 def _backfill_excerpts(path: str) -> tuple[str | None, str | None]:
     """Newest user prompt / assistant reply beyond the status tail, bounded."""
     user = agent = None
@@ -335,7 +368,7 @@ def _build_session_info(
     event_time = None
 
     for e in head_entries:
-        entry_time = _entry_time(e)
+        entry_time = _activity_time(e)
         if entry_time is not None:
             event_time = entry_time
         t = e.get("type")
@@ -359,10 +392,12 @@ def _build_session_info(
     # rows are not turn activity and never invalidate.
     last_terminal_idx: int | None = None
     last_turn_activity_idx: int | None = None
+    tail_has_activity_time = False
     for idx, e in enumerate(tail_entries):
-        entry_time = _entry_time(e)
+        entry_time = _activity_time(e)
         if entry_time is not None:
             event_time = entry_time
+            tail_has_activity_time = True
         t = e.get("type")
         payload = e.get("payload") or {}
         pt = payload.get("type", "")
@@ -400,8 +435,19 @@ def _build_session_info(
             tail_fingerprint = _terminal_fingerprint(last_event_type, e, payload, "")
 
     mtime = os.path.getmtime(path)
+    metadata_tail = bool(
+        tail_entries
+        and _entry_time(tail_entries[-1]) is not None
+        and _activity_time(tail_entries[-1]) is None
+    )
+    if metadata_tail and not tail_has_activity_time:
+        event_time = _backfill_activity_time(path) or event_time
     resolved_event_time = event_time or (dt.timestamp() if dt else None)
     session_time, time_source = effective_session_time(mtime, resolved_event_time)
+    if metadata_tail and event_time is not None:
+        # Even a short settings-only append can cross local midnight. The
+        # generic one-hour stale-mtime threshold must not turn it into Today.
+        session_time, time_source = event_time, "event_time_metadata"
     size_bytes = os.path.getsize(path)
     fallback = (first_user_msg or "").split("\n")[0].strip()
     if len(fallback) > 60:

@@ -19,6 +19,7 @@ Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`
 
 ## Hard constraints (agent)
 
+- Classify ownership before changing session behavior. This library owns native history interpretation, normalized session/message/activity schemas, real activity clocks and native completion/error evidence. Downstream products own presentation, sorting/grouping policy, hosting, remote delivery, generated titles, attention and notification decisions. Fix reusable interpretation here; never add downstream product behavior or dependencies, and never require a consumer to maintain a second parser. Host-specific adaptation belongs in explicit extension contracts. Publish versioned artifacts for consumer dependency handoff.
 - Public load for a scanned session goes through `load_session_conversation` / `RuntimeParser.load_conversation(session)`. Parser modules remain path-based (OpenCode: db + id).
 - Cursor list-level `scan_signature` must omit `store.db-wal`; conversation / `extra_version` must still include WAL (`docs/CONTRACT.md`).
 - Keep the default missing-`cwd` drop for resume-style listings and the missing-history error (`ConversationLoadError` → error envelope); never disguise unreadable history as an empty success.
