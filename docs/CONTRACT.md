@@ -82,7 +82,7 @@ List `status_tag` values come from `sesskit.titles` (`STATUS_DONE` / `STATUS_PEN
 
 ### Required semantics (product rule)
 
-Consumers (Corral notifications, mobile “job finished”, scripts) must be able to tell **successful completion** apart from **abnormal ends**. Abnormal ends that exist in native history **must** be visible through SessKit — at minimum via correct `status_tag`, and ideally via retained detail (error text / code) in list fields and/or `load_events`.
+Shared terminal-evidence semantics: [Agent Session Integration Guide](~/.config/agentsync/docs/AGENT_SESSION_INTEGRATION_GUIDE.md#terminal-evidence-and-errors). SessKit requires native abnormal endings to remain visible at minimum via `status_tag`, and ideally via retained detail in list fields and/or `load_events`.
 
 | Outcome | Expected `status_tag` | Detail consumers need |
 |---|---|---|
@@ -91,7 +91,7 @@ Consumers (Corral notifications, mobile “job finished”, scripts) must be abl
 | Rate limit, quota, provider error, abort, interrupt | `STATUS_ABORTED` (or a future dedicated failure tag) | Human-readable error summary must not be dropped |
 | Truly unknown | `STATUS_NONE` | Prefer unknown over false `DONE` |
 
-**Do not** treat a native “task/turn complete” marker as success when the same record carries a non-empty error. **Do not** drop error-only assistant turns from `load_events` so that only the preceding user line remains.
+Error-bearing terminal records map to `STATUS_ABORTED` per the table above; error-only assistant turns stay in `load_events` — plain conversation views may hide them behind `include_errors` (see Public conversation load).
 
 ### Native signals (reference)
 
