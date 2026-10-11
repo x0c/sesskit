@@ -136,7 +136,7 @@ def _last_texts(entries: list[dict]) -> tuple[str | None, str | None]:
         t = e.get("type")
         if user is None and t == "user":
             text = _extract_text(e.get("message", {}).get("content", ""))
-            if text and text != INTERRUPTED_MARKER:
+            if text and not is_interrupted_marker(text):
                 user = text
         elif user is None and t == "attachment":
             text = queued_command_text(e)
@@ -167,6 +167,14 @@ def _backfill_excerpts(fpath: str) -> tuple[str | None, str | None]:
 
 INTERRUPTED_MARKER = "[Request interrupted by user]"
 _INTERRUPTED_MARKER = INTERRUPTED_MARKER  # 旧私有名兼容：模块内部仍引用
+# Claude Code writes the tool-use variant when the interrupt lands while a tool
+# runs (2.1.296, Esc during a Bash call). Both are native turn-abort markers.
+INTERRUPTED_MARKERS = frozenset({INTERRUPTED_MARKER, "[Request interrupted by user for tool use]"})
+
+
+def is_interrupted_marker(text: object) -> bool:
+    """True for Claude's native user-interrupt markers (never human input)."""
+    return isinstance(text, str) and text.strip() in INTERRUPTED_MARKERS
 
 
 def system_error_text(entry: object) -> str:
@@ -217,7 +225,7 @@ def queued_command_text(entry: object) -> str | None:
     if not isinstance(prompt, str):
         return None
     text = prompt.strip()
-    if not text or text == INTERRUPTED_MARKER:
+    if not text or is_interrupted_marker(text):
         return None
     # 纵深防御：hook 通知正文本身就是系统标记，形状上直接排除。
     lowered = text.lower()
@@ -492,7 +500,7 @@ def _build_session_info(
             title_candidates.append(("last_prompt", last_prompt))
         elif t == "user":
             text = _extract_text(e.get("message", {}).get("content", ""))
-            if text == _INTERRUPTED_MARKER:
+            if is_interrupted_marker(text):
                 last_was_user = "aborted"  # 用户主动中断当前轮次，不是真实用户消息
                 last_content_idx = idx
             elif text:
@@ -1002,7 +1010,7 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                         # 预览只展示 Agent 和真人的对话，这类系统事件价值很低，整条丢弃，不展示。
                         continue
                     text = _extract_text(message.get("content", ""))
-                    if text and text != _INTERRUPTED_MARKER:
+                    if text and not is_interrupted_marker(text):
                         flush_legacy_answer()
                         flush_error()
                         messages.append(ConversationMessage("user", text, _entry_time(entry)))

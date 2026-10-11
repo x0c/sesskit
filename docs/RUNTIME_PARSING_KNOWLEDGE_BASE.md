@@ -114,7 +114,7 @@ For status inference, each parser maps its native tail signals to the shared
 
 | Runtime | Native store | Success signal | Abnormal signal |
 |---|---|---|---|
-| `claude` | Per-project JSONL under the Claude projects dir; bounded 64 KB tail read | Assistant text tail, no error markers | System entries carrying upstream error text plus HTTP status; user-interrupt marker; assistant text starting with the session-limit prefix |
+| `claude` | Per-project JSONL under the Claude projects dir; bounded 64 KB tail read | Assistant text tail, no error markers | System entries carrying upstream error text plus HTTP status; user-interrupt markers (`[Request interrupted by user]`, and `[Request interrupted by user for tool use]` when the interrupt lands during a tool call; both are aborted evidence, never human input); assistant text starting with the session-limit prefix |
 | `codex` | Rollout session files plus session index; shared process snapshot for liveness | `event_msg` / `task_complete` without `error` | Same completion event carrying a non-empty `error` (usage-limit, auth, provider); `turn_aborted` |
 | `cursor` | Workspace-hash chat dirs (`meta.json`, newest-first `prompt_history.json`, `store.db` blobs) | Transcript / store tail with assistant text | Terminal reason unclear: prefer unknown over false done; error-only store tails surface through events |
 | `opencode` | Single SQLite database, v1 tables plus v2 tables with dedup | Assistant message with stop finish and no `error` | Non-empty message `error` (provider error objects, abort errors); error text fills excerpts even for zero-text turns |

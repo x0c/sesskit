@@ -103,7 +103,7 @@ Use these when implementing or reviewing parsers (not an event-bus API — SessK
 | Pi | assistant `stopReason` in `{stop, …}` with content | `stopReason` in `{error, aborted, …}` plus `errorMessage` (e.g. weekly 429) |
 | OpenCode | assistant `finish=stop`, no `error` | Non-empty message `error` → aborted (existing parser rule) |
 | Cursor | Prefer transcript / store tail; list `status_tag` is weak today | Prefer unknown over false done when terminal reason is unclear |
-| Claude | Stop / transcript end without interrupt markers | `system` entries with `error` (`formatted` human text + `status` HTTP code; 2.1+ live shape) → aborted; `[Request interrupted by user]` → aborted; final assistant text beginning `You've hit your session limit` → aborted |
+| Claude | Stop / transcript end without interrupt markers | `system` entries with `error` (`formatted` human text + `status` HTTP code; 2.1+ live shape) → aborted; `[Request interrupted by user]` and its tool-use variant `[Request interrupted by user for tool use]` → aborted (neither is human input); final assistant text beginning `You've hit your session limit` → aborted |
 | Kimi | Stable `step.end` / assistant tail | Cancel / failure markers in wire history |
 
 ### Verified gaps closed (2026-09-15 live Mac runs)

@@ -425,6 +425,33 @@ class ClaudeActivityTests(unittest.TestCase):
             self.assertEqual(limited_snapshot.outcome.status, "aborted")
             assert limited_snapshot.outcome.error is not None
 
+    def test_tool_use_interrupt_is_aborted_not_human_input(self) -> None:
+        # Claude Code 2.1.296: Esc during a Bash call rejects the tool and writes
+        # the tool-use variant of the interrupt marker.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tool-interrupt.jsonl"
+            _write_jsonl(path, [
+                _claude_user("Run sleep 60.", "2026-09-01T00:00:01Z"),
+                {"type": "assistant", "timestamp": "2026-09-01T00:00:02Z",
+                 "message": {"role": "assistant", "content": [
+                     {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                      "input": {"command": "sleep 60"}}]}},
+                {"type": "user", "timestamp": "2026-09-01T00:00:05Z",
+                 "toolUseResult": "User rejected tool use",
+                 "message": {"role": "user", "content": [
+                     {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": True,
+                      "content": "The user doesn't want to proceed with this tool use."}]}},
+                {"type": "user", "timestamp": "2026-09-01T00:00:05Z",
+                 "message": {"role": "user", "content": [
+                     {"type": "text", "text": "[Request interrupted by user for tool use]"}]}},
+            ])
+            snapshot = load_activity(_claude_session(path))
+            self.assertEqual(snapshot.outcome.status, "aborted")
+            assert snapshot.outcome.error is not None
+            self.assertEqual(snapshot.outcome.error.kind, "aborted")
+            prompts = [e.text for e in snapshot.events if e.type == "user_message"]
+            self.assertEqual(prompts, ["Run sleep 60."])
+
     def test_user_tail_pending_and_missing_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "claude.jsonl"

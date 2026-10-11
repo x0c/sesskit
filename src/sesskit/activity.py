@@ -731,7 +731,7 @@ class _ClaudeFeed:
                     continue
                 compact = entry.get("isCompactSummary") is True
                 text = scan_claude.extract_text(content or "")
-                if text and text != scan_claude.INTERRUPTED_MARKER:
+                if text and not scan_claude.is_interrupted_marker(text):
                     if self.pending_error is not None:
                         err_text, err_ts, err_record, err_code = self.pending_error
                         self._add("assistant_message", err_ts, err_record, text=err_text,
@@ -748,7 +748,7 @@ class _ClaudeFeed:
                         self._add("user_message", ts, record, text=text, origin="human")
                     else:
                         self._add("user_message", ts, record, text=text)
-                elif (compact or (isinstance(content, str) and content.strip())) and text != scan_claude.INTERRUPTED_MARKER:
+                elif (compact or (isinstance(content, str) and content.strip())) and not scan_claude.is_interrupted_marker(text):
                     # Command/caveat wrappers strip to nothing: native injected
                     # chrome with no human text. Surfaced typed-only (v1 skips
                     # injected user messages, so projection bytes do not change).
@@ -941,7 +941,7 @@ class _ClaudeOutcomeAcc:
                             and part.get("tool_use_id")):
                         self.answered_calls.add(str(part.get("tool_use_id")))
             text = scan_claude.extract_text(content)
-            if text == scan_claude.INTERRUPTED_MARKER:
+            if scan_claude.is_interrupted_marker(text):
                 self.last_was_user = "aborted"
                 self.last_content_lineno = lineno
             elif text:
