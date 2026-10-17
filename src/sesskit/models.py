@@ -574,6 +574,7 @@ class AssistantMessage(_TypedEventBase):
 class Thinking(_TypedEventBase):
     kind: Literal["thinking"] = "thinking"
     text: str = ""
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True)
@@ -663,7 +664,7 @@ def as_typed(event: ActivityEvent) -> UserMessage | AssistantMessage | Thinking 
     if event.type == "assistant_message":
         return AssistantMessage(text=event.text or "", error=event.error, **shared)
     if event.type == "thinking":
-        return Thinking(text=event.text or "", **shared)
+        return Thinking(text=event.text or "", usage=event.usage, **shared)
     if event.type == "tool_call":
         return ToolCall(
             name=event.name or "tool",

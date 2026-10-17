@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from sesskit.activity import load_activity, to_v1_dicts
+from sesskit.models import as_typed
 from sesskit.transcript import load_events
 
 
@@ -565,6 +566,28 @@ def _codex_output(call_id: str, output: object) -> dict:
     return {"type": "response_item", "timestamp": "2026-09-01T00:00:03Z",
             "payload": {"type": "function_call_output", "call_id": call_id,
                         "output": output}}
+
+
+    def test_thinking_events_carry_native_model_evidence(self) -> None:
+        for model in ("claude-opus-5-5", "deepseek-flash"):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "claude.jsonl"
+                _write_jsonl(path, [
+                    _claude_user("Think.", "2026-09-01T00:00:01Z"),
+                    {"type": "assistant", "timestamp": "2026-09-01T00:00:02Z",
+                     "message": {"role": "assistant", "model": model,
+                                 "content": [{"type": "thinking",
+                                              "thinking": "Weighing options."}]}},
+                ])
+                snapshot = load_activity(_claude_session(path))
+                thinking = next(event for event in snapshot.events if event.type == "thinking")
+                assert thinking.usage is not None
+                self.assertEqual(thinking.usage.model, model)
+                typed = as_typed(thinking)
+                assert typed.usage is not None
+                self.assertEqual(typed.usage.model, model)
+                # Model evidence is additive: the v1 projection keeps its bytes.
+                self.assertEqual(to_v1_dicts(snapshot), load_events(_claude_session(path)))
 
 
 class CodexActivityTests(unittest.TestCase):

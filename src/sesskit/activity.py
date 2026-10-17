@@ -765,7 +765,8 @@ class _ClaudeFeed:
                 part_type = part.get("type")
                 if part_type == "thinking":
                     self._add("thinking", ts, record,
-                              text=str(part.get("thinking") or part.get("text") or "").strip())
+                              text=str(part.get("thinking") or part.get("text") or "").strip(),
+                              usage=usage)
                 elif part_type == "text":
                     text = str(part.get("text") or "").strip()
                     if text:

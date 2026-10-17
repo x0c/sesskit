@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from sesskit.activity import load_activity
 from sesskit.parsers import claude, pi
 from sesskit.registry import ConversationLoadError, default_registry, load_session_conversation
 from sesskit.transcript import load_events
@@ -317,12 +318,23 @@ def test_live_sample_plain_matches_events_and_filters_noise():
         for session in sessions[:2]:
             messages = registry.get(runtime_id).load_conversation(session)
             events = load_events(dict(session))
+            # Native context-compaction summaries stay in plain conversation by
+            # design and quote system markers inside the summarized text. Their
+            # typed event carries native CompactionInfo, so the marker heuristic
+            # applies only to unmarked user rows.
+            compact = {
+                event.text
+                for event in load_activity(dict(session)).events
+                if event.compaction is not None
+            }
             user_plain = [m.text for m in messages if m.role == "user"]
             user_events = [e.get("text") for e in events if e.get("type") == "user_message"]
             for text in user_plain:
                 assert text in user_events or any(
                     text in (ev or "") or (ev or "") in text for ev in user_events
                 ), (runtime_id, session.get("id"), text[:80])
+                if text in compact:
+                    continue
                 low = text.lower()
                 assert not any(marker in low for marker in strong), (runtime_id, text[:120])
             assert all(m.role in {"user", "assistant"} for m in messages)
