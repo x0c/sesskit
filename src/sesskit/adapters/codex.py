@@ -42,14 +42,22 @@ class CodexAdapter(RuntimeAdapter):
 
     def load_conversation(self, session: dict, *, include_errors: bool = False) -> Any:
         from sesskit.conversation import project_session_conversation
+        from sesskit.models import ConversationMessage
 
         path = session_path(session, self.id)
         require_history_file(path)
-        return project_session_conversation(
+        messages = project_session_conversation(
             self.load_activity(session),
             include_errors=include_errors,
             history_ref=path,
         )
+        # Typed user events keep native question-reply envelopes as evidence;
+        # the plain conversation shows the answers.
+        return [
+            ConversationMessage(m.role, _parser.readable_user_text(m.text), m.timestamp)
+            if m.role == "user" else m
+            for m in messages
+        ]
 
     def load_activity(self, session: dict) -> Any:
         from sesskit.activity import _load_codex

@@ -1267,7 +1267,7 @@ class _CodexFeed:
                                            Evidence(_NATIVE, field="payload.reason", record=record),
                                            None, False, "turn"))
                 continue
-            user_text = scan_codex.readable_user_text(scan_codex.user_message_text(entry))
+            user_text = scan_codex.user_message_text(entry)
             if user_text:
                 self._add_dedup("user_message", ts, record, user_text, origin="human")
                 continue

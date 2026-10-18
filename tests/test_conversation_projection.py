@@ -190,10 +190,12 @@ class CodexProjectionTests(unittest.TestCase):
             ])
             expected = [("user", "Use an existing machine"), ("assistant", "Noted."),
                         ("user", malformed)]
-            self.assertEqual(
-                _roles(conversation_from_activity(load_activity(_codex_session(path)))), expected,
-            )
+            self.assertEqual(_roles(load_session_conversation(_codex_session(path))), expected)
             self.assertEqual(_roles(codex.load_conversation(str(path))), expected)
+            # Typed events keep the native envelope: consumers settle questions from it.
+            user_texts = [e.text for e in load_activity(_codex_session(path)).events
+                          if e.type == "user_message"]
+            self.assertEqual(user_texts, [envelope, malformed])
         # The raw row stays available for consumers that detect answered questions.
         raw = {"type": "response_item", "payload": {
             "type": "message", "role": "user",
