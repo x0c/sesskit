@@ -183,6 +183,54 @@ def _response_message_text(payload: dict, role: str) -> str:
     return text
 
 
+# Codex native async answers arrive as a user row wrapping a JSON array of
+# {questionItemId, question, answer} (codex-rs answered_question.rs). The raw
+# row stays available through user_message_text (consumers detect answered
+# questions from it); readable projections show only the answers.
+_QUESTION_REPLY_RE = re.compile(
+    r"<send_user_message_question_reply>(.*?)</send_user_message_question_reply>",
+    re.DOTALL,
+)
+
+
+def _question_reply_answers(body: str) -> str | None:
+    """Answers of one well-formed envelope body, one per line; None otherwise."""
+    try:
+        parsed = json.loads((body or "").strip())
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, list) or not parsed:
+        return None
+    answers: list[str] = []
+    for item in parsed:
+        if not isinstance(item, dict) or not isinstance(item.get("questionItemId"), str):
+            return None
+        question, answer = item.get("question"), item.get("answer")
+        if not isinstance(question, str) or not question.strip() or not isinstance(answer, str):
+            return None
+        if answer.strip():
+            answers.append(answer.strip())
+    return "\n".join(answers)
+
+
+def readable_user_text(text: str) -> str:
+    """User text with native question-reply envelopes replaced by their answers.
+
+    Malformed envelopes and bare tag mentions stay verbatim. When nothing
+    readable remains (every answer empty), the original text is returned so
+    an answered turn never turns into an empty user row.
+    """
+    if "<send_user_message_question_reply>" not in text:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        answers = _question_reply_answers(match.group(1))
+        return match.group(0) if answers is None else answers
+
+    readable = _QUESTION_REPLY_RE.sub(_replace, text).strip()
+    return readable or text
+
+
 def user_message_text(entry: dict) -> str:
     """兼容旧 event_msg 与新版 response_item 的真实用户输入。"""
     payload = entry.get("payload") or {}
@@ -531,7 +579,9 @@ def _build_session_info(
         status_tag=status,
         path=path,
         first_user_msg=preprocess_excerpt(first_user_msg, host),
-        last_user_msg=preprocess_excerpt(last_user_msg, host),
+        last_user_msg=preprocess_excerpt(
+            readable_user_text(last_user_msg) if last_user_msg else last_user_msg, host,
+        ),
         last_agent_msg=preprocess_excerpt(last_agent_msg, host),
         thread_source=thread_source,  # 运行时私有字段，见 SessionInfo 的 total=False 部分
         completion_id=completion_id_for(
@@ -636,7 +686,7 @@ def scan_signature() -> tuple | None:
 def _cache_version(host: HostExtension | None) -> str:
     # 新版记录把真实消息放进 response_item；提升解析缓存版本，让旧版误判为
     # “新会话”的派生结果自动重读，而不必让用户手动清缓存。
-    index_version = repr((file_signature(SESSION_INDEX), "response-item-v2"))
+    index_version = repr((file_signature(SESSION_INDEX), "response-item-v2", "question-reply-v1"))
     return index_version + host_cache_tag(host)
 
 
@@ -789,7 +839,7 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                 # payload 里的字段即使写了 key，值也可能是 JSON null（如任务无输出就结束的
                 # task_complete）；`.get(key, "")` 只在 key 缺失时才用默认值，key 存在但值为
                 # null 时会拿到 None，`str(None)` 变成字面量 "None" 混进正文，必须用 `or ""` 兜底。
-                user_text = _user_message_text(entry)
+                user_text = readable_user_text(_user_message_text(entry))
                 assistant_text = _assistant_message_text(entry)
                 payload_type = payload.get("type")
                 if user_text:

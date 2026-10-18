@@ -20,7 +20,7 @@ from sesskit.conversation import (
     conversation_from_activity,
     project_session_conversation,
 )
-from sesskit.parsers import kimi
+from sesskit.parsers import codex, kimi
 from sesskit.registry import ConversationLoadError, load_session_conversation
 
 
@@ -164,6 +164,42 @@ class CodexProjectionTests(unittest.TestCase):
                 [("user", "Deploy."), ("assistant", "Deploying."),
                  ("assistant", "quota gone")],
             )
+
+
+    def test_question_reply_envelope_projects_to_answers(self) -> None:
+        identity = json.dumps(["request_user_input_async", "call_1", 0])
+        envelope = (
+            "<send_user_message_question_reply>\n"
+            + json.dumps([{"questionItemId": identity, "question": "Budget?",
+                           "answer": "Use an existing machine"}], ensure_ascii=False)
+            + "\n</send_user_message_question_reply>"
+        )
+        malformed = "<send_user_message_question_reply>not json</send_user_message_question_reply>"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex.jsonl"
+            _write_jsonl(path, [
+                {"type": "response_item", "timestamp": "2026-09-01T00:00:01Z",
+                 "payload": {"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text": envelope}]}},
+                {"type": "response_item", "timestamp": "2026-09-01T00:00:02Z",
+                 "payload": {"type": "message", "role": "assistant",
+                             "content": [{"type": "output_text", "text": "Noted."}]}},
+                {"type": "response_item", "timestamp": "2026-09-01T00:00:03Z",
+                 "payload": {"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text": malformed}]}},
+            ])
+            expected = [("user", "Use an existing machine"), ("assistant", "Noted."),
+                        ("user", malformed)]
+            self.assertEqual(
+                _roles(conversation_from_activity(load_activity(_codex_session(path)))), expected,
+            )
+            self.assertEqual(_roles(codex.load_conversation(str(path))), expected)
+        # The raw row stays available for consumers that detect answered questions.
+        raw = {"type": "response_item", "payload": {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": envelope}]}}
+        self.assertEqual(codex.user_message_text(raw), envelope)
+        self.assertEqual(codex.readable_user_text("plain"), "plain")
 
 
 # --- OpenCode ---------------------------------------------------------------
