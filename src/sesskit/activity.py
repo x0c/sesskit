@@ -569,15 +569,7 @@ def _claude_record(lineno: int) -> str:
 
 
 def _claude_entry_error_code(entry: dict) -> str | None:
-    """Native ``error.status`` code for one system-error entry, if present."""
-    err = entry.get("error")
-    if not isinstance(err, dict):
-        return None
-    status = err.get("status")
-    if status is None or isinstance(status, bool):
-        return None
-    text = str(status).strip()
-    return text or None
+    return scan_claude.native_error_code(entry)
 
 
 def _claude_int(value: object) -> int | None:
@@ -618,14 +610,15 @@ def _claude_usage(message: dict, record: str) -> Usage | None:
     )
 
 
-def _claude_upstream_error(err_text: str, err_record: str, err_code: str | None) -> AgentError:
+def _claude_upstream_error(err_text: str, err_record: str, err_code: str | None,
+                           field: str = "error.formatted") -> AgentError:
     """Classified upstream system error (401/5xx/retry bursts) with scope."""
     error_kind, retryable = classify_error(
         runtime="claude", kind="provider", code=err_code, message=err_text,
     )
     return AgentError(
         error_kind, err_text,
-        Evidence(_NATIVE, field="error.formatted", record=err_record),
+        Evidence(_NATIVE, field=field, record=err_record),
         err_code, retryable, "turn", native_http_status(err_code, err_text),
     )
 
@@ -645,7 +638,7 @@ class _ClaudeFeed:
     def __init__(self, seq_start: int = 0) -> None:
         self._seq_start = seq_start
         self.events: list[ActivityEvent] = []
-        self.pending_error: tuple[str, float | None, str, str | None] | None = None
+        self.pending_error: tuple[str, float | None, str, str | None, str] | None = None
         # call_id -> (event index, tool name, raw input, use row)
         self.calls: dict[str, tuple[int, str, object, int]] = {}
         # call_id -> (output, typed outcome, result row)
@@ -673,19 +666,21 @@ class _ClaudeFeed:
             if not isinstance(entry, dict) or entry.get("isMeta") or entry.get("isSidechain"):
                 continue
             record = _claude_record(lineno)
+            err_text = scan_claude.system_error_text(entry)
+            if err_text:
+                field = "isApiErrorMessage" if entry.get("isApiErrorMessage") is True else "error.formatted"
+                self.pending_error = (err_text, scan_claude.entry_time(entry), record,
+                                      _claude_entry_error_code(entry), field)
+                continue
             if entry.get("type") == "system":
-                err_text = scan_claude.system_error_text(entry)
-                if err_text:
-                    self.pending_error = (err_text, scan_claude.entry_time(entry), record,
-                                          _claude_entry_error_code(entry))
                 continue
             if entry.get("type") == "attachment":
                 text = scan_claude.queued_command_text(entry)
                 if text:
                     if self.pending_error is not None:
-                        err_text, err_ts, err_record, err_code = self.pending_error
+                        err_text, err_ts, err_record, err_code, err_field = self.pending_error
                         self._add("assistant_message", err_ts, err_record, text=err_text,
-                                  error=_claude_upstream_error(err_text, err_record, err_code))
+                                  error=_claude_upstream_error(err_text, err_record, err_code, err_field))
                         self.pending_error = None
                     # queued_command_text admits only explicit human evidence.
                     self._add("user_message", scan_claude.entry_time(entry), record,
@@ -733,9 +728,9 @@ class _ClaudeFeed:
                 text = scan_claude.extract_text(content or "")
                 if text and not scan_claude.is_interrupted_marker(text):
                     if self.pending_error is not None:
-                        err_text, err_ts, err_record, err_code = self.pending_error
+                        err_text, err_ts, err_record, err_code, err_field = self.pending_error
                         self._add("assistant_message", err_ts, err_record, text=err_text,
-                                  error=_claude_upstream_error(err_text, err_record, err_code))
+                                  error=_claude_upstream_error(err_text, err_record, err_code, err_field))
                         self.pending_error = None
                     if compact:
                         # System-generated continuation summary in the user
@@ -794,11 +789,11 @@ class _ClaudeFeed:
         """
         before = len(self.events)
         if self.pending_error is not None:
-            err_text, err_ts, err_record, err_code = self.pending_error
+            err_text, err_ts, err_record, err_code, err_field = self.pending_error
             last = self.events[-1] if self.events else None
             if last is None or last.type != "assistant_message" or last.text != err_text:
                 self._add("assistant_message", err_ts, err_record, text=err_text,
-                          error=_claude_upstream_error(err_text, err_record, err_code))
+                          error=_claude_upstream_error(err_text, err_record, err_code, err_field))
             self.pending_error = None
         return self.events[before:]
 
@@ -925,6 +920,7 @@ class _ClaudeOutcomeAcc:
         self.last_agent_msg: str | None = None
         self.last_content_lineno = -1
         self.last_error_text = ""
+        self.last_error_field = "error.formatted"
         self.last_error_lineno = -1
         self.last_error_code: str | None = None
         self.issued_calls: set[str] = set()
@@ -934,6 +930,13 @@ class _ClaudeOutcomeAcc:
         if not isinstance(entry, dict) or entry.get("isMeta") or entry.get("isSidechain"):
             return
         kind = entry.get("type")
+        err_text = scan_claude.system_error_text(entry)
+        if err_text:
+            self.last_error_text = err_text
+            self.last_error_lineno = lineno
+            self.last_error_code = _claude_entry_error_code(entry)
+            self.last_error_field = "isApiErrorMessage" if entry.get("isApiErrorMessage") is True else "error.formatted"
+            return
         if kind == "user":
             content = (entry.get("message") or {}).get("content", "")
             if isinstance(content, list):
@@ -985,9 +988,9 @@ class _ClaudeOutcomeAcc:
             code = self.last_error_code
             return SessionOutcome(
                 "aborted",
-                Evidence(_NATIVE, field="error.formatted", record=_claude_record(self.last_error_lineno)),
+                Evidence(_NATIVE, field=self.last_error_field, record=_claude_record(self.last_error_lineno)),
                 error=AgentError("provider", self.last_error_text,
-                                 Evidence(_NATIVE, field="error.formatted",
+                                 Evidence(_NATIVE, field=self.last_error_field,
                                           record=_claude_record(self.last_error_lineno)),
                                  code=code),
             )
@@ -1042,18 +1045,9 @@ def _claude_outcome(rows: list[tuple[int, dict]]) -> SessionOutcome:
 
 
 def _claude_system_error_code(rows: list[tuple[int, dict]], lineno: int) -> str | None:
-    """Return the native ``error.status`` code for a system-error row, if any."""
     for row_lineno, entry in rows:
-        if row_lineno != lineno:
-            continue
-        err = entry.get("error")
-        if not isinstance(err, dict):
-            return None
-        status = err.get("status")
-        if status is None or isinstance(status, bool):
-            return None
-        text = str(status).strip()
-        return text or None
+        if row_lineno == lineno:
+            return _claude_entry_error_code(entry)
     return None
 
 

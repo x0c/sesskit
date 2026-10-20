@@ -180,11 +180,19 @@ def is_interrupted_marker(text: object) -> bool:
 def system_error_text(entry: object) -> str:
     """Claude 2.1+ `system` 条目里的上游报错（401/504/连接失败…）。
 
+    Positively flagged assistant API errors use the same native failure path.
+
     真机实采（假 key 跑出 401、代理掐出 ECONNRESET）：`error` 对象自带
     `formatted` 人话（`'401 API key is invalid.'` / `'Connection dropped …'`）
     与 `status` HTTP 码；重试会连记多条，调用方取最后一条为准。
     """
-    if not isinstance(entry, dict) or entry.get("type") != "system":
+    if not isinstance(entry, dict):
+        return ""
+    if entry.get("type") == "assistant" and entry.get("isApiErrorMessage") is True:
+        message = entry.get("message")
+        text = _extract_text(message.get("content", "")) if isinstance(message, dict) else ""
+        return text or str(entry.get("error") or "API request failed")
+    if entry.get("type") != "system":
         return ""
     err = entry.get("error")
     if not isinstance(err, dict):
@@ -193,6 +201,18 @@ def system_error_text(entry: object) -> str:
     if formatted:
         return formatted
     return str(err.get("message") or "").strip()
+
+
+def native_error_code(entry: dict) -> str | None:
+    """HTTP status from a positively identified native API-error record."""
+    if entry.get("type") == "assistant" and entry.get("isApiErrorMessage") is True:
+        status = entry.get("apiErrorStatus")
+    else:
+        error = entry.get("error")
+        status = error.get("status") if isinstance(error, dict) else None
+    if status is None or isinstance(status, bool):
+        return None
+    return str(status).strip() or None
 
 
 def queued_command_text(entry: object) -> str | None:
@@ -493,6 +513,13 @@ def _build_session_info(
         if entry_time is not None:
             event_time = entry_time
         t = e.get("type")
+        err_text = system_error_text(e)
+        if err_text:
+            last_error_text = err_text
+            last_error_idx = idx
+            last_error_anchor = str(e.get("uuid") or e.get("timestamp") or "")
+            last_error_msg = err_text
+            continue
         if t == "ai-title":
             ai_title = _prefer_claude_native_title(ai_title, e.get("aiTitle"))
         elif t == "last-prompt" and e.get("lastPrompt"):
@@ -995,11 +1022,12 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                 if not isinstance(message, dict):
                     continue
 
+                err_text = system_error_text(entry)
+                if err_text:
+                    pending_error = err_text
+                    pending_error_ts = _entry_time(entry)
+                    continue
                 if entry_type == "system":
-                    err_text = system_error_text(entry)
-                    if err_text:
-                        pending_error = err_text
-                        pending_error_ts = _entry_time(entry)
                     continue
 
                 if entry_type == "user":

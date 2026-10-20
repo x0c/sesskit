@@ -318,3 +318,48 @@ Unit tests that **mock** `load_conversation` can stay green while the real regis
 7. **No armchair modeling.** Every parser or inference change must be confronted with that runtime's real history files before merge: report sampled session counts, event-type totals, and the exact evidence behind each new rule (e.g. all 11 answered Claude questions omit `is_error`; hook `<task-notification>` reuses the `queued_command` channel with non-human or missing origin). When replacing a parser with a projection of the new model, prove byte-identical output on real histories first (47/47 Claude files on 2026-09-29), then delete the old code — never the reverse. Missing native evidence (a flag, an origin, a result) must stay `unknown`/excluded, never default to the convenient reading. Skipped live runs must name the blocker: on 2026-09-29 fresh one-shot probes were blocked by Claude session limit (`You've hit your session limit`) and Pi insufficient credits (`BAD_REQUEST`), so the changed runtimes were verified by real-history parity plus fixtures instead; codex/cursor/opencode/kimi parsers were untouched and covered by 20-session real-history conversation/event sampling each (kimi: zero local sessions, unverifiable).
 
 <!-- 该文档整理/压缩于 2026-09-29 -->
+
+
+## Claude assistant API failure records (2026-10-20)
+
+Claude Code 2.1.304 can persist a terminal API failure as an assistant record
+with `isApiErrorMessage: true`, `error: authentication_failed` and
+`apiErrorStatus: 401`, rather than a system error record. This is positive
+native failure evidence. Listing status and typed session/turn outcomes must be
+aborted, structured error HTTP/category evidence retained, and transcript error
+text preserved. Default plain chat hides error-only turns unless requested. A
+synthetic error's `<synthetic>` model is not an observed inference model. Ordinary
+assistant prose mentioning an API error without the native flag stays ordinary
+reply content; later genuine user/assistant content supersedes an earlier error.
+The same rules apply to snapshot and incremental reads.
+
+Evidence: exact fresh native history from a failed 401 request, not a guessed
+text match. Historical success paths and native system-error handling remain
+covered. No private service endpoint or downstream product policy is introduced.
+
+The same native fields are independently reported in the upstream project's
+[authentication failure issue](https://github.com/anthropics/claude-code/issues/70958).
+This is an observed native-file format, not a vendor stability guarantee.
+
+
+The live-history gate also exposed a verifier mismatch after native Codex
+question-reply envelopes were retained as typed evidence. Plain chat intentionally
+projects those envelopes to readable answers. Conformance compares that documented
+readable projection, preserving ordered and exact text checks; it must not
+require raw envelope bytes in plain chat or suppress the user-coverage invariant.
+
+
+The 0.2.15 distribution migrates the legacy license table to the SPDX `MIT`
+expression and explicit LICENSE file using Setuptools 77+, which supports this
+metadata. This removes build-time license deprecation diagnostics without
+changing runtime dependencies or suppressing warnings.
+
+
+Verification for this native-error slice: 559 tests and 25 subtests passed; Ruff
+passed. The maintained five-active-runtime gate checked 25 exact native histories
+with zero load, parity, reader or invariant failures after correcting the Codex
+readable-answer verifier. The newly captured 401 file independently yielded
+list `STATUS_ABORTED`, snapshot `aborted`, turn `failed`, native HTTP 401 and no
+synthetic usage model. Existing success histories for the other runtimes passed
+the same gate. Fresh successful Claude inference was blocked by quota on one
+host and invalid saved credentials on another; this is not claimed as a success.

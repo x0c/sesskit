@@ -12,3 +12,4 @@
 
 | Low-friction environment A | 进行中 | pyproject.toml dev tooling and reproducible environment metadata only; no parser/conformance/contract edits | 11:31 | 2026-09-30 11:31 | OpenCode Luna medium; dispatch 20260930-113144-low-friction; coordinator serializes integration/release; do not remove foreign rows |
 | Claude thinking events carry model evidence | Implementing | src/sesskit/activity.py, src/sesskit/models.py, tests/test_activity.py, docs/CONTRACT.md | 2026-10-17 18:25 | 2026-10-17 18:25 | Attach per-message native Usage (model/tokens) to Claude thinking events; additive, v1 bytes unchanged. Consumer Corral gates client display by model. |
+

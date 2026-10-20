@@ -251,10 +251,18 @@ def _visible_conversation_event(event: Any) -> bool:
     return _event_type(event) in {"user_message", "assistant_message"}
 
 
-def _expected_conversation_pairs(events: Sequence[Any]) -> list[tuple[str, str]]:
+def _readable_text(event: Any, text: str, runtime: str | None) -> str:
+    if runtime == "codex" and _event_type(event) == "user_message":
+        from sesskit.parsers.codex import readable_user_text
+
+        return readable_user_text(text)
+    return text
+
+
+def _expected_conversation_pairs(events: Sequence[Any], *, runtime: str | None = None) -> list[tuple[str, str]]:
     if any(hasattr(event, "seq") for event in events):
         return [
-            (_event_type(event).removesuffix("_message"), text)
+            (_event_type(event).removesuffix("_message"), _readable_text(event, text, runtime))
             for event in events
             if _event_type(event) in {"user_message", "assistant_message"}
             and _visible_conversation_event(event)
@@ -285,14 +293,15 @@ def _expected_conversation_pairs(events: Sequence[Any]) -> list[tuple[str, str]]
     return expected
 
 
-def check_conversation(conversation: Sequence[Any], events: Sequence[Any]) -> list[Violation]:
+def check_conversation(conversation: Sequence[Any], events: Sequence[Any], *,
+                       runtime: str | None = None) -> list[Violation]:
     """Plain conversation exactly matches its ordered, visible event projection."""
     violations = _conversation_roles(conversation)
     actual = [(_message_role(message), _message_text(message)) for message in conversation
               if _message_role(message) in {"user", "assistant"}
               and isinstance(_message_text(message), str)
               and _message_text(message).strip()]
-    expected = _expected_conversation_pairs(events)
+    expected = _expected_conversation_pairs(events, runtime=runtime)
     for role in ("user", "assistant"):
         actual_role = [pair for pair in actual if pair[0] == role]
         expected_role = [pair for pair in expected if pair[0] == role]
@@ -349,7 +358,7 @@ def run_conformance(
         count = len(v1_events)
     if conversation is not None and compare_views:
         basis = list(snapshot.events) if snapshot is not None and snapshot.state == "available" else list(v1_events)
-        violations.extend(check_conversation(conversation, basis))
+        violations.extend(check_conversation(conversation, basis, runtime=runtime))
     return ConformanceReport(runtime=runtime, state=state, event_count=count,
                              violations=tuple(violations))
 
