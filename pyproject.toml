@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sesskit"
-version = "0.2.15"
+version = "0.2.16"
 description = "Parse and export local Claude Code, Codex CLI, and Cursor agent session files from disk. Python transcript parser library and JSON CLI — not a TUI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,7 +27,6 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
