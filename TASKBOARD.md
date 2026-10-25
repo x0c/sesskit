@@ -4,7 +4,6 @@
 
 | 任务 | 状态 | 影响范围 | 开始 | 最近更新 | 备注 |
 |---|---|---|---|---|---|
-| Transient error notification switch (DeepSeek) | Implementing | SessKit terminal error evidence; cli remote push/sessions/config/protocol; iPhone+Mac notification settings | 2026-10-25 | 2026-10-25 | Owner decision: retryable aborts get their own switch, default off; unknown/transient notify only after a 75s settle window; classified terminal failures stay immediate |
 | SessKit verification repair A | 进行中 | src/sesskit/conformance.py, src/sesskit/cli.py (verify only), tests/test_conformance.py, docs/CONTRACT.md, README.md, README.zh-CN.md | 2026-09-30 11:26 | 2026-09-30 11:26 | OpenCode Luna medium; coordinator owns dispatch and release |
 | SessKit portable regression B | 验证中 | tests/test_runtime_goldens.py, docs/RUNTIME_PARSING_KNOWLEDGE_BASE.md, pyproject.toml (version only), src/sesskit/__init__.py (version only) | 2026-09-30 11:26 | 2026-09-30 11:36 | v0.2.2 metadata and English draft notes ready; Low-friction owns other pyproject fields; coordinator owns ship |
 | Codex framing-eviction empty-ID fix | 已完成 | src/sesskit/parsers/codex.py（assistant弱推断永空id）、tests/test_completion_id.py（D3改强终局fixture+弱显示/空id+驱逐用例）；不动其它parser/typed/Corral产品代码/proxy/iOS/版本pin | 2026-10-01 | 2026-10-01 | 42KB驱逐仍DONE显示+空id零推送；真终局可通知且稳定/互异；517全绿+ruff绿；hub/notifier逐段验证；report追加framing-eviction独立节 |

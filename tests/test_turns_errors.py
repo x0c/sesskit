@@ -135,12 +135,29 @@ class ClassifyErrorTest(unittest.TestCase):
         kind, _ = classify_error(kind="provider", message="boom 500")
         self.assertEqual(kind, "provider_error")
 
-    def test_retry_exhaustion_stays_retryable(self):
+    def test_retry_exhaustion_is_terminal(self):
         kind, retryable = classify_error(
             runtime="pi", message="Aborted after 1 retry attempt",
         )
         self.assertEqual(kind, "provider_error")
-        self.assertTrue(retryable)
+        self.assertFalse(retryable)
+        kind, retryable = classify_error(
+            runtime="pi",
+            message="Provider error after 10 retry attempts: Connection reset",
+        )
+        self.assertEqual(kind, "provider_error")
+        self.assertFalse(retryable)
+
+    def test_deterministic_request_errors_are_not_retryable(self):
+        kind, retryable = classify_error(
+            runtime="claude",
+            message="invalid_request_error: tool_use ids must be unique",
+        )
+        self.assertEqual(kind, "provider_error")
+        self.assertFalse(retryable)
+        kind, retryable = classify_error(message="invalid_output: schema mismatch")
+        self.assertEqual(kind, "provider_error")
+        self.assertFalse(retryable)
 
     def test_http_400_is_not_retryable(self):
         kind, retryable = classify_error(

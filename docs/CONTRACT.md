@@ -114,7 +114,11 @@ Rules:
   message stays `unknown`/`None` rather than guessed).
 - The classification is advisory evidence, never a change to `status_tag` or
   `completion_id`. Consumers own the notification policy (for example,
-  separating automatically retryable failures from terminal ones).
+  separating automatically retryable failures from terminal ones). Retry
+  exhaustion ("after N retry attempts") and deterministic request-validation
+  failures (`bad_request` / `invalid_request` / `invalid_output`) are
+  terminal: `terminal_error_retryable=False`, even though the underlying
+  provider class would otherwise be retryable.
 - Filling these fields must not widen the status read window and must not turn
   metadata appends, file timestamps or titles into error evidence.
 - Older consumers ignore the fields; older SessKit builds omit them, which reads

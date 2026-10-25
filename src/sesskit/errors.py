@@ -143,8 +143,9 @@ _TIMEOUT_MARKERS = (
     "request took too long",
 )
 
-#: Paired with a retryable provider failure: the runtime already retried and
-#: gave up. The failure class stays retryable even though this turn is terminal.
+#: The runtime already retried and gave up; the turn is terminal. Retrying the
+#: same occurrence is no longer the runtime's job, so consumers must not treat
+#: this as an automatically recoverable failure and silence it.
 _RETRY_EXHAUSTED_MARKERS = (
     "retry attempt",
     "retry attempts",
@@ -246,15 +247,24 @@ def classify_error(
     if any(marker in text for marker in _TIMEOUT_MARKERS):
         return "timeout", _RETRYABLE["timeout"]
     if any(marker in text for marker in _RETRY_EXHAUSTED_MARKERS):
-        return "provider_error", _RETRYABLE["provider_error"]
+        return "provider_error", False
     if any(marker in text for marker in _TOOL_MARKERS):
         return "tool_error", _RETRYABLE["tool_error"]
     if any(marker in text for marker in _CRASH_MARKERS):
         return "runtime_crash", _RETRYABLE["runtime_crash"]
     # HTTP 4xx request errors (auth, throttling and timeout codes are handled
-    # above) are not auto-retryable provider failures. 400 is the live shape
-    # for invalid request bodies; 404/422 follow the same client-error rule.
+    # above) and deterministic request-validation failures are not
+    # auto-retryable provider failures. 400 is the live shape for invalid
+    # request bodies; 404/422 follow the same client-error rule.
     if re.search(r"(?<![\d])(?:400|404|422)(?![\d])", text):
+        return "provider_error", False
+    if any(
+        marker in text
+        for marker in (
+            "bad_request", "invalid-request", "invalid_request",
+            "invalid-output", "invalid_output", "invalid output",
+        )
+    ):
         return "provider_error", False
     # Legacy producer shorthands stay reachable: bare "provider" means a
     # provider-side failure with no finer evidence; bare "error" defers to
@@ -272,8 +282,6 @@ def classify_error(
             "connection", "econnreset", "etimedout", "timeout", "timed out",
             "stream ended",
             "temporarily unavailable", "bad gateway", "service unavailable",
-            "bad_request", "invalid-request", "invalid_request",
-            "invalid-output", "invalid_output", "invalid output",
             "certificate", "tls handshake", "ssl error",
         )
     ):
