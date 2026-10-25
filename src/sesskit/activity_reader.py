@@ -34,7 +34,11 @@ so clock regression cannot select the wrong branch). The fast path advances
 only when file identity is unchanged, the file did not shrink, the stored
 boundary checksum matches, and appended complete lines extend the known leaf's
 chain. A no-change poll performs metadata checks only. A trailing partial
-line (concurrent writer) is held back until its newline arrives.
+line (concurrent writer) is held back until its newline arrives. A cold or
+reset build streams fixed-size read batches instead of reading whole-file
+bytes and splitting every line at once; the parsed native entry map needed
+for branch reconstruction is still retained, so this bounds transient copies,
+not the retained generation.
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -191,6 +195,64 @@ def _split_complete(data: bytes) -> tuple[list[bytes], bytes]:
     return complete, remainder
 
 
+# ``bytes.splitlines`` breaks on ``\r``, ``\n`` and ``\r\n`` only. The
+# streaming splitter below must commit exactly the lines that
+# ``_split_complete`` commits for the same bytes, so it reads the same
+# terminators; ``_READ_CHUNK_BYTES`` bounds the transient read buffer.
+# ``bytearray.find`` uses the bytes fast path; scanning with ``re`` would
+# copy the whole pending buffer for every probe and dominate a large file.
+_READ_CHUNK_BYTES = 1 << 20
+
+
+def _iter_committed_lines(
+    handle: Any, chunk_size: int = _READ_CHUNK_BYTES,
+) -> Iterator[bytes]:
+    """Yield the complete lines of a file without materializing it whole.
+
+    Equal by construction to iterating ``_split_complete(whole_file)[0]``:
+    a trailing record without a newline is held back, and a trailing lone
+    ``\r`` stays unconsumed until the next byte arrives (it may become
+    ``\r\n``) or the file ends, so committed offsets and the boundary-line
+    checksum match the full-file split. Only one read batch plus the current
+    incomplete line live at a time; complete lines are yielded as bytes.
+    """
+    pending = bytearray()
+    scan_pos = 0
+    while True:
+        chunk = handle.read(chunk_size)
+        if not chunk:
+            break
+        pending.extend(chunk)
+        line_start = 0
+        pos = scan_pos
+        size = len(pending)
+        while pos < size:
+            newline = pending.find(b"\n", pos)
+            limit = newline if newline != -1 else size
+            carriage = pending.find(b"\r", pos, limit)
+            if carriage == -1:
+                if newline == -1:
+                    pos = size
+                    break
+                # ``\n`` ends the line (``\r\n`` is already included).
+                end = newline + 1
+            elif carriage + 1 >= size:
+                # A trailing lone ``\r`` may still become ``\r\n``.
+                pos = carriage
+                break
+            elif pending[carriage + 1] == 0x0A:
+                end = carriage + 2
+            else:
+                end = carriage + 1
+            yield bytes(memoryview(pending)[line_start:end])
+            line_start = end
+            pos = end
+        scan_pos = pos
+        if line_start:
+            del pending[:line_start]
+            scan_pos -= line_start
+
+
 def _parse_lines(lines: list[bytes]) -> tuple[list[dict], int]:
     entries: list[dict] = []
     for raw in lines:
@@ -201,6 +263,34 @@ def _parse_lines(lines: list[bytes]) -> tuple[list[dict], int]:
         if isinstance(item, dict):
             entries.append(item)
     return entries, len(lines)
+
+
+def _read_entries(path: str) -> tuple[list[dict], int, bytes, int, int]:
+    """Stream one whole JSONL file into its retained parsed entries.
+
+    Returns ``(entries, committed_bytes, last_complete_line, line_count,
+    bytes_read)``. Every complete line consumes one line number even when it
+    is malformed or not an object, matching ``_parse_lines`` over
+    ``_split_complete``. Only the parsed entries (which Pi retains for its
+    native tree) survive; whole-file bytes and the split-line list do not.
+    """
+    entries: list[dict] = []
+    lines = 0
+    committed = 0
+    last_line = b""
+    with open(path, "rb") as handle:
+        for raw in _iter_committed_lines(handle):
+            lines += 1
+            committed += len(raw)
+            last_line = raw
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(item, dict):
+                entries.append(item)
+        total = handle.tell()
+    return entries, committed, last_line, lines, total
 
 
 class PiActivityReader(ActivityReader):
@@ -321,17 +411,13 @@ class PiActivityReader(ActivityReader):
             self._consume_appended(handle, stat)
 
     def _cold_open(self, stat: os.stat_result) -> None:
-        with open(self._path, "rb") as handle:
-            data = handle.read()
-        self.bytes_read += len(data)
-        lines, _remainder = _split_complete(data)
-        size = len(data) - len(_remainder)
-        entries, parsed = _parse_lines(lines)
+        entries, size, last_line, parsed, total = _read_entries(self._path)
+        self.bytes_read += total
         self.lines_parsed += parsed
         self.full_parses += 1
         saved = self._pending_cursor
         self._pending_cursor = None
-        self._adopt_full(stat, entries, size, lines, fresh_gen=1)
+        self._adopt_full(stat, entries, size, last_line, fresh_gen=1)
         self._initialized = True
         resumed = saved is not None and self._cursor_matches(saved, stat, size)
         if resumed:
@@ -348,15 +434,11 @@ class PiActivityReader(ActivityReader):
             self._new_events = list(self._events)
 
     def _rebuild(self, stat: os.stat_result, reason: str) -> None:
-        with open(self._path, "rb") as handle:
-            data = handle.read()
-        self.bytes_read += len(data)
-        lines, _remainder = _split_complete(data)
-        size = len(data) - len(_remainder)
-        entries, parsed = _parse_lines(lines)
+        entries, size, last_line, parsed, total = _read_entries(self._path)
+        self.bytes_read += total
         self.lines_parsed += parsed
         self.full_parses += 1
-        self._adopt_full(stat, entries, size, lines, fresh_gen=self._gen + 1)
+        self._adopt_full(stat, entries, size, last_line, fresh_gen=self._gen + 1)
         self._initialized = True
         self._last_reset = True
         self._new_events = list(self._events)
@@ -366,7 +448,7 @@ class PiActivityReader(ActivityReader):
         stat: os.stat_result,
         entries: list[dict],
         size: int,
-        lines: list[bytes],
+        last_line: bytes,
         fresh_gen: int,
     ) -> None:
         branch = scan_pi.active_messages(entries)
@@ -391,10 +473,9 @@ class PiActivityReader(ActivityReader):
         self._outcome = _pi_outcome(branch) if events else SessionOutcome("unknown", Evidence("unknown"))
         self._state = "available" if events else "empty"
         self._size = size
-        if lines:
-            last = lines[-1]
-            self._line_start = size - len(last)
-            self._boundary = _boundary_checksum(last)
+        if last_line:
+            self._line_start = size - len(last_line)
+            self._boundary = _boundary_checksum(last_line)
         else:
             self._line_start = size
             self._boundary = _boundary_checksum(b"")

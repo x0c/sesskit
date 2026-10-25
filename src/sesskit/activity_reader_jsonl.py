@@ -7,15 +7,14 @@ A reader feeds one appended byte batch per poll while the feed object
 carries interpretation state across polls, so the incremental outcome
 always equals the snapshot outcome function over the same bytes.
 
-Cold open builds the full interpretation in one pass (a bounded tail
-window of events is *returned*, but sequence numbers are snapshot-global:
-the window always equals the matching suffix of the snapshot). Local
-measurement motivates this: the largest histories on this machine
-(91 MB Codex, 63 MB Claude) are dominated by a few huge tool-output
-lines and parse in ~0.15 s into hundreds of events, so one full build
-per open is cheap while steady-state polls parse only appended bytes.
-Parsed rows are freed after each build; only events plus the compact
-feed maps are retained.
+Cold open builds the full interpretation in one streaming pass over
+fixed-size read batches (a bounded tail window of events is *returned*, but
+sequence numbers are snapshot-global: the window always equals the matching
+suffix of the snapshot). Whole-file bytes, every split line and every parsed
+row are never resident together: each batch is parsed and fed to the shared
+feed before the next batch is read, so the transient peak follows the read
+batch rather than the file size. Only events plus the compact feed maps are
+retained, and steady-state polls parse only appended bytes.
 
 Cursor shape (opaque, versioned, JSON-safe)::
 
@@ -54,6 +53,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from sesskit.activity import (
@@ -72,6 +72,7 @@ from sesskit.activity_reader import (
     PollResult,
     _boundary_checksum,
     _encode_cursor,
+    _iter_committed_lines,
     _split_complete,
     decode_reader_cursor,
 )
@@ -80,6 +81,11 @@ from sesskit.models import ActivityEvent, Evidence, LoadState, SessionOutcome
 _TAIL_EVENTS_DEFAULT = 200
 _HEAD_FP_BYTES = 4096
 _AUX_CALL_CAP = 500
+# Cold/rebuild batches: feed at most this many parsed rows or source bytes
+# before handing them to the shared interpreter. Both bounds are transient;
+# the interpreter (and the retained materialized events) is unchanged.
+_ROW_BATCH_ROWS = 1024
+_ROW_BATCH_BYTES = 2 << 20
 
 
 def _head_checksum(handle: Any, length: int) -> str:
@@ -238,6 +244,9 @@ class _JsonlActivityReaderBase(ActivityReader):
 
     def _aux_state(self) -> dict[str, Any]:
         raise NotImplementedError
+
+    def _finish_rebuild(self, feed: Any) -> None:
+        """Hook run once after the last rebuild batch, before events are read."""
 
     # -- public protocol ---------------------------------------------------
 
@@ -407,40 +416,72 @@ class _JsonlActivityReaderBase(ActivityReader):
         self._rebuild(stat, fresh_gen=self._gen + 1)
 
     def _rebuild(self, stat: os.stat_result, fresh_gen: int, tail: bool = False) -> None:
-        """Full build in one pass; parsed rows are freed afterwards.
+        """Full build in one streaming pass; transient buffers stay bounded.
+
+        The file is read in fixed-size batches and each batch of complete
+        lines is parsed and fed straight into the shared row-sequence
+        interpreter before the next batch, so whole-file bytes, all split
+        lines, and all parsed rows never exist together. Only the materialized
+        events plus the compact feed maps are retained. Line numbers, the
+        committed offset, the boundary line/checksum, and reset/generation
+        semantics are identical to the previous whole-file build.
 
         When ``tail`` is true (cursor-less cold open) only the tail window
         of events is delivered, keeping the response bounded while seqs
         stay snapshot-global.
         """
-        with open(self._path, "rb") as handle:
-            data = handle.read()
-            head_len = min(_HEAD_FP_BYTES, len(data))
-            head = _head_checksum(handle, head_len)
-        self.bytes_read += len(data)
-        lines, _remainder = _split_complete(data)
-        committed = len(data) - len(_remainder)
-        rows = _parse_json_rows(lines)
-        self.lines_parsed += len(lines)
-        self.full_parses += 1
         feed = self._new_feed()
         acc = self._new_acc()
-        feed.feed(rows)
+        batch: list[tuple[int, dict]] = []
+        batch_bytes = 0
+        lineno = 0
+        committed = 0
+        last_line = b""
+
+        def drain() -> None:
+            nonlocal batch, batch_bytes
+            if not batch:
+                return
+            feed.feed(batch)
+            for row_lineno, entry in batch:
+                acc.add(row_lineno, entry)
+            batch = []
+            batch_bytes = 0
+
+        with open(self._path, "rb") as handle:
+            for raw in _iter_committed_lines(handle):
+                lineno += 1
+                committed += len(raw)
+                last_line = raw
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    item = None
+                if isinstance(item, dict):
+                    batch.append((lineno, item))
+                    batch_bytes += len(raw)
+                    if len(batch) >= _ROW_BATCH_ROWS or batch_bytes >= _ROW_BATCH_BYTES:
+                        drain()
+            drain()
+            total = handle.tell()
+            head_len = min(_HEAD_FP_BYTES, total)
+            head = _head_checksum(handle, head_len)
+        self.bytes_read += total
+        self.lines_parsed += lineno
+        self.full_parses += 1
+        self._finish_rebuild(feed)
         feed.finish_snapshot()
-        for lineno, entry in rows:
-            acc.add(lineno, entry)
         self._feed = feed
         self._acc = acc
         self._events = feed.events
         self._outcome = acc.result()
         self._state = "available" if feed.events else "empty"
         self._size = committed
-        self._next_lineno = len(lines) + 1
-        last = lines[-1] if lines else b""
-        self._last_line = last
-        if last:
-            self._line_start = committed - len(last)
-            self._boundary = _boundary_checksum(last)
+        self._next_lineno = lineno + 1
+        self._last_line = last_line
+        if last_line:
+            self._line_start = committed - len(last_line)
+            self._boundary = _boundary_checksum(last_line)
         else:
             self._line_start = committed
             self._boundary = _boundary_checksum(b"")
@@ -605,6 +646,24 @@ class CodexActivityReader(_JsonlActivityReaderBase):
 
     def _new_acc(self) -> _CodexOutcomeAcc:
         return _CodexOutcomeAcc()
+
+    def _finish_rebuild(self, feed: _CodexFeed) -> None:
+        """Re-link token usage once, exactly like the single full-file feed.
+
+        The shared feed links usage at the end of every batch. A bounded
+        cold build therefore has to clear the provisional links made at
+        earlier batch boundaries and run the feed's own idempotent linker
+        again over the complete usage map: the snapshot attaches a turn's
+        usage to the last assistant message of that turn, not to whichever
+        message existed when a batch ended. No rows are re-parsed or kept.
+        """
+        if not feed.usages:
+            return
+        events = feed.events
+        for index, event in enumerate(events):
+            if event.usage is not None:
+                events[index] = replace(event, usage=None)
+        feed.feed([])
 
     def _aux_state(self) -> dict[str, Any]:
         feed = self._feed
