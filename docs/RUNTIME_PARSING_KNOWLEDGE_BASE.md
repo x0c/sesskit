@@ -97,6 +97,18 @@ For status inference, each parser maps its native tail signals to the shared
 4. `scan_signature()` returns a cheap list-level version: it must stay stable
    under streaming writes (notably the Cursor WAL exclusion below).
 
+### Refresh flow (single hot session)
+
+1. `refresh_session(session, host=...)` re-derives one already listed session
+   through the same runtime builder as the next scan; list filters and liveness
+   are not applied.
+2. Pi shares the list memo and an incremental entries reader: unchanged files
+   are not reread, and an append parses only the new complete lines. OpenCode v2
+   shares the list memo keyed by the session row plus per-session message
+   aggregate, so a WAL write in another session does not rebuild this one.
+3. A missing history, unknown runtime, or history that no longer yields a
+   session returns `None`; callers keep their last scan result.
+
 ### Load flow (conversation path)
 
 1. Public entry `registry.py load_session_conversation()` accepts a session
@@ -197,6 +209,8 @@ never proves termination; open-file evidence outranks the name match.
 | Shared tool-kind map | `src/sesskit/parsers/common.py` | `classify_tool()` | Name-to-kind table (read/edit/write/shell/search/web/task/todo/question); unknown names map to generic |
 | Shared process snapshot | `src/sesskit/parsers/common.py` | `live_pid_snapshot()` | One snapshot reused across scanners to avoid repeated forks during background rescans |
 | List-version signal | each parser module | `scan_signature()` | List-level version for change detection; Cursor variant excludes the streaming WAL file |
+| Refresh reuse | `src/sesskit/parsers/pi.py`, `src/sesskit/parsers/opencode.py` | `refresh_session()`, `_memoized_session_info()`, `_memoized_session_info_v2()` | Single-session refresh uses the same list memo as scans; OpenCode reads the per-session row/message version first, Pi reuses parsed JSONL prefixes under verified appends |
+| Pi incremental entries | `src/sesskit/parsers/pi.py` | `_read_session_entries()`, `_PiEntryCache` | Bounded LRU of compact parsed entries; head plus last-committed-line checksums guard append reuse; replacement, truncation, same-size rewrite and checksum mismatch rebuild |
 | Delete session file | `codex.py`, `kimi.py`, `pi.py` | `delete_session()` | Test and maintenance helper; production CLI never deletes history |
 | Clone session record | `kimi.py` | `clone_session()` | Test helper duplicating a session record shape |
 | File-change signature | `src/sesskit/parsers/common.py`, `src/sesskit/cache.py` | `stat_signature()`, `file_signature()` | Device plus inode plus size plus mtime-ns; used for cache keys and change detection |
@@ -288,6 +302,9 @@ with an explicit flag to bring them back where the runtime supports it.
 
 - **AI pitfall** 【Forbidden】Treat an image-first Claude prompt as noise or drop the session -> must strip only leading image markers for the fallback title and keep the full prompt in history (reason: the marker plus human text is a real session; dropping it loses recoverable history).
 - **AI pitfall** 【Hidden dependency】Before trusting a tool-heavy Claude tail, backfill excerpts from a wider backward read, but keep status and completion identity on the original bounded window -> else a mid-turn assistant sentence becomes a false `STATUS_DONE` and a false completion notification.
+- **AI pitfall** 【Forbidden】Reuse a Pi parsed prefix from inode/size alone -> must also verify the frozen head checksum and the last committed line, rebuild on replacement, truncation, same-size stamp changes or checksum mismatch, and never commit a trailing line before its newline; otherwise a rewrite can serve stale branch/status evidence.
+- **AI pitfall** 【Implicit semantics】Pi refresh and list share one memo versioned by the complete file stamp plus host key, while the entries cache is only an append accelerator -> when changing status, excerpt or branch logic, check both the cached and uncached builders produce identical `SessionInfo` values.
+- **AI pitfall** 【Hidden dependency】OpenCode v2 refresh must read the per-session message aggregate before the memo lookup just like a scan -> otherwise a WAL write in an unrelated session rebuilds every hot session, or a stale record is returned without a version check.
 - **AI pitfall** 【Forbidden】Resume a Claude session by its scanned id without checking the `continued-in` chain -> must resolve through `superseded_by` / `resolve_continuation()` first (reason: background resume may continue the conversation under a new id; the old id still opens but misses everything written to the new file). The pointer may sit outside the head+tail scan windows, so the continuation sweep reads the full file with a `continued-in` substring pre-filter and stays cached per path; missing targets and cycles resolve to the last readable id, never an error.
 - **AI pitfall** 【Implicit semantics】Cursor list versioning automatically excludes the streaming WAL while conversation versioning automatically includes it at `parsers/cursor.py scan_signature()`; when changing either version key also check the other, else live writes either spam list rescans or stale previews serve checkpointed text only.
 - **AI pitfall** 【Forbidden】Drop a Cursor chat from listings just because `meta.json` has no title and `prompt_history.json` is absent -> when `store.db` holds message blobs the session is real (fresh `--print` one-shots, 2026-09-30 live evidence) and must list with `STATUS_NONE` plus empty excerpts/title; only blob-less shells and missing stores stay unlisted. Never scan blobs or fabricate excerpts at list time to fill the row.
@@ -317,6 +334,7 @@ with an explicit flag to bring them back where the runtime supports it.
 - After changing transcript or tool mapping: run `python3 -m pytest tests/test_transcript.py tests/test_transcript_opencode_v2.py -q` and confirm event counts and role filtering hold.
 - After changing Cursor or OpenCode versioning: run `python3 -m pytest tests/test_scan_opencode_join_order.py tests/test_scan_opencode_v2.py -q` plus a live two-step check: `sesskit list --top 5 --compact`, then `sesskit show <session-id> --full`, and confirm the preview reflects uncheckpointed tails without list spam.
 - After changing Pi branch or error handling: run `python3 -m pytest tests/test_activity.py -q` and sample the exact live Pi session file through `load_session_conversation` plus `load_events`, asserting `status_tag`, `last_agent_msg`, and trailing error events on the same path.
+- After changing refresh reuse or Pi incremental entries: run `python3 -m pytest tests/test_refresh_session.py tests/test_scan_list_memo.py -q`; compare every refreshed record with the uncached builder across append, replacement, truncation, same-size rewrite, partial line, branch switch, compaction and malformed-record cases, and prove an unrelated OpenCode session write does not rebuild untouched sessions.
 - After changing Codex liveness: run `python3 -m pytest tests/test_codex_liveness.py tests/test_process_snapshot.py tests/test_completion_id.py -q` and verify live marking against open rollout files rather than process-name matches alone.
 - Live runtime sweep (required when parsers change and histories exist): for every installed runtime with sessions, verify `load_session_conversation` succeeds, roles are only `user` / `assistant`, no empty text, no literal `"None"`, no system-injection markers in plain user turns, and every plain user text appears in `load_events` user texts. Prefer one fresh success prompt plus one reproducible abnormal prompt per runtime on the exact session path.
 - After changing ephemeral or missing-directory filters: run `python3 -m pytest tests/test_ephemeral_workspace.py -q` and manually verify a manager-job path plus a marker-ignored workspace stay unlisted even with the archive flag, while a real session under a temp dir still lists.

@@ -1122,7 +1122,10 @@ def refresh_session(
             return _build_session_info(row, db_path, host)
         try:
             row = conn.execute(_SESSION_SQL_V2, (session_id,)).fetchone()
-            return _build_session_info_v2(conn, row, db_path, host) if row is not None else None
+            if row is None:
+                return None
+            versions = _v2_session_versions(conn, [session_id])
+            return _memoized_session_info_v2(conn, row, db_path, host, versions)
         except sqlite3.Error:
             return None
     finally:

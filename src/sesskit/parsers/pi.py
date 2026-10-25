@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from sesskit import titles
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
@@ -88,6 +92,307 @@ def read_entries(path: str) -> list[dict]:
     return entries
 
 
+# Full Pi entries are large dicts, but the list builder reads only a small
+# stable projection. Keep that projection in the append cache so a hot session
+# does not retain parser-only fields.
+_ENTRY_FIELDS = ("type", "id", "parentId", "timestamp", "name", "cwd")
+_MESSAGE_FIELDS = ("role", "content", "stopReason", "errorMessage", "timestamp")
+_ENTRY_HEAD_BYTES = 4096
+_ENTRY_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_ENTRY_CACHE_MAX_FILES = 64
+
+
+def _compact_entry(item: dict) -> dict:
+    """Projection used by the list builder and branch walk."""
+    compact = {key: item[key] for key in _ENTRY_FIELDS if key in item}
+    message = item.get("message")
+    if isinstance(message, dict):
+        compact["message"] = {
+            key: message[key] for key in _MESSAGE_FIELDS if key in message
+        }
+    return compact
+
+
+def _parse_entry_lines(lines: list[bytes]) -> tuple[dict, ...]:
+    parsed: list[dict] = []
+    for raw in lines:
+        try:
+            item = json.loads(raw.decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(item, dict):
+            parsed.append(_compact_entry(item))
+    return tuple(parsed)
+
+
+def _parse_entry_tail(raw: bytes) -> dict | None:
+    if not raw:
+        return None
+    items = _parse_entry_lines([raw])
+    return items[0] if items else None
+
+
+@dataclass(frozen=True)
+class _PiEntryCache:
+    """Committed JSONL prefix plus the uncommitted trailing line, if any."""
+
+    dev: int
+    ino: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    committed: int
+    last_line_start: int
+    head_len: int
+    head_digest: bytes
+    boundary: bytes
+    entries: tuple[dict, ...]
+    tail: dict | None
+    source_bytes: int
+
+
+_ENTRY_CACHE: OrderedDict[str, _PiEntryCache] = OrderedDict()
+_ENTRY_CACHE_BYTES = 0
+_ENTRY_BYTES_READ = 0
+_ENTRY_FULL_PARSES = 0
+_ENTRY_APPEND_READS = 0
+_ENTRY_CACHE_LOCK = threading.Lock()
+_ENTRY_LOCK_STRIPES = 64
+_ENTRY_LOCKS = tuple(threading.Lock() for _ in range(_ENTRY_LOCK_STRIPES))
+
+
+def _entry_path_lock(path: str) -> threading.Lock:
+    return _ENTRY_LOCKS[hash(path) % _ENTRY_LOCK_STRIPES]
+
+
+def _entry_cache_get(path: str) -> _PiEntryCache | None:
+    with _ENTRY_CACHE_LOCK:
+        state = _ENTRY_CACHE.get(path)
+        if state is not None:
+            _ENTRY_CACHE.move_to_end(path)
+        return state
+
+
+def _entry_cache_drop(path: str) -> None:
+    global _ENTRY_CACHE_BYTES
+    with _ENTRY_CACHE_LOCK:
+        state = _ENTRY_CACHE.pop(path, None)
+        if state is not None:
+            _ENTRY_CACHE_BYTES -= state.source_bytes
+
+
+def _entry_cache_put(path: str, state: _PiEntryCache) -> None:
+    global _ENTRY_CACHE_BYTES
+    if state.source_bytes > _ENTRY_CACHE_MAX_BYTES:
+        _entry_cache_drop(path)
+        return
+    with _ENTRY_CACHE_LOCK:
+        previous = _ENTRY_CACHE.pop(path, None)
+        if previous is not None:
+            _ENTRY_CACHE_BYTES -= previous.source_bytes
+        _ENTRY_CACHE[path] = state
+        _ENTRY_CACHE_BYTES += state.source_bytes
+        while (
+            len(_ENTRY_CACHE) > _ENTRY_CACHE_MAX_FILES
+            or _ENTRY_CACHE_BYTES > _ENTRY_CACHE_MAX_BYTES
+        ):
+            _old_path, old = _ENTRY_CACHE.popitem(last=False)
+            _ENTRY_CACHE_BYTES -= old.source_bytes
+
+
+def _entry_cache_stats() -> dict[str, int]:
+    """Observable cache budget and read counters for tests and local benchmarks."""
+    with _ENTRY_CACHE_LOCK:
+        return {
+            "files": len(_ENTRY_CACHE),
+            "source_bytes": _ENTRY_CACHE_BYTES,
+            "limit_bytes": _ENTRY_CACHE_MAX_BYTES,
+            "limit_files": _ENTRY_CACHE_MAX_FILES,
+            "bytes_read": _ENTRY_BYTES_READ,
+            "full_parses": _ENTRY_FULL_PARSES,
+            "append_reads": _ENTRY_APPEND_READS,
+        }
+
+
+def _entry_cache_clear() -> None:
+    global _ENTRY_CACHE_BYTES, _ENTRY_BYTES_READ, _ENTRY_FULL_PARSES, _ENTRY_APPEND_READS
+    with _ENTRY_CACHE_LOCK:
+        _ENTRY_CACHE.clear()
+        _ENTRY_CACHE_BYTES = 0
+        _ENTRY_BYTES_READ = 0
+        _ENTRY_FULL_PARSES = 0
+        _ENTRY_APPEND_READS = 0
+
+
+def _state_entries(state: _PiEntryCache) -> list[dict]:
+    entries = list(state.entries)
+    if state.tail is not None:
+        entries.append(state.tail)
+    return entries
+
+
+def _entry_stamp(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _build_entry_state(data: bytes, stat: os.stat_result) -> _PiEntryCache | None:
+    last_newline = data.rfind(b"\n")
+    if last_newline >= 0:
+        committed = last_newline + 1
+        raw_lines = data[:committed].split(b"\n")[:-1]
+        tail_raw = data[committed:]
+    else:
+        committed = 0
+        raw_lines = []
+        tail_raw = data
+    head_len = min(_ENTRY_HEAD_BYTES, len(data))
+    return _PiEntryCache(
+        dev=stat.st_dev,
+        ino=stat.st_ino,
+        size=len(data),
+        mtime_ns=stat.st_mtime_ns,
+        ctime_ns=stat.st_ctime_ns,
+        committed=committed,
+        last_line_start=committed - len(raw_lines[-1]) - 1 if raw_lines else committed,
+        head_len=head_len,
+        head_digest=hashlib.sha256(data[:head_len]).digest(),
+        boundary=hashlib.sha256(
+            (raw_lines[-1] + b"\n") if raw_lines else b""
+        ).digest(),
+        entries=_parse_entry_lines(raw_lines),
+        tail=_parse_entry_tail(tail_raw),
+        source_bytes=len(data),
+    )
+
+
+def _read_incremental_entries(path: str) -> tuple[_PiEntryCache | None, list[dict]]:
+    """Read one full state; return the parsed entries for the builder."""
+    global _ENTRY_BYTES_READ, _ENTRY_FULL_PARSES
+    try:
+        before = os.stat(path)
+        with open(path, "rb") as handle:
+            data = handle.read()
+        after = os.stat(path)
+    except OSError:
+        return None, read_entries(path)
+    _ENTRY_BYTES_READ += len(data)
+    _ENTRY_FULL_PARSES += 1
+    if b"\r" in data or _entry_stamp(before) != _entry_stamp(after):
+        # Text mode treats bare CR as a line break; the append cache only
+        # commits LF boundaries. A racing rewrite is also not cacheable.
+        return None, read_entries(path)
+    state = _build_entry_state(data, after)
+    return state, _state_entries(state) if state is not None else read_entries(path)
+
+
+def _append_entry_state(path: str, stat: os.stat_result, state: _PiEntryCache) -> _PiEntryCache | None:
+    global _ENTRY_BYTES_READ, _ENTRY_APPEND_READS
+    expected = stat.st_size - state.committed
+    if expected < 0:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(state.head_len)
+            length = state.committed - state.last_line_start
+            handle.seek(state.last_line_start)
+            boundary_line = handle.read(length)
+            handle.seek(state.committed)
+            chunk = handle.read(expected)
+        after = os.stat(path)
+    except OSError:
+        return None
+    _ENTRY_BYTES_READ += len(head) + len(boundary_line) + len(chunk)
+    if _entry_stamp(after) != _entry_stamp(stat):
+        return None
+    if hashlib.sha256(head).digest() != state.head_digest:
+        return None
+    if hashlib.sha256(boundary_line).digest() != state.boundary:
+        return None
+    if len(chunk) != expected or b"\r" in chunk:
+        return None
+    _ENTRY_APPEND_READS += 1
+    last_newline = chunk.rfind(b"\n")
+    if last_newline < 0:
+        committed = state.committed
+        entries = state.entries
+        last_line_start = state.last_line_start
+        boundary = state.boundary
+        tail_raw = chunk
+    else:
+        committed = state.committed + last_newline + 1
+        lines = chunk[: last_newline + 1].split(b"\n")[:-1]
+        entries = state.entries + _parse_entry_lines(lines)
+        last_line_start = committed - len(lines[-1]) - 1
+        boundary = hashlib.sha256(lines[-1] + b"\n").digest()
+        tail_raw = chunk[last_newline + 1:]
+    observed = committed + len(tail_raw)
+    head_len = state.head_len
+    head_digest = state.head_digest
+    if head_len == 0 and observed:
+        head_len = min(_ENTRY_HEAD_BYTES, observed)
+        head_digest = hashlib.sha256(chunk[:head_len]).digest()
+    return _PiEntryCache(
+        dev=after.st_dev,
+        ino=after.st_ino,
+        size=observed,
+        mtime_ns=after.st_mtime_ns,
+        ctime_ns=after.st_ctime_ns,
+        committed=committed,
+        last_line_start=last_line_start,
+        head_len=head_len,
+        head_digest=head_digest,
+        boundary=boundary,
+        entries=entries,
+        tail=_parse_entry_tail(tail_raw),
+        source_bytes=observed,
+    )
+
+
+def _read_session_entries(path: str) -> list[dict]:
+    """Entries for the list builder, reusing a verified appended prefix.
+
+    The path lock serializes concurrent refresh/scan calls for one history.
+    A state is reused only while the whole-file stamp matches; growth is
+    accepted only after the frozen head and last committed line still match.
+    Any uncertainty drops the cache and rebuilds from the file.
+    """
+    with _entry_path_lock(path):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            _entry_cache_drop(path)
+            return read_entries(path)
+        state = _entry_cache_get(path)
+        if (
+            state is not None
+            and state.dev == stat.st_dev
+            and state.ino == stat.st_ino
+        ):
+            if (
+                stat.st_size == state.size
+                and stat.st_mtime_ns == state.mtime_ns
+                and stat.st_ctime_ns == state.ctime_ns
+            ):
+                return _state_entries(state)
+            if stat.st_size > state.size:
+                appended = _append_entry_state(path, stat, state)
+                if appended is not None:
+                    _entry_cache_put(path, appended)
+                    return _state_entries(appended)
+        state, entries = _read_incremental_entries(path)
+        if state is None:
+            _entry_cache_drop(path)
+        else:
+            _entry_cache_put(path, state)
+        return entries
+
+
 def active_messages(entries: list[dict]) -> list[dict]:
     """从当前叶子沿 parentId 回溯，避免预览已分叉出去的旧分支。
 
@@ -139,7 +444,20 @@ def _build_session_info(
     path: str,
     host: HostExtension | None = None,
 ) -> tuple[SessionInfo, float] | None:
-    entries = _read_entries(path)
+    return _build_session_info_from_entries(path, _read_session_entries(path), host)
+
+
+def _build_session_info_from_entries(
+    path: str,
+    entries: list[dict],
+    host: HostExtension | None = None,
+) -> tuple[SessionInfo, float] | None:
+    """Build one list record from an entry sequence.
+
+    Exposed for parity tests: passing ``read_entries(path)`` exercises the
+    uncached interpretation, while production scans pass the verified
+    incremental sequence.
+    """
     if not entries or entries[0].get("type") != "session":
         return None
     header = entries[0]
@@ -358,11 +676,14 @@ def refresh_session(
     """
     path = str(session.get("path") or "")
     if not path.endswith(".jsonl") or not os.path.isfile(path):
+        _entry_cache_drop(path)
         return None
     try:
-        built = _build_session_info(path, host)
+        stat = os.stat(path)
     except OSError:
+        _entry_cache_drop(path)
         return None
+    built = _memoized_session_info(path, _file_stamp(stat), host)
     return built[0] if built is not None else None
 
 

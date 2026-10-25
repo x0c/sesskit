@@ -130,6 +130,7 @@ pointing at the describe command itself.
 | Print command help as data | `src/sesskit/cli.py` | `cmd_describe()`, `_describe_command()` | Unknown names route back to describe hints |
 | Dispatch argv | `src/sesskit/cli.py` | `build_parser()`, `dispatch()`, `main()` | JSON argument parser plus subcommand routing |
 | Build success or error envelopes | `src/sesskit/envelope.py` | `ok()`, `err()`, `print_envelope()` | Single envelope shape with version meta |
+| Refresh one hot session | `src/sesskit/registry.py` | `refresh_session()` | Same builder and memo as the next scan; no list filters or liveness |
 | Trim and resolve titles | `src/sesskit/cli.py` | `_trim()`, `_resolve_title()`, `_apply_fields()`, `_apply_top()` | Bounded display helpers shared by list and search |
 | Guard output paths | `src/sesskit/paths.py` | `assert_not_history_path()`, `atomic_write_json()` | Realpath comparison against protected history paths; temp-plus-replace writes |
 | Sign file changes | `src/sesskit/cache.py` | `file_signature()` | Device plus inode plus size plus mtime-ns for cache keys |
