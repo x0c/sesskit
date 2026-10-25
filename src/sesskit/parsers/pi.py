@@ -10,7 +10,9 @@ from collections.abc import Mapping
 from sesskit import titles
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
 from sesskit.parsers.common import (
+    MEMO_MISS,
     HostExtension,
+    ListRecordMemo,
     ephemeral_prefixes_for,
     host_session_ident,
     is_ephemeral_agent_cwd,
@@ -246,6 +248,34 @@ def scan_signature() -> tuple | None:
     return (stat_signature(paths), live_pid_snapshot("pi"))
 
 
+# Unchanged files keep their built record across scans: a long-lived scanner
+# otherwise rereads every listed JSONL whenever one session appends.
+_LIST_MEMO = ListRecordMemo()
+
+
+def _file_stamp(info: os.stat_result) -> tuple[int, int, int, int]:
+    return (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _memoized_session_info(
+    path: str,
+    stamp: tuple[int, int, int, int],
+    host: HostExtension | None,
+) -> tuple[SessionInfo, float] | None:
+    """``_build_session_info`` reused while the file stamp and host inputs match.
+
+    The stamp is taken before the build, so a write racing the parse only makes
+    the next scan rebuild; it can never pin an older record to a newer file.
+    """
+    version = (stamp, ListRecordMemo.host_key(host))
+    cached = _LIST_MEMO.get(path, version)
+    if cached is not MEMO_MISS:
+        return cached  # type: ignore[return-value]
+    built = _build_session_info(path, host)
+    _LIST_MEMO.put(path, version, built)
+    return built
+
+
 def scan_sessions(
     cwd_filter: str | None = None,
     limit: int = 50,
@@ -262,23 +292,23 @@ def scan_sessions(
         if (host is not None and host.is_isolation_dir is not None)
         else (lambda directory: False)
     )
-    keep_ids = {str(item) for item in (keep_ids or ()) if item}
-    candidates: list[tuple[float, str]] = []
+    candidates: list[tuple[float, str, tuple[int, int, int, int]]] = []
     for root, _dirs, names in os.walk(SESSIONS_DIR):
         for name in names:
             if not name.endswith(".jsonl"):
                 continue
             path = os.path.join(root, name)
             try:
-                candidates.append((os.stat(path).st_mtime, path))
+                stat_info = os.stat(path)
             except OSError:
                 continue
+            candidates.append((stat_info.st_mtime, path, _file_stamp(stat_info)))
     results: list[SessionInfo] = []
     created_ts: dict[str, float] = {}
     heap_kept = 0
     isolated_kept = 0
     seen_ids: set[str] = set()
-    for _mtime, path in sorted(candidates, reverse=True):
+    for _mtime, path, stamp in sorted(candidates, reverse=True):
         isolated = bool(is_isolation_dir(os.path.dirname(path)))
         over_quota = isolated_kept >= limit if isolated else heap_kept >= limit
         file_id = _session_id_from_path(path) or ""
@@ -286,7 +316,7 @@ def scan_sessions(
             if heap_kept >= limit and isolated_kept >= limit and not keep_ids:
                 break
             continue
-        built = _build_session_info(path, host)
+        built = _memoized_session_info(path, stamp, host)
         if built is None:
             continue
         info, created = built

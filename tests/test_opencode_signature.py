@@ -3,8 +3,8 @@
 Contract under test (docs/CONTRACT.md, Runtime-specific restore semantics,
 OpenCode item): `scan_signature` must not embed `opencode.db-wal` mtime.
 It is a read-only content fingerprint per database, hashing all row values
-for the tracked session/message tables in stable key order, plus the
-live-process snapshot. Busy/locked/missing-table databases fall back to the
+for the tracked session/message tables in stable key order (message bodies by
+byte length), plus the live-process snapshot. Busy/locked/missing-table databases fall back to the
 old file-mtime behavior without raising.
 
 These tests build synthetic databases (WAL mode on, like production) and
@@ -303,6 +303,17 @@ class SignatureTests(unittest.TestCase):
         after = self._list_info(session_id)
         self.assertEqual(after["status_tag"], titles.STATUS_PENDING)
         self.assertEqual(after["last_agent_msg"], "")
+
+    def test_body_length_change_without_timestamp_flips(self):
+        # Bodies are fingerprinted by byte length (not content) so the
+        # signature never reads message bodies; a rewrite that keeps
+        # time_updated but changes the body length must still flip.
+        before = self._sig()
+        self._write(
+            "UPDATE message SET data = ? WHERE id = 'm1'",
+            (json.dumps({"role": "user", "error": {"name": "X"}}),),
+        )
+        self.assertNotEqual(self._sig(), before)
 
     def test_v2_inplace_update_flips(self):
         before = self._sig()

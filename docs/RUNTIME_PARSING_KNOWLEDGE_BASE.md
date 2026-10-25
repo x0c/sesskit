@@ -267,6 +267,7 @@ pipelines.
 | Version | List-level `scan_signature` | `scan_signature()` in each parser module | Cheap list-change detection; Cursor variant excludes the streaming WAL so live writes do not invalidate the whole list every few seconds |
 | Version | Conversation-level `extra_version` | Cursor scanner cache key including WAL state | Preview freshness for uncheckpointed tails; never collapse with the list-level key |
 | Cache | Session / conversation cache slots | `src/sesskit/cache.py` `file_signature()`, `NullSessionCache` | Default no-op cache; file signature is device plus inode plus size plus mtime-ns |
+| Memo | In-process list-record memo | `src/sesskit/parsers/common.py` `ListRecordMemo`; Pi `_LIST_MEMO`, OpenCode `_V2_LIST_MEMO` | Bounded LRU of built list records keyed by native source version plus host key; see CONTRACT Listing modes (0.2.19) |
 | Filter | Missing-directory drop | `include_missing_cwd` parameter on scanners | Default drops sessions whose project directory no longer exists; archive flows opt in explicitly |
 | Filter | Ephemeral-workspace drop | `src/sesskit/parsers/common.py` `is_ephemeral_agent_cwd()` | Always drops manager-job and marker-ignored workspaces regardless of the missing-directory flag |
 | Filter | Title-generation sessions | `src/sesskit/titles.py` `is_title_generation_prompt()` | Drops automated title-generation histories from listings |

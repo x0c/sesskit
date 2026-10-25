@@ -7,10 +7,13 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import subprocess
 import sys
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -135,6 +138,52 @@ def host_cache_tag(host: HostExtension | None) -> str:
         tuple(host.ephemeral_prefixes),
         tuple(host.title_noise_prefixes),
     ))
+
+
+MEMO_MISS = object()
+"""Sentinel returned by :meth:`ListRecordMemo.get` when no current record exists."""
+
+
+class ListRecordMemo:
+    """Bounded in-process memo of built list records, keyed by source version.
+
+    A long-lived scanner otherwise rebuilds every listed session whenever any
+    one of them changes. ``version`` must capture every input the builder reads
+    (native source stamps plus :meth:`host_key`); a mismatch is a miss, so a
+    stale record can never be returned. ``None`` results are memoized too.
+    Values are deep-copied in both directions because callers mutate records.
+    """
+
+    def __init__(self, limit: int = 4096) -> None:
+        self._limit = max(1, int(limit))
+        self._entries: OrderedDict[object, tuple[object, object]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def host_key(host: HostExtension | None) -> tuple:
+        """Host inputs that change built records: cache tag plus the transform."""
+        return (host_cache_tag(host), host.excerpt_preprocess if host is not None else None)
+
+    def get(self, key: object, version: object) -> object:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry[0] != version:
+                return MEMO_MISS
+            self._entries.move_to_end(key)
+            value = entry[1]
+        return copy.deepcopy(value)
+
+    def put(self, key: object, version: object, value: object) -> None:
+        stored = copy.deepcopy(value)
+        with self._lock:
+            self._entries[key] = (version, stored)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._limit:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
 
 
 def preprocess_excerpt(text: str | None, host: HostExtension | None) -> str | None:

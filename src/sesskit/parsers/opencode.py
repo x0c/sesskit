@@ -24,7 +24,9 @@ from itertools import groupby
 from sesskit import titles
 from sesskit.models import ConversationMessage, SessionInfo, make_session_info
 from sesskit.parsers.common import (
+    MEMO_MISS,
     HostExtension,
+    ListRecordMemo,
     ephemeral_prefixes_for,
     host_session_ident,
     is_ephemeral_agent_cwd,
@@ -137,6 +139,24 @@ ORDER BY seq ASC, time_created ASC, id ASC
 _V2_SIZE_SQL = """
 SELECT COALESCE(SUM(LENGTH(data)), 0) FROM session_message WHERE session_id = ?
 """
+
+# Byte length of a TEXT/BLOB column without loading the value: SQLite 3.43+
+# answers octet_length() from the record header, so overflow pages holding large
+# message bodies are never read. Older libraries fall back to length(), which
+# still runs inside SQLite instead of transferring the body to Python.
+_DATA_LENGTH_FN = "octet_length" if sqlite3.sqlite_version_info >= (3, 43, 0) else "length"
+
+# Per-session version of the rows `_build_session_info_v2` reads. Inserts and
+# deletions move the count; OpenCode bumps time_updated on every row update; the
+# seq and byte-length sums also catch rewrites that keep the timestamp. Integer
+# SUM stays exact (TOTAL would round millisecond sums above 2**53).
+_V2_VERSIONS_SQL = (
+    "SELECT session_id, COUNT(*), MAX(time_updated), SUM(time_updated), SUM(seq), "
+    f"SUM({_DATA_LENGTH_FN}(data)) FROM session_message "
+    "WHERE session_id IN ({placeholders}) GROUP BY session_id"
+)
+# Stay well inside SQLite's bound-parameter limit (32766 since 3.32).
+_V2_VERSIONS_BATCH = 500
 
 # 非对话行：tail/状态判定与正文提取一律跳过这些 type。
 _V2_SKIP_TYPES = frozenset({"system", "synthetic", "compaction", "idle"})
@@ -644,6 +664,52 @@ def _build_session_info(
     )
 
 
+# Unchanged v2 sessions keep their built record across scans: building one reads
+# and JSON-decodes its whole transcript, and a long-lived scanner otherwise
+# repeats that for every listed session whenever any session in the database
+# changes.
+_V2_LIST_MEMO = ListRecordMemo()
+
+
+def _v2_session_versions(
+    conn: sqlite3.Connection, session_ids: list[str],
+) -> dict[str, tuple] | None:
+    """Per-session message versions, or None when the query fails (no memo)."""
+    versions: dict[str, tuple] = {}
+    try:
+        for start in range(0, len(session_ids), _V2_VERSIONS_BATCH):
+            batch = session_ids[start : start + _V2_VERSIONS_BATCH]
+            query = _V2_VERSIONS_SQL.format(placeholders=", ".join("?" * len(batch)))
+            for version_row in conn.execute(query, batch):
+                versions[str(version_row[0])] = tuple(version_row[1:])
+    except sqlite3.Error:
+        return None
+    return versions
+
+
+def _memoized_session_info_v2(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    db_path: str,
+    host: HostExtension | None,
+    versions: dict[str, tuple] | None,
+) -> dict | None:
+    """``_build_session_info_v2`` reused while the session row and its message
+    version match. Versions are read before the build, so a racing write only
+    makes the next scan rebuild."""
+    if versions is None:
+        return _build_session_info_v2(conn, row, db_path, host)
+    session_id = str(row["id"])
+    version = (tuple(row), versions.get(session_id), ListRecordMemo.host_key(host))
+    key = (db_path, session_id)
+    cached = _V2_LIST_MEMO.get(key, version)
+    if cached is not MEMO_MISS:
+        return cached  # type: ignore[return-value]
+    info = _build_session_info_v2(conn, row, db_path, host)
+    _V2_LIST_MEMO.put(key, version, info)
+    return info
+
+
 def _build_session_info_v2(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -735,7 +801,10 @@ def _build_session_info_v2(
 
 # The list fingerprint hashes every list-driving v1/v2 row in stable key order.
 # Timestamp extrema miss tied/older appends and edits/deletions of non-maximum
-# rows. The part table is intentionally excluded: streaming changes there do not
+# rows. Message bodies (`data`) contribute their byte length, not their content:
+# hashing the bodies read the whole database (26 s CPU on a 1 GB store) on every
+# WAL change, while OpenCode bumps time_updated on each row update anyway. The
+# part table is intentionally excluded: streaming changes there do not
 # invalidate the list signature, as documented in CONTRACT's preview-freshness
 # tradeoff. Read-only connections use a short timeout; busy/locked/old schemas
 # fall back to the legacy mtime signature.
@@ -748,6 +817,9 @@ _SIGNATURE_TABLES = (
     ("session_message", ("id", "session_id", "type", "seq", "time_created",
                           "time_updated", "data")),
 )
+
+# Columns fingerprinted by byte length only (see above).
+_SIGNATURE_LENGTH_ONLY = frozenset({"data"})
 
 _SIGNATURE_CACHE_LIMIT = 8
 _SIGNATURE_FINGERPRINT_CACHE: OrderedDict[
@@ -818,9 +890,15 @@ def _content_fingerprint(db_path: str) -> tuple | None:
             conn.execute("PRAGMA query_only=ON")
         except sqlite3.Error:
             pass
+        conn.row_factory = None  # plain tuples: repr() below must not see Row objects
         result = []
         for table, columns in _SIGNATURE_TABLES:
-            projection = ", ".join(f'"{column}"' for column in columns)
+            projection = ", ".join(
+                f'{_DATA_LENGTH_FN}("{column}")'
+                if column in _SIGNATURE_LENGTH_ONLY
+                else f'"{column}"'
+                for column in columns
+            )
             query = (
                 f'SELECT {projection} FROM "{table}" '
                 f'ORDER BY "{columns[0]}"'
@@ -832,20 +910,10 @@ def _content_fingerprint(db_path: str) -> tuple | None:
                 while batch := cursor.fetchmany(512):
                     for row in batch:
                         row_count += 1
-                        digest.update(b"R")
-                        for value in row:
-                            if value is None:
-                                encoded = b"N"
-                            elif isinstance(value, bytes):
-                                encoded = b"B" + value
-                            elif isinstance(value, int):
-                                encoded = b"I" + str(value).encode("ascii")
-                            elif isinstance(value, float):
-                                encoded = b"F" + value.hex().encode("ascii")
-                            else:
-                                encoded = b"T" + str(value).encode("utf-8")
-                            digest.update(len(encoded).to_bytes(8, "big"))
-                            digest.update(encoded)
+                        # repr() of a tuple of None/int/float/str/bytes is
+                        # unambiguous (quoted, typed, separated) and exact.
+                        digest.update(repr(row).encode("utf-8", "surrogatepass"))
+                        digest.update(b"\n")
                 result.append((table, row_count, digest.hexdigest()))
             except sqlite3.Error:
                 return None
@@ -942,11 +1010,6 @@ def scan_sessions(
     host_marker = host.title_prompt_marker if host is not None else None
     host_prefixes = ephemeral_prefixes_for(host)
     query_limit = max(limit * _SCAN_OVERFETCH, _SCAN_OVERFETCH_MIN, limit)
-    db_paths = _db_paths()
-    successful_queries = 0
-    results: list[dict] = []
-    created_ms: dict[str, int] = {}
-    query_limit = max(limit * _SCAN_OVERFETCH, _SCAN_OVERFETCH_MIN, limit)
     for db_path in db_paths:
         conn = _connect_ro(db_path)
         if conn is None:
@@ -995,9 +1058,10 @@ def scan_sessions(
             continue
         successful_queries += 1
         try:
+            versions = _v2_session_versions(conn, [str(row["id"]) for row in v2_rows])
             for row in v2_rows:
                 try:
-                    info = _build_session_info_v2(conn, row, db_path, host)
+                    info = _memoized_session_info_v2(conn, row, db_path, host, versions)
                 except sqlite3.Error:
                     continue  # 单会话预览失败只跳过该会话，不连累同库其它 v2 行
                 if info is None:
