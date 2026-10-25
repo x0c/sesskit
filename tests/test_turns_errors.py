@@ -135,6 +135,34 @@ class ClassifyErrorTest(unittest.TestCase):
         kind, _ = classify_error(kind="provider", message="boom 500")
         self.assertEqual(kind, "provider_error")
 
+    def test_retry_exhaustion_stays_retryable(self):
+        kind, retryable = classify_error(
+            runtime="pi", message="Aborted after 1 retry attempt",
+        )
+        self.assertEqual(kind, "provider_error")
+        self.assertTrue(retryable)
+
+    def test_http_400_is_not_retryable(self):
+        kind, retryable = classify_error(
+            runtime="opencode", kind="APIError",
+            message="400: reasoning `encrypted_content` was not issued to this call",
+        )
+        self.assertEqual(kind, "provider_error")
+        self.assertFalse(retryable)
+
+    def test_pi_operation_aborted_is_interrupt(self):
+        kind, retryable = classify_error(runtime="pi", message="Operation aborted")
+        self.assertEqual(kind, "user_interrupt")
+        self.assertFalse(retryable)
+
+    def test_pi_stream_ended_is_retryable(self):
+        kind, retryable = classify_error(
+            runtime="pi",
+            message="OpenAI Responses stream ended before a terminal response event",
+        )
+        self.assertEqual(kind, "provider_error")
+        self.assertTrue(retryable)
+
     def test_unclassifiable_stays_unknown(self):
         kind, retryable = classify_error(
             kind="weird", message="something indescribable happened",

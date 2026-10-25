@@ -33,6 +33,7 @@ from sesskit.parsers.common import (
     process_command_line,
     process_environ,
     process_start_time,
+    terminal_error_evidence,
 )
 
 DB_FILENAME = "opencode.db"
@@ -189,13 +190,18 @@ def _v2_msg_time_ms(data: dict) -> float | None:
     return None
 
 
-def _status_tag_v2(typed_rows: list[tuple[str, dict]]) -> str:
-    """v2 末轮状态判定：倒序跳过 system/synthetic/compaction/idle 后首行定状态。
+def _status_and_error_v2(
+    typed_rows: list[tuple[str, dict]],
+) -> tuple[str, dict | None]:
+    """v2 末轮状态判定 + 失败证据：倒序跳过 system/synthetic/compaction/idle。
 
     - user → PENDING；assistant + 非空 error → ABORTED（带 error 永不判 DONE）；
     - finish='stop'（且无 error）→ DONE；tool-calls/缺失/unknown 等 → NONE；
     - 跳过的尾部里若有 idle outcome=failed（异常信号），把 PENDING/NONE 翻成
       ABORTED；已成立的 DONE 不翻（bookkeeping 不推翻无 error 的成功轮）。
+
+    Returns the status plus the assistant data that carried the live error, or
+    ``None`` when the abort came only from idle bookkeeping (unknown evidence).
     """
     idle_failed = False
     for row_type, data in reversed(typed_rows):
@@ -208,15 +214,26 @@ def _status_tag_v2(typed_rows: list[tuple[str, dict]]) -> str:
                 idle_failed = True
             continue
         if row_type == "user":
-            return titles.STATUS_ABORTED if idle_failed else titles.STATUS_PENDING
+            return (
+                titles.STATUS_ABORTED if idle_failed else titles.STATUS_PENDING,
+                None,
+            )
         if row_type == "assistant":
             if isinstance(data, dict) and data.get("error"):
-                return titles.STATUS_ABORTED
+                return titles.STATUS_ABORTED, data
             if isinstance(data, dict) and data.get("finish") == "stop":
-                return titles.STATUS_DONE
-            return titles.STATUS_ABORTED if idle_failed else titles.STATUS_NONE
-        return titles.STATUS_ABORTED if idle_failed else titles.STATUS_NONE
-    return titles.STATUS_ABORTED if idle_failed else titles.STATUS_NONE
+                return titles.STATUS_DONE, None
+            return (
+                titles.STATUS_ABORTED if idle_failed else titles.STATUS_NONE,
+                None,
+            )
+        return titles.STATUS_ABORTED if idle_failed else titles.STATUS_NONE, None
+    return titles.STATUS_ABORTED if idle_failed else titles.STATUS_NONE, None
+
+
+def _status_tag_v2(typed_rows: list[tuple[str, dict]]) -> str:
+    """Compatibility wrapper for callers/tests that only need the verdict."""
+    return _status_and_error_v2(typed_rows)[0]
 
 
 def _cmdline_parts_before_prompt(cmdline: str) -> list[str]:
@@ -528,6 +545,38 @@ def error_text_from_msg(msg: object) -> str:
     return str(name or "").strip()
 
 
+def _error_code_from_msg(msg: object) -> str | None:
+    """Native HTTP status from an OpenCode message error, when present."""
+    if not isinstance(msg, dict):
+        return None
+    err = msg.get("error")
+    if not isinstance(err, dict):
+        return None
+    candidates: list[object] = []
+    data = err.get("data")
+    if isinstance(data, dict):
+        candidates.extend([data.get("statusCode"), data.get("status")])
+    candidates.extend([err.get("statusCode"), err.get("status")])
+    for value in candidates:
+        if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+            return str(value)
+    return None
+
+
+def _error_kind_from_msg(msg: object) -> str:
+    """Native error name/type (e.g. MessageAbortedError, APIError)."""
+    if not isinstance(msg, dict):
+        return ""
+    err = msg.get("error")
+    if not isinstance(err, dict):
+        return ""
+    for key in ("name", "type"):
+        value = str(err.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 
 def _build_session_info(
     row: sqlite3.Row,
@@ -551,12 +600,19 @@ def _build_session_info(
     status = _status_tag(row["last_msg_data"])
     from sesskit.models import completion_id_for
 
+    try:
+        last_msg = json.loads(row["last_msg_data"] or "{}")
+    except (json.JSONDecodeError, ValueError):
+        last_msg = {}
+    terminal_error: dict[str, object] = {}
+    if status == titles.STATUS_ABORTED:
+        terminal_error = terminal_error_evidence(
+            kind=_error_kind_from_msg(last_msg),
+            code=_error_code_from_msg(last_msg),
+            message=error_text_from_msg(last_msg),
+        )
     last_agent_text = str(row["last_agent_text"] or "")
     if not last_agent_text and status == titles.STATUS_ABORTED:
-        try:
-            last_msg = json.loads(row["last_msg_data"] or "{}")
-        except (json.JSONDecodeError, ValueError):
-            last_msg = {}
         last_agent_text = error_text_from_msg(last_msg)
     tail_text = (
         f"{str(row['last_user_text'] or '')[:120]}\n"
@@ -584,6 +640,7 @@ def _build_session_info(
             anchor=str(row["last_msg_key"] or ""),
             tail_text=tail_text,
         ),
+        **terminal_error,
     )
 
 
@@ -623,7 +680,14 @@ def _build_session_info_v2(
     last_agent_text = (
         _v2_assistant_text(assistant_datas[-1]) if assistant_datas else ""
     )
-    status = _status_tag_v2(typed_rows)
+    status, error_data = _status_and_error_v2(typed_rows)
+    terminal_error: dict[str, object] = {}
+    if status == titles.STATUS_ABORTED:
+        terminal_error = terminal_error_evidence(
+            kind=_error_kind_from_msg(error_data),
+            code=_error_code_from_msg(error_data),
+            message=error_text_from_msg(error_data),
+        )
     if not last_agent_text and status == titles.STATUS_ABORTED and assistant_datas:
         last_agent_text = error_text_from_msg(assistant_datas[-1])
 
@@ -665,6 +729,7 @@ def _build_session_info_v2(
             anchor=last_anchor,
             tail_text=tail_text,
         ),
+        **terminal_error,
     )
 
 

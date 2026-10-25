@@ -50,6 +50,12 @@ class SessionInfo(_SessionInfoRequired, total=False):
     # disk; absent means no known continuation. Listings keep the record
     # with this flag; hiding or merging is host policy.
     superseded_by: str
+    # Terminal failure evidence for STATUS_ABORTED rows only: the closed
+    # ErrorKind and the advisory retryable flag from sesskit.errors. Consumers
+    # own the notification policy (e.g. separating retryable failures from
+    # terminal ones). Absent means unknown; never fabricate.
+    terminal_error_kind: str
+    terminal_error_retryable: bool | None
 
 
 @dataclass(frozen=True)

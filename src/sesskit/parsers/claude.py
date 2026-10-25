@@ -24,6 +24,7 @@ from sesskit.parsers.common import (
     is_ephemeral_agent_cwd,
     preprocess_excerpt,
     stat_signature,
+    terminal_error_evidence,
 )
 from sesskit.parsers.common import parse_timestamp as _parse_timestamp
 
@@ -507,6 +508,7 @@ def _build_session_info(
     # Identity tail material for the ABORTED path: the human-readable text of
     # the same error event that set last_error_anchor.
     last_error_msg = ""
+    last_error_entry: object = None
 
     for idx, e in enumerate(tail_entries):
         entry_time = _entry_time(e)
@@ -519,6 +521,7 @@ def _build_session_info(
             last_error_idx = idx
             last_error_anchor = str(e.get("uuid") or e.get("timestamp") or "")
             last_error_msg = err_text
+            last_error_entry = e
             continue
         if t == "ai-title":
             ai_title = _prefer_claude_native_title(ai_title, e.get("aiTitle"))
@@ -575,6 +578,7 @@ def _build_session_info(
             event_time = entry_time
     session_time, time_source = effective_session_time(stat.st_mtime, event_time)
     fallback = _choose_claude_fallback_title(title_candidates, host)
+    terminal_error: dict[str, object] = {}
 
     if last_error_text and last_error_idx > last_content_idx:
         # 上游报错（401/504/连接失败）且之后没有新的正文：本轮死在报错上。
@@ -583,10 +587,16 @@ def _build_session_info(
         last_agent_msg = last_error_text
         id_anchor = last_error_anchor
         id_tail_text = (last_error_msg or "")[:120]
+        terminal_error = terminal_error_evidence(
+            kind="provider",
+            code=native_error_code(last_error_entry) if isinstance(last_error_entry, dict) else None,
+            message=last_error_text,
+        )
     elif last_was_user == "aborted":
         status_tag = titles.STATUS_ABORTED
         id_anchor = ""
         id_tail_text = ""
+        terminal_error = terminal_error_evidence(kind="user_interrupt", message="interrupted by user")
     elif last_was_user is True:
         status_tag = titles.STATUS_PENDING
         id_anchor = ""
@@ -595,6 +605,7 @@ def _build_session_info(
         status_tag = titles.STATUS_ABORTED
         id_anchor = last_text_anchor
         id_tail_text = (last_text_msg or "")[:120]
+        terminal_error = terminal_error_evidence(kind="quota_exhausted", message=last_agent_msg)
     elif last_was_user is False and (last_text_stop == "end_turn" or (last_text_stop is None and not last_text_stop_present)) and not _continued_after(tail_entries, last_text_idx):
         status_tag = titles.STATUS_DONE
         id_anchor = last_text_anchor
@@ -641,6 +652,7 @@ def _build_session_info(
             anchor=id_anchor,
             tail_text=tail_text,
         ),
+        **terminal_error,
     )
 
 

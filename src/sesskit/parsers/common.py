@@ -777,3 +777,25 @@ def open_file_paths(pids: list[int]) -> dict[int, list[str]]:
         if line.startswith("n"):
             result[current].append(line[1:])
     return result
+
+
+def terminal_error_evidence(
+    *, kind: str = "", code: str | int | None = "", message: str = ""
+) -> dict[str, object]:
+    """Optional ``SessionInfo`` evidence for an aborted terminal turn.
+
+    The closed :mod:`sesskit.errors` classifier turns the parser's native
+    failure evidence (provider error name, HTTP status, human-readable text)
+    into ``terminal_error_kind`` plus the advisory
+    ``terminal_error_retryable`` flag. Callers pass this only for
+    ``STATUS_ABORTED`` verdicts; consumers own the notification policy.
+    Absent fields mean unknown (older builds, runtimes without native failure
+    evidence) and must never be fabricated.
+    """
+    from sesskit.errors import classify_error
+
+    error_kind, retryable = classify_error(kind=kind, code=code, message=message)
+    return {
+        "terminal_error_kind": error_kind,
+        "terminal_error_retryable": retryable,
+    }

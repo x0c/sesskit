@@ -299,7 +299,10 @@ changing the above: a closed `ErrorKind` taxonomy (now incl.
 native codes/messages by `classify_error` (`errors.py`; legacy free-text
 `kind` values stay, unclassifiable stays `unknown`, advisory `retryable` is
 true/false/unknown) with `AgentError.scope` (tool/turn/session) and
-native-only `http_status`; `Turn`/`TurnOutcome` per user-delimited span
+native-only `http_status`; list rows whose `status_tag` is `STATUS_ABORTED`
+expose the same classification as optional `terminal_error_kind` /
+`terminal_error_retryable` (absent = unknown), so consumers can separate
+automatically retryable failures from terminal ones without re-parsing text; `Turn`/`TurnOutcome` per user-delimited span
 (`completed`/`awaiting_input`/`interrupted`/`failed`/`rejected`/`in_progress`/`unknown`
 with verbatim `stop_reason`; bare trailing user yields at most
 `in_progress`) with the session outcome derived from the last turn; per-kind

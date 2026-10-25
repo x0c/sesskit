@@ -23,6 +23,7 @@ from sesskit.parsers.common import (
     process_environ,
     process_start_time,
     stat_signature,
+    terminal_error_evidence,
 )
 
 PI_HOME = os.path.expanduser("~/.pi/agent")
@@ -148,6 +149,7 @@ def _build_session_info(
     first_user = last_user = last_agent = None
     last_role = None
     last_stop_reason: str | None = None
+    last_error_text = ""
     leaf_id: str | None = None
     last_assistant_has_text = False
     event_time = parse_timestamp(header.get("timestamp"))
@@ -166,12 +168,14 @@ def _build_session_info(
             last_user = text
             last_role = "user"
             last_stop_reason = None
+            last_error_text = ""
         elif role == "assistant":
             stop_reason = str(message.get("stopReason") or "").strip() or None
             error_text = str(message.get("errorMessage") or "").strip()
             last_role = "assistant"
             last_assistant_has_text = bool(text)
             last_stop_reason = stop_reason
+            last_error_text = error_text
             if text:
                 last_agent = text
             if stop_reason in {"error", "aborted"} or error_text:
@@ -201,6 +205,16 @@ def _build_session_info(
     created = parse_timestamp(header.get("timestamp")) or 0.0
     from sesskit.models import completion_id_for
 
+    terminal_error: dict[str, object] = {}
+    if status == titles.STATUS_ABORTED:
+        # With a native errorMessage, its text owns the classification: a
+        # stopReason of "aborted" can also mean retries were exhausted, not a
+        # user interrupt. Only a bare "aborted" (no message) is an interrupt.
+        terminal_error = terminal_error_evidence(
+            kind="" if last_error_text else (last_stop_reason or "error"),
+            message=last_error_text,
+        )
+
     # 尾指纹：分支叶子 id + stopReason。同一轮重扫不变，新一轮必变。
     tail_text = f"{leaf_id or ''}:{(last_stop_reason or '')}:{(last_agent or '')[:120]}"
     info = make_session_info(
@@ -216,6 +230,7 @@ def _build_session_info(
             anchor=f"{leaf_id or ''}:{(last_stop_reason or '')}",
             tail_text=tail_text,
         ),
+        **terminal_error,
     )
     return info, created
 

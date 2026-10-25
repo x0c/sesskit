@@ -25,6 +25,7 @@ from sesskit.parsers.common import (
     live_pid_snapshot,
     preprocess_excerpt,
     stat_signature,
+    terminal_error_evidence,
 )
 from sesskit.parsers.common import parse_timestamp as _parse_timestamp
 
@@ -414,6 +415,7 @@ def _build_session_info(
     last_agent_msg = None
     last_event_type = None
     event_time = None
+    terminal_error: dict[str, object] = {}
 
     for e in head_entries:
         entry_time = _activity_time(e)
@@ -483,6 +485,15 @@ def _build_session_info(
                 # Quota / provider failures often complete with null last_agent_message.
                 last_agent_msg = err_text
             last_event_type = "task_complete_error" if err_text else "task_complete"
+            if err_text:
+                raw_err = payload.get("error")
+                code = (
+                    str(raw_err.get("codex_error_info") or "").strip()
+                    if isinstance(raw_err, dict) else ""
+                ) or None
+                terminal_error = terminal_error_evidence(
+                    kind="provider", code=code, message=err_text,
+                )
             last_terminal_idx = idx
             terminal_turn_id = str(payload.get("turn_id") or "")
             tail_fingerprint = _terminal_fingerprint(
@@ -490,6 +501,8 @@ def _build_session_info(
             )
         elif t == "event_msg" and pt == "turn_aborted":
             last_event_type = "turn_aborted"
+            reason = str(payload.get("reason") or "").strip() or "turn_aborted"
+            terminal_error = terminal_error_evidence(kind="aborted", message=reason)
             last_terminal_idx = idx
             terminal_turn_id = str(payload.get("turn_id") or "")
             tail_fingerprint = _terminal_fingerprint(last_event_type, e, payload, "")
@@ -547,6 +560,7 @@ def _build_session_info(
         # cleared alongside the status so no stale identity leaks downstream.
         status = titles.STATUS_NONE
         tail_fingerprint = ""
+        terminal_error = {}
     if last_event_type == "agent_message":
         # Weak assistant-text-only inference: no native turn-end evidence backs
         # this verdict, so it must never carry a notification identity — even
@@ -589,6 +603,7 @@ def _build_session_info(
             anchor=tail_fingerprint,
             tail_text=tail_fingerprint,
         ),
+        **terminal_error,
     )
 
 

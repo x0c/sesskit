@@ -93,6 +93,33 @@ Shared terminal-evidence semantics: [Agent Session Integration Guide](~/.config/
 
 Error-bearing terminal records map to `STATUS_ABORTED` per the table above; error-only assistant turns stay in `load_events` — plain conversation views may hide them behind `include_errors` (see Public conversation load).
 
+### Terminal error evidence (`terminal_error_kind` / `terminal_error_retryable`)
+
+`status_tag == STATUS_ABORTED` rows may additionally carry the closed error
+classification of the evidence that produced the verdict:
+
+- `terminal_error_kind`: one of `sesskit.models.ERROR_KINDS`
+  (`rate_limited`, `quota_exhausted`, `auth`, `context_length`,
+  `provider_overloaded`, `provider_error`, `policy_blocked`, `tool_error`,
+  `user_interrupt`, `timeout`, `runtime_crash`, `unknown`).
+- `terminal_error_retryable`: `True` / `False` / `None` (unknown), from
+  `sesskit.errors.classify_error`.
+
+Rules:
+
+- Both fields are derived from the same bounded terminal evidence that decides
+  `STATUS_ABORTED`, through the shared classifier; parsers must not invent a
+  second text heuristic. Omit both fields for non-aborted rows and when a
+  runtime has no native failure evidence (bare `STATUS_NONE`/`ABORTED` without a
+  message stays `unknown`/`None` rather than guessed).
+- The classification is advisory evidence, never a change to `status_tag` or
+  `completion_id`. Consumers own the notification policy (for example,
+  separating automatically retryable failures from terminal ones).
+- Filling these fields must not widen the status read window and must not turn
+  metadata appends, file timestamps or titles into error evidence.
+- Older consumers ignore the fields; older SessKit builds omit them, which reads
+  as unknown. Absent fields are not an error.
+
 ### Native signals (reference)
 
 Use these when implementing or reviewing parsers (not an event-bus API — SessKit stays pull/snapshot):

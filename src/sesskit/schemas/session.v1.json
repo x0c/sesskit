@@ -77,6 +77,17 @@
     },
     "last_agent": {
       "type": "string"
+    },
+    "terminal_error_kind": {
+      "type": "string",
+      "description": "Closed failure class for status_tag=aborted rows; absent when unknown."
+    },
+    "terminal_error_retryable": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Advisory retryable flag for the terminal failure; absent when unknown."
     }
   },
   "additionalProperties": true

@@ -51,6 +51,8 @@ class CodexAbnormalEndingTests(unittest.TestCase):
             assert info is not None
             self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
             self.assertIn("usage limit", info["last_agent_msg"])
+            self.assertEqual(info["terminal_error_kind"], "quota_exhausted")
+            self.assertIs(info["terminal_error_retryable"], False)
             conversation = codex.load_conversation(str(path))
             self.assertEqual([m.role for m in conversation], ["user", "assistant"])
             self.assertIn("usage limit", conversation[-1].text)
@@ -135,6 +137,8 @@ class PiAbnormalEndingTests(unittest.TestCase):
             info, _created = built
             self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
             self.assertIn("weekly usage limit", info["last_agent_msg"])
+            self.assertEqual(info["terminal_error_kind"], "quota_exhausted")
+            self.assertIs(info["terminal_error_retryable"], False)
             conversation = pi.load_conversation(str(path))
             self.assertEqual([m.role for m in conversation], ["user"])
             conversation = pi.load_conversation(str(path), include_errors=True)
@@ -262,6 +266,8 @@ class PiAbnormalEndingTests(unittest.TestCase):
             info, _created = built
             self.assertEqual(info["status_tag"], titles.STATUS_DONE)
             self.assertEqual(info["last_agent_msg"], "PONG")
+            self.assertNotIn("terminal_error_kind", info)
+            self.assertNotIn("terminal_error_retryable", info)
 
     def test_user_owned_tail_remains_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -459,6 +465,8 @@ class ClaudeAbnormalEndingTests(unittest.TestCase):
             assert info is not None
             self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
             self.assertIn("401", info["last_agent_msg"])
+            self.assertEqual(info["terminal_error_kind"], "auth")
+            self.assertIs(info["terminal_error_retryable"], False)
             conversation = claude.load_conversation(path)
             self.assertEqual([m.role for m in conversation], ["user", "assistant"])
             self.assertIn("API key is invalid", conversation[-1].text)
@@ -488,6 +496,10 @@ class ClaudeAbnormalEndingTests(unittest.TestCase):
             assistants = [m for m in conversation if m.role == "assistant"]
             self.assertEqual(len(assistants), 1)
             self.assertIn("ECONNRESET", assistants[0].text)
+            info = claude._build_session_info(path, "proj")
+            assert info is not None
+            self.assertEqual(info["terminal_error_kind"], "provider_error")
+            self.assertIs(info["terminal_error_retryable"], True)
         finally:
             os.unlink(path)
 
@@ -600,12 +612,85 @@ class OpencodeAbnormalEndingTests(unittest.TestCase):
             assert info is not None
             self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
             self.assertIn("aborted", info["last_agent_msg"])
+            self.assertEqual(info["terminal_error_kind"], "user_interrupt")
+            self.assertIs(info["terminal_error_retryable"], False)
             conversation = opencode.load_conversation(path, "ses_err1")
             self.assertEqual(conversation[-1].role, "assistant")
             events = load_events({"source": "opencode", "path": path, "id": "ses_err1"})
             self.assertEqual(events[-1]["type"], "assistant_message")
         finally:
             os.unlink(path)
+
+
+class RetryableTerminalEvidenceTests(unittest.TestCase):
+    """The classification is evidence only; consumers own notification policy."""
+
+    def test_pi_timeout_is_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "2026-10-25T08-00-00-000Z_pi-timeout.jsonl"
+            lines = [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "pi-timeout",
+                    "timestamp": "2026-10-25T08:00:00.000Z",
+                    "cwd": "/tmp/demo",
+                },
+                {
+                    "type": "message",
+                    "id": "m1",
+                    "parentId": None,
+                    "timestamp": "2026-10-25T08:00:01.000Z",
+                    "message": {"role": "user", "content": "hi"},
+                },
+                {
+                    "type": "message",
+                    "id": "m2",
+                    "parentId": "m1",
+                    "timestamp": "2026-10-25T08:00:02.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [],
+                        "stopReason": "error",
+                        "errorMessage": "Request timed out.",
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            built = pi._build_session_info(str(path))
+            assert built is not None
+            info, _created = built
+            self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
+            self.assertEqual(info["terminal_error_kind"], "timeout")
+            self.assertIs(info["terminal_error_retryable"], True)
+
+    def test_codex_turn_aborted_is_user_interrupt(self) -> None:
+        sid = "01a0a432-cccc-7300-951f-c6cc548cb2f4"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / f"rollout-2026-10-25T08-10-00-{sid}.jsonl"
+            lines = [
+                {
+                    "timestamp": "2026-10-25T08:10:00.000Z",
+                    "type": "session_meta",
+                    "payload": {"cwd": "/tmp/demo"},
+                },
+                {
+                    "timestamp": "2026-10-25T08:10:01.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "hi"},
+                },
+                {
+                    "timestamp": "2026-10-25T08:10:02.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "turn_aborted", "reason": "interrupted"},
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            info = codex._build_session_info(str(path), {})
+            assert info is not None
+            self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
+            self.assertEqual(info["terminal_error_kind"], "user_interrupt")
+            self.assertIs(info["terminal_error_retryable"], False)
 
 
 if __name__ == "__main__":
