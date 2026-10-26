@@ -303,7 +303,9 @@ def test_cli_show_uses_real_loader(tmp_path, monkeypatch, capsys):
 def test_live_sample_plain_matches_events_and_filters_noise():
     """Sample real local history: user texts align; strong system markers stay out."""
     registry = default_registry()
-    scanned = registry.scan_all(6)
+    scanned = registry.scan_all(6, raise_on_scan_error=True)
+    if not any(scanned.values()):
+        pytest.skip("no discoverable local agent history; directories alone are not samples")
     checked = 0
     strong = (
         "system reminder",

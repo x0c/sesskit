@@ -10,6 +10,7 @@ Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`
 
 - `README.md` / `README.zh-CN.md`: public CLI/API surface, install instructions, and open-source facade.
 - `docs/GITHUB_DISCOVERY.md`: About description, Topics, and README first-screen rules with need-query baselines; skipping it reuses session-manager search queries or misdescribes SessKit as a session manager.
+- `docs/INTEGRATION_GUIDE.md`: Host-independent adoption, fixed-release installation, runnable search/analysis/incremental recipes, verified capabilities, data limits, and public integration feedback.
 - `docs/CONTRACT.md`: session contract — envelope, schemas, load wiring, listing modes, write safety, status tags and abnormal endings, and verification.
 - `schemas/*.json` and `src/sesskit/schemas/*.json`: JSON envelope fields and transcript event types; both copies stay identical.
 - `docs/RUNTIME_PARSING_KNOWLEDGE_BASE.md`: Native history parsing for six runtimes: scan, plain-turn load, liveness, versioning, and per-runtime success versus abnormal signals.

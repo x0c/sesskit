@@ -10,6 +10,7 @@ and corrupt-cursor fallback. Counts and seqs only, never content or paths.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 from sesskit import load_activity, to_v1_dicts
@@ -18,6 +19,20 @@ from sesskit.activity_reader import (
     supports_incremental,
 )
 from sesskit.transcript import load_events
+
+_FIXTURE_MTIMES: dict[str, int] = {}
+
+
+def _advance_db_mtime(path):
+    """Make fixture commits visible on coarse-clock filesystems."""
+    wal = path.with_name(path.name + "-wal")
+    source = wal if wal.exists() else path
+    stamp = source.stat()
+    key = str(source)
+    mtime = max(stamp.st_mtime_ns, _FIXTURE_MTIMES.get(key, 0)) + 1_000_000
+    os.utime(source, ns=(stamp.st_atime_ns, mtime))
+    _FIXTURE_MTIMES[key] = mtime
+
 
 # --- Cursor fixtures --------------------------------------------------------
 
@@ -40,6 +55,7 @@ def _cursor_write(store_path, objects, *, keep_open=False):
             (f"blob-{base + index}", raw),
         )
     conn.commit()
+    _advance_db_mtime(store_path)
     if keep_open:
         return conn
     conn.close()
@@ -109,6 +125,7 @@ def _v1_db(db_path, session_id, messages):
             )
     conn.commit()
     conn.close()
+    _advance_db_mtime(db_path)
 
 
 def _v1_append_message(db_path, session_id, message_id, message, parts, created):
@@ -125,6 +142,7 @@ def _v1_append_message(db_path, session_id, message_id, message, parts, created)
         )
     conn.commit()
     conn.close()
+    _advance_db_mtime(db_path)
 
 
 def _v2_db(db_path, session_id, rows):
@@ -145,6 +163,7 @@ def _v2_db(db_path, session_id, rows):
         )
     conn.commit()
     conn.close()
+    _advance_db_mtime(db_path)
 
 
 def _v2_append(db_path, session_id, row_id, seq, kind, data, *, keep_open=False):
@@ -154,6 +173,7 @@ def _v2_append(db_path, session_id, row_id, seq, kind, data, *, keep_open=False)
         (row_id, session_id, kind, seq, seq * 1000, seq * 1000, json.dumps(data)),
     )
     conn.commit()
+    _advance_db_mtime(db_path)
     if keep_open:
         return conn
     conn.close()
@@ -249,6 +269,7 @@ def test_cursor_concurrent_append_is_visible(tmp_path):
     writer.execute("INSERT INTO blobs VALUES (?, ?)",
                    ("b1", json.dumps(_cursor_assistant("live reply")).encode()))
     writer.commit()
+    _advance_db_mtime(store)
     result = reader.poll()
     assert result.reset is False
     assert [e.text for e in result.events] == ["live reply"]
@@ -285,6 +306,7 @@ def test_cursor_rowid_reuse_resets(tmp_path):
                  ("n1", json.dumps(_cursor_assistant("delta")).encode()))
     conn.commit()
     conn.close()
+    _advance_db_mtime(store)
     result = reader.poll()
     assert result.reset is True
     assert result.generation != first.generation
@@ -571,6 +593,7 @@ def test_opencode_v2_seq_reorder_resets(tmp_path):
     )
     conn.commit()
     conn.close()
+    _advance_db_mtime(db)
     result = reader.poll()
     assert result.reset is True
     assert result.generation != first.generation
@@ -716,6 +739,7 @@ def test_cursor_inplace_update_resets(tmp_path):
                  (json.dumps(_cursor_user("alpha edited longer")).encode(), rowid))
     conn.commit()
     conn.close()
+    _advance_db_mtime(store)
     result = reader.poll()
     assert result.reset is True
     assert result.generation != first.generation
@@ -752,6 +776,7 @@ def test_opencode_v1_append_reads_only_new_rows(tmp_path):
         db, "v1", "a2",
         {"role": "assistant", "time": {"created": 3000}, "finish": "stop"},
         [("p-t2", {"type": "text", "text": "Finished."})], 3000)
+    _advance_db_mtime(db)
     result = reader.poll()
     assert result.reset is False
     assert result.generation == first.generation
@@ -776,6 +801,7 @@ def test_opencode_v1_inplace_update_resets(tmp_path):
                   9999, "p-text"))
     conn.commit()
     conn.close()
+    _advance_db_mtime(db)
     result = reader.poll()
     assert result.reset is True
     assert result.generation != first.generation
@@ -803,6 +829,7 @@ def test_opencode_v1_other_session_write_is_no_change(tmp_path):
          json.dumps({"type": "text", "text": "Elsewhere."}), 5000))
     conn.commit()
     conn.close()
+    _advance_db_mtime(db)
     result = reader.poll()
     assert result.reset is False
     assert result.generation == first.generation
@@ -848,6 +875,7 @@ def test_opencode_v2_inplace_update_resets(tmp_path):
          9999, "u1"))
     conn.commit()
     conn.close()
+    _advance_db_mtime(db)
     result = reader.poll()
     assert result.reset is True
     assert result.generation != first.generation
@@ -869,6 +897,7 @@ def test_opencode_v2_backfill_seq_resets(tmp_path):
          json.dumps({"text": "Older row arriving late."})))
     conn.commit()
     conn.close()
+    _advance_db_mtime(db)
     result = reader.poll()
     assert result.reset is True
     assert result.generation != first.generation

@@ -320,6 +320,30 @@ OpenTelemetry GenAI event conventions are a design influence for naming and sepa
 
 Release compatibility: `0.2.1` is the minimum artifact version for consumers relying on thinking-only Pi error lifecycle events and the added incremental readers. Installing the published `0.2.0` artifact does not provide those later fixes. Validation: 390 tests passed (1 skipped; 20 subtests), plus `verify --sample 20` passed for 100 local histories across Claude, Codex, OpenCode, Cursor and Pi with zero parity, reader or invariant failures. No local Kimi history was available; this check does not claim a fresh live Agent execution.
 
+## Portable source-observation and fixture limits
+
+Metadata-only no-change checks require an observable source-stamp change. On a
+Linux ext4 validation host (2026-10-26), five consecutive same-size rewrites
+returned identical nanosecond mtime/ctime values. A reader cannot detect those
+rewrites from stat alone; a later visible stamp change or reopening/reloading is
+needed. This is not a lossless filesystem event subscription. It preserves the
+existing no-change fast path rather than promising detection without evidence.
+Integration guidance must disclose this boundary. Follow-up: evaluate an explicit
+opt-in periodic content recheck if a consumer needs same-stamp rewrite detection;
+do not silently replace the metadata-only contract with unconditional reads.
+
+Reader fixtures that exercise the *changed-stamp* fingerprint/recheck path must
+explicitly advance their owned source's mtime after same-size writes; depending
+on consecutive wall-clock ticks made Linux tests nondeterministic. Keep the same
+reset, event-content, pairing, and bounded-read assertions. OpenCode row-fingerprint/cache
+fixtures control their source revisions while hashing real SQLite rows:
+read-only SQLite opens were observed to change the WAL's ctime during the first
+fingerprint, making the documented unstable-source fallback legitimate. A
+separate native-stamp test exercises actual main/WAL metadata changes; cache-hit,
+concurrent-change rejection, and fallback assertions remain intact.
+A live-history test with existing but empty history directories is unverified
+(skipped), not a product failure or a pass; scan errors must still fail.
+
 ## Verification (mandatory when changing parsers or load wiring)
 
 Unit regressions must use deterministic native-history fixtures rather than requiring a particular compaction, relation or origin distribution in a developer's recent sessions. Keep the same semantic assertions and real loader path. The separate `sesskit verify` gate and exact-file live checks below remain required; a fixture pass is never real-history evidence.

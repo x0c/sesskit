@@ -21,6 +21,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from sesskit import titles
 from sesskit.parsers import opencode as oc
@@ -95,6 +96,15 @@ class SignatureTests(unittest.TestCase):
         self.old_live = oc.live_processes
         oc.live_processes = lambda _name: ()
         self.addCleanup(self._restore_live)
+        # These tests isolate row-fingerprint/cache semantics from incidental
+        # SQLite WAL ctime changes. Native source stamps are tested separately.
+        self.native_source_version = oc._source_version
+        self.source_revision = 0
+        version_patch = mock.patch.object(
+            oc, "_source_version", side_effect=lambda _path: (self.source_revision,),
+        )
+        version_patch.start()
+        self.addCleanup(version_patch.stop)
 
     def _restore_env(self):
         if self.old_env is None:
@@ -108,6 +118,7 @@ class SignatureTests(unittest.TestCase):
     def _write(self, sql: str, args: tuple = ()):
         self.writer.execute(sql, args)
         self.writer.commit()
+        self.source_revision += 1
 
     def _sig(self):
         sig = oc.scan_signature()
@@ -138,6 +149,15 @@ class SignatureTests(unittest.TestCase):
         info = next((s for s in sessions if s["id"] == session_id), None)
         self.assertIsNotNone(info)
         return info
+
+    def test_native_source_stamp_observes_main_and_wal_changes(self):
+        for path in (self.db_path, self.db_path + "-wal"):
+            before = self.native_source_version(self.db_path)
+            stamp = os.stat(path)
+            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000))
+            after = self.native_source_version(self.db_path)
+            self.assertNotEqual(after, before)
+        self.assertEqual(after, (oc._stat_version(self.db_path), oc._stat_version(self.db_path + "-wal")))
 
     # -- stability ----------------------------------------------------
 

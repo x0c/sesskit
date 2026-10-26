@@ -11,6 +11,7 @@ parity on the same bytes, and append polls without full re-parse.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -365,6 +366,9 @@ def test_inplace_rewrite_detected_by_fingerprint(tmp_path, runtime):
         assert len(alt.encode()) == size
         handle.seek(0)
         handle.write(alt.encode())
+    # Exercise changed-stamp fingerprint checks even on coarse-clock filesystems.
+    stamp = path.stat()
+    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000))
     result = reader.poll()
     assert result.reset is True
     assert result.generation != first.generation

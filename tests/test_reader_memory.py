@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tracemalloc
 
 import pytest
@@ -360,6 +361,9 @@ def test_truncation_and_replacement_reset_after_streamed_open(tmp_path):
     replacement = rows[0]
     replacement["message"]["content"][0]["text"] = "uno"
     _write_lines(path, [replacement])
+    # Same-size writes need a visible stamp to enter the fingerprint recheck.
+    stamp = path.stat()
+    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000))
     replaced = reader.poll()
     assert replaced.reset is True
     assert [event.text for event in replaced.events] == ["uno"]

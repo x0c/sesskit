@@ -8,19 +8,30 @@ This is a **Python library and JSON CLI** — not a TUI, not a session manager. 
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+## Build with SessKit
+
+- Feed local conversations into your own search index or knowledge base.
+- Inspect native usage and historical outcomes without parsing runtime files.
+- Follow incremental events in your own session client.
+
+Start with the [integration guide and three runnable examples](docs/INTEGRATION_GUIDE.md).
+No model account or API key is needed to read existing local history.
+
 ## Install
 
-SessKit is not on PyPI yet. Install from GitHub (recommended) or from a local checkout.
+SessKit is not on PyPI yet. Install the fixed-release wheel in your project's virtual environment.
 
 Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not claimed on Windows.
 
 ```bash
-pip install "sesskit @ git+https://github.com/x0c/sesskit.git"
-# or
-pipx install "sesskit @ git+https://github.com/x0c/sesskit.git"
-# or from source
-pip install -e .
+python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.21/sesskit-0.2.21-py3-none-any.whl"
+python -m sesskit describe
 ```
+
+The same command works on macOS and Linux; no Git or local build tools are needed.
+Need a virtual environment first? Run `python3 -m venv .venv && . .venv/bin/activate`.
+For a standalone CLI, use `pipx install` with the same wheel URL. For source
+contributions, clone the repository and run `python -m pip install -e .`.
 
 ## Quick start
 
@@ -65,9 +76,8 @@ for runtime_id, items in sessions.items():
     for session in items[:3]:
         messages = load_session_conversation(session)
         events = load_events(session)  # SCHEMA_ID == "sesskit.transcript/v1"
-
-# one hot session between scans: same record the next scan would list
-fresh = refresh_session(session)  # status_tag / completion_id / excerpts; None if gone
+        # Refresh this session between scans; None if its history is gone.
+        fresh = refresh_session(session)
 ```
 
 ## What it reads
@@ -81,6 +91,11 @@ fresh = refresh_session(session)  # status_tag / completion_id / excerpts; None 
 | Kimi Code | Parse / export local session files |
 | Pi | Parse / export local session files |
 
+See the [capability matrix](docs/INTEGRATION_GUIDE.md#capability-matrix) for typed
+activity, incremental reading, questions, native turn markers, usage, and compaction.
+Capabilities are also returned by `sesskit describe`; unavailable data is not zero
+or proof of success.
+
 Read-only. It does not launch agents, resume chats, or write history.
 
 Automation that launches real agent sessions (tests, evals, probes) can keep them out of listings by placing an empty `.sesskit-ignore` file in its workspace root; see [`docs/CONTRACT.md`](docs/CONTRACT.md).
@@ -89,14 +104,17 @@ Automation that launches real agent sessions (tests, evals, probes) can keep the
 
 See [`schemas/`](schemas/) and [`docs/CONTRACT.md`](docs/CONTRACT.md).
 
-## Compared to similar tools
+## Choose an interface
 
-| | SessKit | Typical dump / usage dashboards |
-|---|---|---|
-| Shape | Library + JSON CLI | Often a TUI, web UI, or one-off script |
-| Contract | JSON Schema + stable envelope | Usually Python/CLI only |
-| Transcript | Plain messages (`export` / `show`) and rich events (`share`) | Varies |
-| Runtimes | Claude Code, Codex, Cursor, OpenCode, Kimi, Pi | Often 1–3 |
+| Need | Interface |
+|---|---|
+| Plain conversation | Python `load_session_conversation`, or CLI `show` / `export` |
+| Compatible JSON events from another language | CLI `share` + transcript v1 schema |
+| Rich evidence, usage, outcomes, or incremental readers | Python API; see the [integration guide](docs/INTEGRATION_GUIDE.md) |
+
+Transcript v1 is a compatibility projection, not every field in the richer Python
+model. `sesskit search` matches titles and excerpts, not full conversation text.
+Exported content may contain secrets; review it before sharing or uploading.
 
 ## Non-goals (v1)
 
@@ -104,6 +122,12 @@ See [`schemas/`](schemas/) and [`docs/CONTRACT.md`](docs/CONTRACT.md).
 - A terminal UI or session manager
 - Writing or deleting session history
 - Go/TypeScript bindings (consume the CLI/schema instead)
+
+## What are you building?
+
+[Share your integration use case](https://github.com/x0c/sesskit/issues/new?template=integration.yml):
+which runtimes you read, what output you need, and what blocked you. Do not post
+credentials or complete private transcripts; synthetic or redacted examples help.
 
 ## License
 
