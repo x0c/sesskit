@@ -620,6 +620,125 @@ def cmd_verify(args, registry: ParserRegistry):
     return ok(report), code
 
 
+def cmd_usage(args, registry: ParserRegistry) -> dict:
+    """Show preserved native usage: a bounded summary plus paged records/observations.
+
+    Read-only. Summaries never invent totals: unknown stays unknown, and a
+    session rollup only ever sets ``complete_total``, never joins the
+    additive sums. Detail pages carry an opaque generation-bound cursor.
+    """
+    from sesskit import usage as _usage
+
+    detail = getattr(args, "detail", "summary") or "summary"
+    raw_limit = getattr(args, "limit", None)
+    cursor = getattr(args, "cursor", None)
+    turn_id = getattr(args, "turn_id", None)
+    message_id = getattr(args, "message_id", None)
+    include_native = bool(getattr(args, "include_native", False))
+    if detail == "summary" and (raw_limit is not None or cursor):
+        raise ApiError("usage_error", "--limit/--cursor are only valid with --detail", EXIT_USAGE)
+    if detail != "summary" and raw_limit is not None and int(raw_limit) <= 0:
+        raise ApiError("usage_error", "--limit must be positive", EXIT_USAGE)
+    if turn_id and message_id:
+        raise ApiError("usage_error", "--turn-id and --message-id are mutually exclusive", EXIT_USAGE)
+    limit = 100 if raw_limit is None else int(raw_limit)
+    view = getattr(args, "view", "all-branches") or "all-branches"
+    history_view = "active_branch" if view == "active-branch" else "all_branches"
+
+    ref = getattr(args, "session", "")
+    session = resolve_ref(
+        registry,
+        ref,
+        _RESOLVE_SCAN_LIMIT,
+        include_missing_cwd=_include_missing_cwd(args),
+    )
+    snapshot = _usage.load_usage(session, history_view=history_view)
+    if snapshot.state == "unavailable":
+        raise ApiError(
+            "load_failed",
+            f"history unreadable: {ref}",
+            EXIT_ERROR,
+            hint="the session may have been deleted; refresh with sesskit list",
+            next_commands=["sesskit list"],
+        )
+
+    payload = _usage.snapshot_to_dict(snapshot, include_native=include_native)
+    summary = snapshot.summary
+    selectors: dict = {}
+    if turn_id or message_id:
+        selection = _usage.UsageSelection(
+            turn_ids=(turn_id,) if turn_id else (),
+            message_ids=(message_id,) if message_id else (),
+        )
+        summary = _usage.summarize_usage(snapshot, selection=selection)
+        selectors = {k: v for k, v in {"turn_id": turn_id, "message_id": message_id}.items() if v}
+    assert summary is not None
+    payload["summary"] = _usage.summary_to_dict(summary)
+    if selectors:
+        payload["selectors"] = selectors
+        full_summary = snapshot.summary
+        assert full_summary is not None
+        payload["matched_records"] = summary.record_count
+        payload["unlinked_records"] = len(full_summary.ambiguous_ids)
+        if summary.record_count == 0:
+            payload.setdefault("diagnostics", []).append("selector_matched_zero")
+
+    if detail == "summary":
+        return ok(payload)
+
+    if turn_id:
+        observations = [o for o in snapshot.observations if o.turn_id == turn_id]
+        records = [r for r in snapshot.records if r.turn_id == turn_id]
+    elif message_id:
+        observations = [o for o in snapshot.observations
+                        if o.message_id == message_id or o.response_id == message_id]
+        records = [r for r in snapshot.records
+                   if r.message_id == message_id or r.response_id == message_id]
+    else:
+        observations = list(snapshot.observations)
+        records = list(snapshot.records)
+    items = (records if detail == "records" else observations)
+    total = len(items)
+    offset = 0
+    if cursor:
+        try:
+            offset = _usage.decode_usage_cursor(cursor, snapshot.watermark)
+        except ValueError as exc:
+            if str(exc) == "stale":
+                raise ApiError(
+                    "stale_cursor",
+                    "usage page cursor is stale; source changed, fetch a fresh page",
+                    EXIT_ERROR,
+                    next_commands=[f"sesskit usage {ref}"],
+                ) from exc
+            raise ApiError("usage_error", "malformed usage page cursor", EXIT_USAGE) from exc
+    if offset > total:
+        raise ApiError("usage_error", "cursor offset beyond available items", EXIT_USAGE)
+    page = items[offset:offset + limit]
+    has_more = offset + limit < total
+    serialize = _usage.record_to_dict if detail == "records" else _usage.observation_to_dict
+    payload["detail"] = {
+        "kind": detail,
+        "items": [serialize(item, include_native=include_native) for item in page],
+        "returned": len(page),
+        "total": total,
+        "has_more": has_more,
+        "cursor": _usage.encode_usage_cursor(snapshot.watermark or "", offset + limit)
+        if has_more and snapshot.watermark else None,
+        "read_coverage": {
+            "entries_read": snapshot.entries_read,
+            "observed": snapshot.observed_count,
+            "records": len(snapshot.records),
+        },
+        "scope": {"history_view": snapshot.history_view, **selectors},
+        "omitted_native_subdivisions": (
+            0 if include_native else sum(1 for o in page
+                                         if getattr(o, "native_subdivisions", ()))
+        ),
+    }
+    return ok(payload)
+
+
 COMMANDS = [
     {
         "name": "list",
@@ -695,6 +814,25 @@ COMMANDS = [
             {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
         ],
         "returns": {"sessions": "array with full messages"},
+    },
+    {
+        "name": "usage",
+        "help": "Show preserved native token/cost usage for one session (bounded summary plus paged records)",
+        "handler": cmd_usage,
+        "args": [
+            {"flags": ["session"], "kwargs": {"help": "id, prefix, or runtime:id"}},
+            {"flags": ["--detail"], "kwargs": {"choices": ["summary", "records", "observations"], "default": "summary", "help": "summary (default) or one paged detail list"}},
+            {"flags": ["--limit"], "kwargs": {"type": int, "default": None, "help": "detail page size (detail mode only)"}},
+            {"flags": ["--cursor"], "kwargs": {"help": "opaque page cursor from a previous detail page (detail mode only)"}},
+            {"flags": ["--view"], "kwargs": {"choices": ["all-branches", "active-branch"], "default": "all-branches", "help": "accounting history view"}},
+            {"flags": ["--turn-id"], "kwargs": {"help": "restrict to one native turn id (mutually exclusive with --message-id)"}},
+            {"flags": ["--message-id"], "kwargs": {"help": "restrict to one native message/response id (mutually exclusive with --turn-id)"}},
+            {"flags": ["--include-native"], "kwargs": {"action": "store_true", "help": "include bounded native subdivisions and provider/cost-basis metadata"}},
+            {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
+            {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
+            {"flags": ["--json"], "kwargs": {"action": "store_true", "help": "single-line JSON output (same as --compact)"}},
+        ],
+        "returns": {"schema": "sesskit.usage/v1", "summary": "scoped totals with coverage", "detail": "optional paged records/observations"},
     },
     {
         "name": "share",

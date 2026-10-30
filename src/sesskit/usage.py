@@ -11,10 +11,13 @@ only collects, never deduplicates or totals.
 
 from __future__ import annotations
 
+import base64
+import json
+import os
 from dataclasses import dataclass
 from typing import Literal
 
-from sesskit.models import Evidence, Usage
+from sesskit.models import Evidence, LoadState, Usage
 
 ScopeKind = Literal["call", "message", "turn", "session", "unknown"]
 CounterKind = Literal["absolute", "delta", "cumulative", "unknown"]
@@ -549,6 +552,7 @@ class UsageRecord:
     response_id: str | None = None
     turn_id: str | None = None
     message_id: str | None = None
+    scope_id: str | None = None
     model: str | None = None
     provider: str | None = None
     counter_name: str | None = None
@@ -764,6 +768,7 @@ def reconcile(observations: list[UsageObservation]) -> list[UsageRecord]:
             "response_id": first.response_id,
             "turn_id": first.turn_id,
             "message_id": first.message_id,
+            "scope_id": first.scope_id,
             "model": first.usage.model,
             "provider": first.provider,
             "counter_name": first.counter_name,
@@ -828,6 +833,7 @@ def reconcile(observations: list[UsageObservation]) -> list[UsageRecord]:
                        "response_id": member.response_id,
                        "turn_id": member.turn_id,
                        "message_id": member.message_id,
+                       "scope_id": member.scope_id,
                        "model": member.usage.model,
                        "provider": member.provider},
                 ))
@@ -1346,9 +1352,514 @@ def summarize_observations(
     )
 
 
+USAGE_SCHEMA_ID = "sesskit.usage/v1"
+_MODEL_SLICE_LIMIT = 50
+
+
+@dataclass(frozen=True)
+class UsageCapabilities:
+    """Detailed usage support per runtime (extends the coarse ``usage_data`` flag)."""
+
+    runtime: str
+    supported: bool
+    source_variants: tuple[str, ...] = ()
+    metric_families: tuple[str, ...] = ()
+    entity_granularities: tuple[str, ...] = ()
+    counter_kinds: tuple[str, ...] = ()
+    branch_views: tuple[str, ...] = ()
+    auxiliary_support: bool = False
+    incremental_support: bool = False
+
+
+_USAGE_CAPABILITIES: dict[str, UsageCapabilities] = {
+    "claude": UsageCapabilities(
+        "claude", True,
+        source_variants=("message.usage",),
+        metric_families=("input_text", "cache_read", "cache_write", "output"),
+        entity_granularities=("message",),
+        counter_kinds=("absolute",),
+        branch_views=("all_branches",),
+        auxiliary_support=False,
+        incremental_support=False,
+    ),
+    "codex": UsageCapabilities(
+        "codex", True,
+        source_variants=("token_usage_record", "token_count.info"),
+        metric_families=("input", "cached_input", "output", "reasoning", "total"),
+        entity_granularities=("call", "turn"),
+        counter_kinds=("absolute", "cumulative"),
+        branch_views=("all_branches",),
+        auxiliary_support=False,
+        incremental_support=False,
+    ),
+    "opencode": UsageCapabilities(
+        "opencode", True,
+        source_variants=("message.tokens",),
+        metric_families=("input", "cache_read", "cache_write", "output", "reasoning", "cost"),
+        entity_granularities=("message",),
+        counter_kinds=("absolute",),
+        branch_views=("all_branches",),
+        auxiliary_support=False,
+        incremental_support=False,
+    ),
+    "pi": UsageCapabilities(
+        "pi", True,
+        source_variants=("message.usage", "compaction.usage", "branch_summary.usage", "toolResult.usage"),
+        metric_families=("input", "cache_read", "cache_write", "output", "reasoning", "total", "cost"),
+        entity_granularities=("message",),
+        counter_kinds=("absolute", "unknown"),
+        branch_views=("all_branches", "active_branch"),
+        auxiliary_support=True,
+        incremental_support=False,
+    ),
+}
+
+
+def usage_capabilities(runtime: str) -> UsageCapabilities:
+    """Detailed usage support for one runtime; unsupported runtimes report False."""
+    capabilities = _USAGE_CAPABILITIES.get(runtime)
+    if capabilities is None:
+        return UsageCapabilities(runtime, False)
+    return capabilities
+
+
+@dataclass(frozen=True)
+class UsageSelection:
+    """Typed record selector: native identities only, never a predicate callback.
+
+    ``turn_ids`` and ``message_ids`` are mutually exclusive. Message ids
+    match message- or response-linked records. SessKit never invents a
+    task, benchmark or attempt model on top of these identities.
+    """
+
+    turn_ids: tuple[str, ...] = ()
+    message_ids: tuple[str, ...] = ()
+    include_auxiliary: bool = True
+
+    def __post_init__(self) -> None:
+        if self.turn_ids and self.message_ids:
+            raise ValueError("turn_ids and message_ids are mutually exclusive")
+
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    """One session's preserved usage readings plus their reconciled summary.
+
+    ``state`` follows the shared load states: a readable history without
+    recorded usage is ``empty`` with ``not_recorded`` coverage, never a
+    zero-cost session; failure is never empty success. The snapshot is a
+    projection container over shared history identities, not a second
+    session hierarchy.
+    """
+
+    state: LoadState
+    runtime: str
+    session_ref: str | None
+    history_view: str
+    watermark: str | None
+    observations: tuple[UsageObservation, ...]
+    records: tuple[UsageRecord, ...]
+    summary: UsageSummary | None
+    entries_read: int
+    observed_count: int
+    diagnostics: tuple[str, ...] = ()
+
+
+def _file_watermark(path: str) -> str | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _read_jsonl_rows(path: str) -> list[tuple[int, dict]]:
+    rows: list[tuple[int, dict]] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as file:
+            for lineno, line in enumerate(file, 1):
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(entry, dict):
+                    rows.append((lineno, entry))
+    except OSError:
+        pass
+    return rows
+
+
+def _load_jsonl_usage(path: str, runtime: str) -> tuple[list[UsageObservation], int, str | None]:
+    rows = _read_jsonl_rows(path)
+    if runtime == "claude":
+        return collect_claude_observations(rows), len(rows), _file_watermark(path)
+    return collect_codex_observations(rows), len(rows), _file_watermark(path)
+
+
+def _load_pi_usage(path: str, history_view: str) -> tuple[list[UsageObservation], int, str | None]:
+    from sesskit.activity import _pi_compactions
+    from sesskit.parsers import pi as scan_pi
+
+    entries = scan_pi.read_entries(path)
+    watermark = _file_watermark(path)
+    if history_view == "active_branch":
+        branch = scan_pi.active_messages(entries)
+        # _pi_compactions keeps only compaction entries feeding this branch.
+        wanted = {id(item) for item in branch}
+        wanted.update(id(entry) for entry in _pi_compactions(entries, branch).values())
+        positions = {id(item): index for index, item in enumerate(entries)}
+        scoped = sorted(
+            (item for item in entries if id(item) in wanted),
+            key=lambda item: positions[id(item)],
+        )
+        return collect_pi_observations(scoped), len(entries), watermark
+    return collect_pi_observations(entries), len(entries), watermark
+
+
+def _load_opencode_usage(path: str, session_id: str) -> tuple[list[UsageObservation], list[dict] | None, int, str | None]:
+    """Read v1/v2 message usage; stored session aggregates are not present in this schema."""
+    import sqlite3
+
+    from sesskit.parsers import opencode as scan_opencode
+
+    conn = scan_opencode.connect_ro(path)
+    if conn is None:
+        return [], None, 0, None
+    try:
+        tables = {str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        messages: list[dict] = []
+        count = 0
+        if {"session", "message", "part"} <= tables:
+            try:
+                has_session = conn.execute(
+                    "SELECT 1 FROM session WHERE id = ? LIMIT 1", (session_id,)).fetchone()
+            except sqlite3.Error:
+                has_session = None
+            if has_session is not None:
+                try:
+                    rows = conn.execute(
+                        "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC",
+                        (session_id,)).fetchall()
+                except sqlite3.Error:
+                    return [], None, 0, _file_watermark(path)
+                for row in rows:
+                    count += 1
+                    try:
+                        data = json.loads(row[1])
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        continue
+                    if isinstance(data, dict):
+                        data = dict(data)
+                        data.setdefault("id", row[0])
+                        messages.append(data)
+                return collect_opencode_observations(messages), None, count, _file_watermark(path)
+        if "session_message" in tables:
+            try:
+                rows = conn.execute(
+                    "SELECT id, data FROM session_message WHERE session_id = ? ORDER BY seq ASC, id ASC",
+                    (session_id,)).fetchall()
+            except sqlite3.Error:
+                return [], None, 0, _file_watermark(path)
+            for row in rows:
+                count += 1
+                try:
+                    data = json.loads(row[1])
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    continue
+                if isinstance(data, dict):
+                    data = dict(data)
+                    data.setdefault("id", row[0])
+                    messages.append(data)
+            return collect_opencode_observations(messages), None, count, _file_watermark(path)
+        return [], None, 0, _file_watermark(path)
+    finally:
+        conn.close()
+
+
+def load_usage(session: dict, *, history_view: str = "all_branches") -> UsageSnapshot:
+    """Load preserved usage observations, records and summary for one session dict.
+
+    ``history_view`` is ``all_branches`` (default, the session's own
+    operations) or ``active_branch`` (Pi only; other runtimes fall back to
+    the full history with a diagnostic). Unknown runtimes and runtimes
+    without a verified usage mapping yield ``unsupported``; missing or
+    unreadable history yields ``unavailable``. A readable history without
+    recorded usage is ``empty`` with ``not_recorded`` coverage.
+    """
+    runtime = str(session.get("source") or "")
+    session_id = str(session.get("id") or "")
+    session_ref = f"{runtime}:{session_id}" if runtime and session_id else None
+    if history_view not in {"all_branches", "active_branch"}:
+        raise ValueError(f"unsupported history view: {history_view!r}")
+    if runtime in UNSUPPORTED_RUNTIMES or runtime not in SUPPORTED_RUNTIMES:
+        summary = summarize([], session_ref=session_ref, runtime=runtime or "unknown",
+                            history_view=history_view, observed_count=0)
+        return UsageSnapshot("unsupported", runtime or "unknown", session_ref,
+                             history_view, None, (), (), summary, 0, 0,
+                             ("runtime_usage_unsupported",))
+    path = str(session.get("path") or "")
+    if not path or not os.path.isfile(path):
+        summary = summarize([], session_ref=session_ref, runtime=runtime,
+                            history_view=history_view, observed_count=0)
+        return UsageSnapshot("unavailable", runtime, session_ref, history_view,
+                             None, (), (), summary, 0, 0, ("history_unreadable",))
+    diagnostics: list[str] = []
+    observations: list[UsageObservation] = []
+    entries_read = 0
+    watermark: str | None = None
+    if runtime in {"claude", "codex"}:
+        try:
+            observations, entries_read, watermark = _load_jsonl_usage(path, runtime)
+        except OSError:
+            observations, entries_read, watermark = [], 0, None
+        if history_view == "active_branch":
+            diagnostics.append("branch_views_unsupported_fallback_all_branches")
+    elif runtime == "pi":
+        try:
+            observations, entries_read, watermark = _load_pi_usage(path, history_view)
+        except OSError:
+            observations, entries_read, watermark = [], 0, None
+    elif runtime == "opencode":
+        if history_view == "active_branch":
+            diagnostics.append("branch_views_unsupported_fallback_all_branches")
+        try:
+            observations, _rollup, entries_read, watermark = _load_opencode_usage(path, session_id)
+        except OSError:
+            observations, entries_read, watermark = [], 0, None
+    else:
+        summary = summarize([], session_ref=session_ref, runtime=runtime,
+                            history_view=history_view, observed_count=0)
+        return UsageSnapshot("unsupported", runtime, session_ref, history_view,
+                             None, (), (), summary, 0, 0, ("runtime_usage_unsupported",))
+    if watermark is None:
+        summary = summarize([], session_ref=session_ref, runtime=runtime,
+                            history_view=history_view, observed_count=0)
+        return UsageSnapshot("unavailable", runtime, session_ref, history_view,
+                             None, (), (), summary, entries_read, 0, ("history_unreadable",))
+    records = reconcile(observations)
+    summary = summarize(records, session_ref=session_ref, runtime=runtime,
+                        history_view=history_view, observed_count=len(observations))
+    state: LoadState = "available" if observations else "empty"
+    return UsageSnapshot(state, runtime, session_ref, history_view, watermark,
+                         tuple(observations), tuple(records), summary,
+                         entries_read, len(observations), tuple(diagnostics))
+
+
+def summarize_usage(snapshot: UsageSnapshot, *,
+                    selection: UsageSelection | None = None) -> UsageSummary:
+    """Summarize a snapshot, optionally narrowed to native turn/message ids."""
+    if selection is None:
+        assert snapshot.summary is not None
+        return snapshot.summary
+    records = list(snapshot.records)
+    if selection.turn_ids:
+        wanted = set(selection.turn_ids)
+        records = [record for record in records if record.turn_id in wanted]
+    else:
+        wanted_messages = set(selection.message_ids)
+        records = [record for record in records
+                   if record.message_id in wanted_messages
+                   or (record.response_id is not None and record.response_id in wanted_messages)]
+    return summarize(records, session_ref=snapshot.session_ref, runtime=snapshot.runtime,
+                     history_view=snapshot.history_view, observed_count=snapshot.observed_count)
+
+
+def _usage_numbers(usage: Usage) -> dict:
+    return {
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "cache_read": usage.cache_read_tokens,
+        "cache_write": usage.cache_write_tokens,
+        "reasoning": usage.reasoning_tokens,
+        "total": usage.total_tokens,
+        "cost": usage.cost,
+    }
+
+
+def observation_to_dict(observation: UsageObservation, *, include_native: bool = False) -> dict:
+    payload: dict = {
+        "observation_id": observation.observation_id,
+        "runtime": observation.runtime,
+        "record": observation.record,
+        "scope": {"kind": observation.scope_kind, "id": observation.scope_id},
+        "counter": {"kind": observation.counter_kind, "name": observation.counter_name},
+        "operation": observation.operation,
+        "operation_detail": observation.operation_detail,
+        "correlation": {
+            "request_id": observation.request_id,
+            "response_id": observation.response_id,
+            "turn_id": observation.turn_id,
+            "message_id": observation.message_id,
+        },
+        "model": observation.usage.model,
+        "provider": observation.provider,
+        "usage": _usage_numbers(observation.usage),
+        "cost_basis": observation.cost_basis,
+        "quality": observation.quality,
+        "evidence": {
+            "origin": observation.evidence.origin,
+            "field": observation.evidence.field,
+            "record": observation.evidence.record,
+        },
+    }
+    if include_native:
+        payload["native_subdivisions"] = [
+            {"name": name, "value": value}
+            for name, value in observation.native_subdivisions
+        ]
+    return payload
+
+
+def record_to_dict(record: UsageRecord, *, include_native: bool = False) -> dict:
+    normalized = record.normalized
+    payload: dict = {
+        "usage_id": record.usage_id,
+        "runtime": record.runtime,
+        "observation_ids": list(record.observation_ids),
+        "scope": {"kind": record.scope_kind, "id": record.scope_id},
+        "counter": {"kind": record.counter_kind, "name": record.counter_name},
+        "operation": record.operation,
+        "correlation": {
+            "response_id": record.response_id,
+            "turn_id": record.turn_id,
+            "message_id": record.message_id,
+        },
+        "model": record.model,
+        "provider": record.provider,
+        "standing": record.standing,
+        "revision": record.revision,
+        "normalized": {
+            "input_total": normalized.input_total,
+            "input_uncached": normalized.input_uncached,
+            "cache_read": normalized.cache_read,
+            "cache_write": normalized.cache_write,
+            "output_total": normalized.output_total,
+            "reasoning": normalized.reasoning,
+            "total": normalized.total,
+            "reported_total": normalized.reported_total,
+            "cost": normalized.cost,
+            "currency": normalized.currency,
+            "cost_basis": normalized.cost_basis,
+            "gaps": list(normalized.gaps),
+            "derivation": list(normalized.derivation),
+        },
+        "diagnostics": list(record.diagnostics),
+    }
+    if include_native:
+        payload["native_subdivisions"] = [
+            {"name": name, "value": value}
+            for name, value in record.native_subdivisions
+        ]
+    return payload
+
+
+def metric_summary_to_dict(summary: MetricSummary) -> dict:
+    return {
+        "known_total": summary.known_total,
+        "detail_total": summary.detail_total,
+        "interval_total": summary.interval_total,
+        "complete_total": summary.complete_total,
+        "reported_total": summary.reported_total,
+        "unattributed": summary.unattributed,
+        "coverage": summary.coverage,
+        "contributing": list(summary.contributing),
+    }
+
+
+def cost_summary_to_dict(summary: CostSummary) -> dict:
+    return {
+        "known_total": summary.known_total,
+        "detail_total": summary.detail_total,
+        "complete_total": summary.complete_total,
+        "unattributed": summary.unattributed,
+        "coverage": summary.coverage,
+        "groups": [
+            {"currency": group.currency, "basis": group.basis,
+             "total": group.total, "records": list(group.records)}
+            for group in summary.groups
+        ],
+        "contributing": list(summary.contributing),
+    }
+
+
+def summary_to_dict(summary: UsageSummary) -> dict:
+    slices = summary.by_model[:_MODEL_SLICE_LIMIT]
+    return {
+        "session_ref": summary.session_ref,
+        "runtime": summary.runtime,
+        "history_view": summary.history_view,
+        "coverage": summary.coverage,
+        "metrics": {
+            "input_total": metric_summary_to_dict(summary.input_total),
+            "cache_read": metric_summary_to_dict(summary.cache_read),
+            "cache_write": metric_summary_to_dict(summary.cache_write),
+            "output_total": metric_summary_to_dict(summary.output_total),
+            "reasoning": metric_summary_to_dict(summary.reasoning),
+            "total_tokens": metric_summary_to_dict(summary.total_tokens),
+        },
+        "cost": cost_summary_to_dict(summary.cost),
+        "by_model": [
+            {"model": item.model, "provider": item.provider,
+             "input_total": item.input_total, "output_total": item.output_total,
+             "total_tokens": item.total_tokens, "records": list(item.records)}
+            for item in slices
+        ],
+        "models_omitted": max(0, len(summary.by_model) - len(slices)),
+        "record_ids": list(summary.record_ids),
+        "selected_ids": list(summary.selected_ids),
+        "ambiguous_ids": list(summary.ambiguous_ids),
+        "conflicted_ids": list(summary.conflicted_ids),
+        "interval_ids": list(summary.interval_ids),
+        "observed_count": summary.observed_count,
+        "record_count": summary.record_count,
+        "diagnostics": list(summary.diagnostics),
+    }
+
+
+def snapshot_to_dict(snapshot: UsageSnapshot, *, include_native: bool = False) -> dict:
+    return {
+        "schema": USAGE_SCHEMA_ID,
+        "session_ref": snapshot.session_ref,
+        "runtime": snapshot.runtime,
+        "state": snapshot.state,
+        "history_view": snapshot.history_view,
+        "watermark": snapshot.watermark is not None,
+        "entries_read": snapshot.entries_read,
+        "summary": summary_to_dict(snapshot.summary) if snapshot.summary is not None else None,
+        "diagnostics": list(snapshot.diagnostics),
+        "native_subdivisions_omitted": (
+            0 if include_native else sum(
+                1 for observation in snapshot.observations if observation.native_subdivisions)
+        ),
+    }
+
+
+def encode_usage_cursor(watermark: str, offset: int) -> str:
+    raw = json.dumps({"v": 1, "gen": watermark, "off": offset}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def decode_usage_cursor(token: str, watermark: str | None) -> int:
+    """Return the page offset, or raise ValueError("stale"|"malformed")."""
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        payload = json.loads(raw)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        raise ValueError("malformed") from None
+    if not isinstance(payload, dict) or payload.get("v") != 1:
+        raise ValueError("malformed")
+    if not isinstance(payload.get("off"), int) or payload["off"] < 0:
+        raise ValueError("malformed")
+    if watermark is None or payload.get("gen") != watermark:
+        raise ValueError("stale")
+    return int(payload["off"])
+
+
 __all__ = [
     "SUPPORTED_RUNTIMES",
     "UNSUPPORTED_RUNTIMES",
+    "USAGE_SCHEMA_ID",
     "CostBasis",
     "CostGroup",
     "CostSummary",
@@ -1360,17 +1871,30 @@ __all__ = [
     "OperationKind",
     "RecordStanding",
     "ScopeKind",
+    "UsageCapabilities",
     "UsageObservation",
     "UsageRecord",
+    "UsageSelection",
+    "UsageSnapshot",
     "UsageSummary",
     "ValueQuality",
     "collect_claude_observations",
     "collect_codex_observations",
     "collect_opencode_observations",
     "collect_pi_observations",
+    "decode_usage_cursor",
     "describe_support",
+    "encode_usage_cursor",
+    "load_usage",
+    "metric_summary_to_dict",
     "normalize_observation",
+    "observation_to_dict",
     "reconcile",
+    "record_to_dict",
+    "snapshot_to_dict",
     "summarize",
     "summarize_observations",
+    "summarize_usage",
+    "summary_to_dict",
+    "usage_capabilities",
 ]

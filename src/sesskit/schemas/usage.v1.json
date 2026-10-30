@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/x0c/sesskit/schemas/usage.v1.json",
+  "title": "SessKit Usage Snapshot (sesskit.usage/v1)",
+  "description": "Preserved native token/cost usage for one session: a bounded summary plus optional paged records/observations. Sums only cover proven non-overlapping records; missing stays missing and explicit zero stays zero.",
+  "type": "object",
+  "required": ["schema", "runtime", "state", "summary"],
+  "properties": {
+    "schema": {
+      "const": "sesskit.usage/v1",
+      "description": "Dataset version; the CLI envelope version is separate"
+    },
+    "session_ref": { "type": ["string", "null"] },
+    "runtime": { "type": "string" },
+    "state": {
+      "type": "string",
+      "enum": ["available", "empty", "unavailable", "unsupported"]
+    },
+    "history_view": { "type": "string", "enum": ["all_branches", "active_branch"] },
+    "watermark": {
+      "type": "boolean",
+      "description": "Whether a source watermark was captured (never the path)"
+    },
+    "entries_read": { "type": "integer", "minimum": 0 },
+    "summary": { "$ref": "#/$defs/usageSummary" },
+    "selectors": {
+      "type": "object",
+      "properties": {
+        "turn_id": { "type": "string" },
+        "message_id": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "matched_records": { "type": "integer", "minimum": 0 },
+    "unlinked_records": { "type": "integer", "minimum": 0 },
+    "diagnostics": { "type": "array", "items": { "type": "string" } },
+    "native_subdivisions_omitted": { "type": "integer", "minimum": 0 },
+    "detail": { "$ref": "#/$defs/usageDetail" }
+  },
+  "$defs": {
+    "metricSummary": {
+      "type": "object",
+      "required": ["coverage", "contributing"],
+      "properties": {
+        "known_total": { "type": ["integer", "number", "null"] },
+        "detail_total": { "type": ["integer", "number", "null"] },
+        "interval_total": { "type": ["integer", "number", "null"] },
+        "complete_total": { "type": ["integer", "number", "null"] },
+        "reported_total": { "type": ["integer", "number", "null"] },
+        "unattributed": { "type": ["integer", "number", "null"] },
+        "coverage": {
+          "type": "string",
+          "enum": ["complete", "partial", "unknown", "conflicted", "not_recorded", "unsupported"]
+        },
+        "contributing": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "costSummary": {
+      "type": "object",
+      "required": ["coverage", "groups", "contributing"],
+      "properties": {
+        "known_total": { "type": ["number", "null"] },
+        "detail_total": { "type": ["number", "null"] },
+        "complete_total": { "type": ["number", "null"] },
+        "unattributed": { "type": ["number", "null"] },
+        "coverage": {
+          "type": "string",
+          "enum": ["complete", "partial", "unknown", "conflicted", "not_recorded", "unsupported"]
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["basis", "total", "records"],
+            "properties": {
+              "currency": { "type": ["string", "null"] },
+              "basis": { "type": "string" },
+              "total": { "type": "number" },
+              "records": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "contributing": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "usageSummary": {
+      "type": "object",
+      "required": ["runtime", "history_view", "coverage", "metrics", "cost"],
+      "properties": {
+        "session_ref": { "type": ["string", "null"] },
+        "runtime": { "type": "string" },
+        "history_view": { "type": "string" },
+        "coverage": { "type": "string" },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "input_total": { "$ref": "#/$defs/metricSummary" },
+            "cache_read": { "$ref": "#/$defs/metricSummary" },
+            "cache_write": { "$ref": "#/$defs/metricSummary" },
+            "output_total": { "$ref": "#/$defs/metricSummary" },
+            "reasoning": { "$ref": "#/$defs/metricSummary" },
+            "total_tokens": { "$ref": "#/$defs/metricSummary" }
+          }
+        },
+        "cost": { "$ref": "#/$defs/costSummary" },
+        "by_model": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "model": { "type": ["string", "null"] },
+              "provider": { "type": ["string", "null"] },
+              "input_total": { "type": ["integer", "null"] },
+              "output_total": { "type": ["integer", "null"] },
+              "total_tokens": { "type": ["integer", "null"] },
+              "records": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "models_omitted": { "type": "integer", "minimum": 0 },
+        "record_ids": { "type": "array", "items": { "type": "string" } },
+        "selected_ids": { "type": "array", "items": { "type": "string" } },
+        "ambiguous_ids": { "type": "array", "items": { "type": "string" } },
+        "conflicted_ids": { "type": "array", "items": { "type": "string" } },
+        "interval_ids": { "type": "array", "items": { "type": "string" } },
+        "observed_count": { "type": "integer", "minimum": 0 },
+        "record_count": { "type": "integer", "minimum": 0 },
+        "diagnostics": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "usageDetail": {
+      "type": "object",
+      "required": ["kind", "items", "returned", "total", "has_more"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["records", "observations"] },
+        "items": { "type": "array", "items": { "type": "object" } },
+        "returned": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "has_more": { "type": "boolean" },
+        "cursor": { "type": ["string", "null"] },
+        "read_coverage": { "type": "object" },
+        "scope": { "type": "object" },
+        "omitted_native_subdivisions": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

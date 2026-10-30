@@ -73,10 +73,31 @@ messages. The recipe intentionally does not sum tokens or costs. Missing values
 stay null, not zero; no price lookup or cost estimate is performed. Session
 outcomes describe persisted history, not whether a process is currently running.
 
-The [native usage data design](NATIVE_USAGE_DATA_DESIGN.md) specifies planned
-reconciled records, scoped summaries and versioned exports. Its proposed APIs
-are not available yet. SessKit supplies native data; evaluation and the meaning
-of an external task remain with the consumer.
+Reconciled records and scoped summaries are available in code and on the CLI:
+
+```bash
+sesskit usage pi:SESSION_ID
+sesskit usage pi:SESSION_ID --detail records --limit 100
+sesskit usage pi:SESSION_ID --message-id MESSAGE_ID
+```
+
+```python
+from sesskit import load_usage, summarize_usage, UsageSelection
+
+snapshot = load_usage(session)  # session dict from scan; state is
+                                # available/empty/unavailable/unsupported
+summary = summarize_usage(snapshot)
+narrow = summarize_usage(snapshot, selection=UsageSelection(message_ids=("m1",)))
+```
+
+`summary.known_total` sums only proven non-overlapping records; a stored
+session rollup only ever sets `complete_total`, never joins the sums. Every
+total carries its coverage (`complete`/`partial`/`unknown`/`conflicted`/
+`not_recorded`/`unsupported`) and contributing record ids. The versioned
+`sesskit.usage/v1` payload is described by `schemas/usage.v1.json` (duplicated
+under `src/sesskit/schemas/`). The [native usage data design](NATIVE_USAGE_DATA_DESIGN.md)
+specifies the full reconciliation rules. SessKit supplies native data;
+evaluation and the meaning of an external task remain with the consumer.
 
 ## 3. Follow one session
 
