@@ -1,8 +1,9 @@
 # Native usage data design
 
-Status: owner-approved product boundary; proposed technical contract, ready for
-implementation planning. No API, command, schema, or parser change in this
-document is implemented by this design-only delivery.
+Status: owner-approved product boundary; proposed technical contract. Internal
+collector scaffolding exists at `46d9a2e`, but U1 acceptance is incomplete (§2.4).
+The proposed public load/summary/reader APIs, CLI and usage schema have not landed.
+This document update changes no parser or runtime implementation.
 
 ## 1. Purpose and boundary
 
@@ -94,8 +95,9 @@ Confirmed source-level gaps:
 2. `_build_pi_events` attaches usage to text/error events but not ordinary
    tool-only assistant responses. Its message-first filtering cannot represent
    every independent usage, branch-summary or nested tool-use record.
-3. `_pi_usage` does not expose the observed `reasoning` field. The common model
-   lacks provider, counter semantics, currency, cost basis and finality.
+3. The activity-level `_pi_usage` now exposes `reasoning` as of `46d9a2e`.
+   That field addition does not address the remaining common-model gaps:
+   provider, counter semantics, currency, per-amount cost basis and finality.
 4. Existing incremental activity results do not re-emit late usage enrichment.
    An accounting consumer cannot rely on appended activity events alone.
 5. Transcript v1 omits usage; `asdict()` recipes are not a versioned external
@@ -112,11 +114,38 @@ may have been live; no prompts, paths, ids or native content were exported.
 OpenCode/Cursor findings here are source/documentation checks, not new database
 probes or live agent executions.
 
+### 2.4 Internal collector checkpoint: not accepted U1
+
+`46d9a2e` added `src/sesskit/usage.py` and synthetic collector tests. Source
+inspection and executable synthetic probes establish the limits below; these
+are implementation gaps against the design, not changes to native-runtime
+semantics. The existing parser outcome/v1 behavior was not reaccepted here.
+
+| Committed scaffold at `46d9a2e` | Required before U1 acceptance |
+|---|---|
+| `collect_*_observations` has no adapter/public load caller; `describe_support` is a separate hard-coded runtime table | Wire through the existing adapter/capability and shared native-feed contracts. Direct calls on prepared dictionaries do not prove native scan/load coverage. |
+| Observation ids combine runtime, record position and the current collector-list index, with no session/generation binding | Qualify identity with the existing session identity and source generation; use native record plus field locator. Snapshot/batch/page extraction must yield the same ids within a generation, independent of how many earlier observations happened to be returned. |
+| A Codex turn counter chooses the response id for `scope_id`; legacy `total_token_usage` becomes `scope_kind=turn`, `counter_name=turn_token_usage` | The declared entity kind, its identifier and counter semantics must agree. Keep request links separate; map a verified thread/session counter to that scope or retain unknown scope, not a fabricated turn. |
+| An OpenCode step is assigned `scope_kind=turn` without a normalized turn association | Preserve the step/model-operation identity and native step marker. Use a common turn link only after the shared interpreter establishes one. |
+| Collector helpers repeat native token mapping and reduce the observation to legacy `Usage`; invalid/unknown-only metrics can disappear | Share adapter-local extraction with activity instead of creating a second mapping authority. Preserve safe native metric values and rejection diagnostics; legacy `Usage` is only a compatibility projection. |
+| Pi independent-usage `kind`, provider, nested tool-call link, cost-provider marker and detailed metric data are not all retained | Preserve native operation metadata, shared invocation links and amount-specific evidence. Unknown operation names remain available even when no canonical category matches. |
+
+Synthetic probes reproduced the scope mismatches, same observation ids for equal
+source positions without session qualification, dropped invalid/extension-only
+usage, and lost independent-usage metadata. They are not complete U1 regression
+coverage. No native history was modified and no missing field was estimated.
+Preserve the committed scaffold; complete or refactor it rather than replacing
+it with another parser. U2 acceptance requires resolving these identity/scope
+assumptions before trusting additive totals. At this committed checkpoint U1
+is partial and U2-U4 are unimplemented; subsequent working changes require their
+own verification and do not inherit acceptance from these probes.
+
 ## 3. Data model
 
 Use three layers. An observation is evidence, a record is one reconciled unit,
 and a summary is a scoped arithmetic projection. None is an evaluation result.
-Names below are proposed, not current public symbols.
+The contract below is proposed, not a current public API. A same-named internal
+collector type does not establish that the complete contract is implemented.
 
 Granularity is explicit: a **call** is one model request/response operation; a
 **message** is a native message, not each rendered text/thinking/tool fragment;
@@ -164,7 +193,7 @@ tests rather than speculative universal workflow abstractions.
 | Field group | Required meaning |
 |---|---|
 | Identity | `observation_id`, runtime/session ref, source generation, record/field locator; no prompt/content hash as a call identity |
-| Entity | `scope_kind`: `call`, `message`, `turn`, `session`, `unknown`; native scope id where present |
+| Entity | `scope_kind`: `call`, `message`, `turn`, `session`, `unknown`; a matching shared entity reference when resolved, with native scope id/evidence kept separately |
 | Measurement | `counter_kind`: `absolute`, `delta`, `cumulative`, `unknown`; cumulative counter identity and reset epoch only where supported |
 | Operation | `model_call`, `compaction`, `branch_summary`, `cache_warm`, `tool_nested`, or `unknown`; preserve the native operation string for unfamiliar kinds |
 | Correlation | Native response/request/message/turn/tool ids, branch entry, root turn, parent/origin session and their individual evidence; each optional |
@@ -189,9 +218,12 @@ and links above, normalized metrics, `revision`, and reconciliation diagnostics.
 Records can be call-level details **or** coarser rollups; record lists are not
 universally additive. Summaries return the selected contributing record ids.
 
-- Prefer native response/entry/message identity within its runtime and proven
-  origin. Otherwise use a generation-local source-position identity, explicitly
-  labeled `identity_basis=source_position`. Do not promise rewrite-stable ids.
+- Prefer native response/entry/message identity within its runtime, canonical
+  session identity and proven origin. Otherwise use a generation-local source-
+  record/field identity, explicitly labeled `identity_basis=source_position`.
+  Do not derive identity from a collector's output index. Equal local ids in
+  unrelated sessions stay distinct; full and chunked extraction of the same
+  generation agree. Do not promise rewrite-stable ids.
 - Response splitting, text/thinking/tool fragments and repeated snapshots refer
   to the same usage record; they do not create new consumption.
 - Expose message-to-usage links as many-to-many. Keep only a turn/session link
@@ -499,8 +531,9 @@ projection scope differs from accounting scope.
 
 ## 7. Implementation stages and acceptance
 
-No parser fixes are part of this design-only change. Each future stage is a
-complete, tested slice; do not expose an unfinished command/capability.
+No parser fixes are part of this design-only change. Complete the partial U1
+scaffold against §2.4 before treating it as delivered. Each stage is a complete,
+tested slice; do not expose an unfinished command/capability.
 
 | Stage | Work and owning locations | Gate |
 |---|---|---|
@@ -518,7 +551,9 @@ following text message; tool-only/thinking-only/empty responses; repeated pages
 and resumed readers; unknown operation kinds; recorded-cost-only records; and
 non-finite/fractional/negative metrics preserved with diagnostics. Also run the
 generality cases in §3 and assert that core reconciliation has no runtime-name
-branches or duplicated session/turn/message identity model.
+branches or duplicated session/turn/message identity model. Include equal local
+ids in different sessions, source-field identity across batch/page boundaries,
+coarse counters without fine-grained ids, and step-versus-turn distinction.
 
 Verification must use an independent native-data oracle, not just agreement
 between SessKit's snapshot and reader sharing the same bug. Compare exact native
