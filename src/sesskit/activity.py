@@ -261,6 +261,7 @@ def _pi_usage(message: dict, record: str) -> Usage | None:
         fields["output_tokens"] = _pi_int(usage.get("output"))
         fields["cache_read_tokens"] = _pi_int(usage.get("cacheRead"))
         fields["cache_write_tokens"] = _pi_int(usage.get("cacheWrite"))
+        fields["reasoning_tokens"] = _pi_int(usage.get("reasoning"))
         fields["total_tokens"] = _pi_int(usage.get("totalTokens"))
         details = usage.get("cost")
         if isinstance(details, dict):
