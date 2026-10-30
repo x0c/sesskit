@@ -73,6 +73,11 @@ messages. The recipe intentionally does not sum tokens or costs. Missing values
 stay null, not zero; no price lookup or cost estimate is performed. Session
 outcomes describe persisted history, not whether a process is currently running.
 
+The [native usage data design](NATIVE_USAGE_DATA_DESIGN.md) specifies planned
+reconciled records, scoped summaries and versioned exports. Its proposed APIs
+are not available yet. SessKit supplies native data; evaluation and the meaning
+of an external task remain with the consumer.
+
 ## 3. Follow one session
 
 Source: [follow_session.py](../examples/follow_session.py).

@@ -22,14 +22,41 @@ evidence is collected in §6.
 
 ## 2. Target design
 
+### Native data scope (owner clarification, 2026-10-30)
+
+SessKit does not perform agent evaluation. It supplies as much useful,
+source-supported session data as possible so independent consumers can analyze
+or evaluate it without maintaining a second native-history parser. Token and
+recorded-cost evidence must support the finest granularity the source actually
+provides, including model calls, messages, turns, auxiliary operations, and
+session totals, without inventing finer attribution. Consumer-defined tasks,
+benchmarks, correctness scores, success criteria, pricing, and billing remain
+outside the library. A runtime's task-complete marker is completion evidence,
+not proof that a consumer's task succeeded.
+
+The unified abstraction must remain general-purpose (owner clarification,
+2026-10-30): model common historical semantics, not the field layout of a favored
+runtime or one downstream use case. Usage reuses session/message/turn identity,
+relations and evidence; it must not create a competing hierarchy. Runtime-specific
+mapping and namespaced native extensions belong behind adapters. Common fields
+remain typed and meaningful, not an unvalidated dictionary. Do not assume one
+model per session, one message per call, or a visible message for every operation.
+
+The owner-approved outcome is richer, trustworthy data, not an evaluation
+framework. Detailed usage models, reconciliation, export, and implementation
+stages are specified in [Native usage data design](NATIVE_USAGE_DATA_DESIGN.md);
+its proposed interfaces are not current APIs.
+
+### Cross-runtime structure
+
 - **Runtime adapter (P1).** Each runtime implements one adapter: `id`, `display_name`, `capabilities`, `scan(options)`, `open(session)` returning a reader, and snapshot load. `Capabilities` is a frozen, typed declaration, for example: incremental reading, structured questions, permission records, native tool-result status, native turn boundaries, subagent linkage, usage data. Consumers branch on capabilities, never on runtime names. The registry holds adapters; public entry points dispatch through it only.
 - **Single interpretation (P2).** Typed activity is the only interpreter of raw records. Plain conversation, v1 transcript, list previews, and status tags are projections of it with one documented error policy.
 - **Session record split (P3).** `SessionRef` (runtime, native id, history location), `SessionMetadata` (cwd, times, native title, relations), `SessionSummary` (previews, outcome), `ProcessObservation` (pid and its evidence). Display strings belong to consumers. The flat v1 record remains a compatibility projection until a versioned schema retires it.
-- **Turns (P4).** A turn starts at a user input and ends at the next user input or end of history; runtimes with native turn records (Codex turns, Pi `turn_start`/`turn_end`, Claude result per turn, OpenCode steps) define the boundary instead. `TurnOutcome` states: `completed`, `awaiting_input`, `interrupted`, `failed`, `rejected` (the model refused; not an error), `in_progress`, `unknown`, with evidence, optional error, and the native stop reason kept verbatim next to the normalized value. The session outcome is derived from the last turn. A bare trailing user message is weak evidence: it may yield `in_progress` with inferred evidence, never `awaiting_input`.
+- **Turns (P4).** A turn is an interaction span, with user-delimited inference as a fallback. Use native boundaries only when their semantics match that normalized span; preserve model-call/step boundaries separately. A native object named "turn" or an OpenCode step is not automatically a normalized user turn. Keep boundary kind and native-versus-derived evidence explicit. `TurnOutcome` states: `completed`, `awaiting_input`, `interrupted`, `failed`, `rejected` (the model refused; not an error), `in_progress`, `unknown`, with evidence, optional error, and the native stop reason kept verbatim next to the normalized value. The session outcome is derived from the last turn. A bare trailing user message is weak evidence: it may yield `in_progress` with inferred evidence, never `awaiting_input`.
 - **Typed events (P5).** Events are a tagged union of per-kind types sharing `seq`, `ts`, `message_id`, `turn_id`, and `evidence`; native raw payloads stay attached. Target kinds: `user_message`, `assistant_message`, `thinking`, `tool_call`, `tool_result`, `interaction_request`, `interaction_resolution`, `error`, `compaction`, `system_context`, `attachment`, `usage`, `plan_update`, `queued_input`, `lifecycle`. A paired `ToolInvocation` view is provided by SessKit with status `proposed`, `succeeded`, `failed`, `denied` (refusal by a person or policy, never `failed`), `awaiting_approval`, `timed_out`, `unknown`; missing evidence is `unknown`, never success.
 - **Error taxonomy (P7).** Closed kinds: `rate_limited`, `quota_exhausted`, `auth`, `context_length`, `provider_overloaded`, `provider_error`, `policy_blocked`, `tool_error`, `user_interrupt`, `timeout`, `runtime_crash`, `unknown`; plus `scope` (`tool`, `turn`, `session`), native `code` and `http_status` only when natively present, raw message, `retryable` (true, false, or unknown), and evidence. Unclassifiable errors are `unknown`, never guessed. Refusals and denials are not errors.
 - **Interactions.** One request model covers `question`, `permission`, `plan_approval`, `elicitation_form`, and `elicitation_url`. Resolution: `pending`, `answered`, `approved`, `denied`, `declined`, `dismissed`, `expired`, `unknown`, plus `decided_by` (`human`, `policy`, `unknown`) and `is_secret` / `is_blocking` where native. Approval polarity and explicit "no" are never folded into dismissal. SessKit models requests and resolutions as data only; submitting answers stays with the host.
-- **Added concepts (P6).** Added only where native history provides evidence, each behind a capability flag: session relations (`subagent`, `fork`, `continuation`, with lineage validation that quarantines cycles, self-parents, and malformed links; a superseded session keeps its record with a `superseded_by` marker and chain resolution stops at missing targets), usage ticks per step/turn with model attribution (cost only when natively recorded; pricing is a consumer projection), compaction records (trigger, summary reference, first kept entry), system/injected context kept out of plain conversation, attachments, plan items with replace-all semantics, and steering versus queued input.
+- **Added concepts (P6).** Added only where native history provides evidence, each behind a capability flag: session relations (`subagent`, `fork`, `continuation`, with lineage validation that quarantines cycles, self-parents, and malformed links; a superseded session keeps its record with a `superseded_by` marker and chain resolution stops at missing targets), native usage observations and reconciled records under the [usage design](NATIVE_USAGE_DATA_DESIGN.md) (recorded values only; pricing is a consumer projection), compaction records (trigger, summary reference, first kept entry), system/injected context kept out of plain conversation, attachments, plan items with replace-all semantics, and steering versus queued input.
 - **Incremental cursors (P9).** Opaque, versioned cursor holding a content fingerprint (head checksum plus file identity, not inode alone), the committed offset of the next unread complete record (committed after processing), and runtime-specific auxiliary state (Pi leaf and chain, SQLite row id). Truncation, replacement, or fingerprint mismatch starts a new generation and resyncs; it never continues silently.
 - **Conformance (P8).** A shared conformance suite runs every adapter against synthetic fixtures (ordering, pairing, evidence, error, and outcome invariants). A `verify` CLI command runs real-history parity and timing over local sessions and prints counts only, never content.
 
@@ -53,6 +80,8 @@ evidence is collected in §6.
 | G | Producers emit turns, the taxonomy, and new concepts (P6) — new concepts landed 2026-09-30: `SessionRelation` + `session_relations` (`relations.py`), `Usage` on assistant events, `compaction` event kind + `CompactionInfo` markers, `origin` (human/injected/system/unknown) on user events, `compaction_markers` + `message_origin` capability flags (all five typed runtimes; Kimi deferred); turn/error remainder landed 2026-10-01: native `turn_id` stamping (Codex item/terminal turn ids; Pi/Claude/OpenCode keep derived ids — no native per-message turn record observed), typed-only `lifecycle` terminal markers (Codex `turn_aborted`/bare `task_complete`, OpenCode empty tail rows), classified event errors with `scope` + `http_status`, Pi `stopReason` verbatim + text-riding errors, Codex `verified_answer` linkage (`decided_by=human`), one shared `visibility.py` predicate for conversation + v1 | C, F |
 | H | Session record split with versioned schema (P3) | F |
 | I | Bounded-tail activity state for host polling loops — proposed 2026-09-30: hosts that poll many sessions every few seconds (attention/status indicators) measured ~4 ms p95 per session per tick with their own native tail reads, while full `load_activity` snapshots cost ~16x that; they need a reader-style API that returns only the current turn state (working / waiting on a structured question / idle / error end) from a bounded tail with a persisted cursor, and `pending` interaction resolution only on explicit native evidence. Not started. | D, C |
+
+Native usage stages U1-U4 are proposed in [Native usage data design](NATIVE_USAGE_DATA_DESIGN.md#7-implementation-stages-and-acceptance): independent native records, reliable summaries, versioned snapshot export, then incremental revisions. Stage G's existing event-attached `Usage` is not evidence that those accounting stages have landed.
 
 Each stage lands with conformance fixtures, real-history parity for affected runtimes, and no timing regression on the `verify` report.
 
