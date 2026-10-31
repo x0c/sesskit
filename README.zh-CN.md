@@ -2,7 +2,7 @@
 
 **语言：** [English](README.md) | 简体中文
 
-从磁盘解析并导出本机 **Claude Code**、**Codex CLI**、**Cursor** 助手的会话文件，统一成一套 JSON 契约。同时支持 OpenCode、Kimi Code、Pi。
+从磁盘解析并导出本机 **Claude Code**、**Codex CLI**、**Cursor**、**OpenCode**、**Kimi Code** 和 **Pi** 助手的会话文件，统一成一套 JSON 契约。
 
 这是 **Python 解析库 + JSON 命令行**，不是终端界面，也不是会话管理器。其他工具可调用 `sesskit` CLI，或按公开 JSON Schema 自行实现。
 
@@ -11,17 +11,17 @@
 ## 用 SessKit 构建工具
 
 - 将本地对话送入自己的搜索索引或知识库。
-- 不解析运行时原始文件，直接读取原生用量与历史结局。
+- 不解析运行时原始文件，直接读取各助手的用量数据与历史记录。
 - 在自己的会话客户端中消费增量事件。
 
 从[接入指南和三个可运行示例](docs/INTEGRATION_GUIDE.md)开始。
-读取已有本地历史不需要模型账号或 API key。
+读取本地已有历史不需要模型账号或 API key。
 
 ## 安装
 
-SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装固定发布版本的 wheel。
+SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装指定版本的 wheel。
 
-需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。不宣称支持 Windows。
+需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。暂不支持 Windows。
 
 ```bash
 python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.21/sesskit-0.2.21-py3-none-any.whl"
@@ -45,9 +45,9 @@ sesskit describe
 sesskit verify --sample 30
 ```
 
-修改解析器或加载链路后，`sesskit verify` 是必跑的真实历史一致性检查。它会对照普通对话、v1 事件、typed 活动记录和受支持的增量读取结果，并输出各运行时的计数、结局、违反项与耗时，不输出内容或路径。扫描、加载、读取或探针失败都不能判为通过；没有样本时会明确标记为未验证，而不是通过；独立读取期间若历史仍在变化，则标记为未定，也不能算通过。Kimi 暂不支持 typed 活动记录和增量读取是预期能力边界，但仍会执行旧版对话与事件检查。这项检查只验证 SessKit 自身各视图是否一致，不是独立的语义正确性判定。检查失败或未验证时，命令会以非零状态结束。
+修改解析器或加载链路后，请运行 `sesskit verify`：它会交叉核对普通对话、v1 事件、类型化活动记录和增量读取，并报告各运行时的计数、结果、违反项和耗时——不输出内容或路径。检查失败时会以非零状态退出。
 
-命令均输出同一套 JSON envelope：
+命令均输出同一套 JSON 信封：
 
 ```json
 {"ok": true, "data": {...}, "error": null, "meta": {"version": 1}}
@@ -87,7 +87,7 @@ for runtime_id, items in sessions.items():
 
 只读。不会启动助手、恢复对话，也不会改写历史文件。
 
-会真实启动助手会话的自动化（测试、评测、探针）可以在工作区根目录放一个空的 `.sesskit-ignore` 文件，让这些会话不进列表；见 [`docs/CONTRACT.md`](docs/CONTRACT.md)。
+会真实启动助手会话的自动化（测试、评测、探针）可以在工作区根目录放一个空的 `.sesskit-ignore` 文件，即可将其排除在列表之外；见 [`docs/CONTRACT.md`](docs/CONTRACT.md)。
 
 ## 契约
 
@@ -99,18 +99,18 @@ for runtime_id, items in sessions.items():
 |---|---|
 | 普通对话 | Python `load_session_conversation`，或 CLI `show` / `export` |
 | 在其他语言中读取兼容 JSON 事件 | CLI `share` + transcript v1 schema |
-| 丰富的证据、用量、结局或增量读取 | Python API，见[接入指南](docs/INTEGRATION_GUIDE.md) |
+| 丰富的证据、用量、结果或增量读取 | Python API，见[接入指南](docs/INTEGRATION_GUIDE.md) |
 
-Transcript v1 是兼容投影，不包含更丰富的 Python 模型中的所有字段。
+Transcript v1 是面向兼容的精简视图，不包含更丰富的 Python 模型中的所有字段。
 `sesskit search` 搜索标题和摘要，不搜索完整对话正文。
-导出内容可能包含秘密；分享或上传前请先检查。
+导出内容可能包含密钥等敏感信息；分享或上传前请先检查。
 
 ## 非目标（v1）
 
 - 启动或控制助手
 - 终端界面或会话管理器
 - 写入或删除会话历史
-- Go / TypeScript 绑定（请消费 CLI / Schema）
+- Go / TypeScript 绑定（请直接使用 CLI / Schema）
 
 ## 你在构建什么？
 

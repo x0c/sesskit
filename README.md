@@ -2,7 +2,7 @@
 
 **Languages:** English | [简体中文](README.zh-CN.md)
 
-Parse and export local **Claude Code**, **Codex CLI**, and **Cursor** agent session files from disk into one JSON schema. Also reads OpenCode, Kimi Code, and Pi.
+Parse and export local **Claude Code**, **Codex CLI**, **Cursor**, **OpenCode**, **Kimi Code**, and **Pi** agent session files from disk into one JSON schema.
 
 This is a **Python library and JSON CLI** — not a TUI, not a session manager. Other tools integrate by shelling out to `sesskit` or by validating against the published JSON Schema.
 
@@ -11,7 +11,7 @@ This is a **Python library and JSON CLI** — not a TUI, not a session manager. 
 ## Build with SessKit
 
 - Feed local conversations into your own search index or knowledge base.
-- Inspect native usage and historical outcomes without parsing runtime files.
+- Inspect usage and historical outcomes without parsing runtime files.
 - Follow incremental events in your own session client.
 
 Start with the [integration guide and three runnable examples](docs/INTEGRATION_GUIDE.md).
@@ -21,7 +21,7 @@ No model account or API key is needed to read existing local history.
 
 SessKit is not on PyPI yet. Install the fixed-release wheel in your project's virtual environment.
 
-Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not claimed on Windows.
+Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not supported on Windows.
 
 ```bash
 python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.21/sesskit-0.2.21-py3-none-any.whl"
@@ -45,17 +45,7 @@ sesskit describe
 sesskit verify --sample 30
 ```
 
-After changing parsers or load wiring, `sesskit verify` is the required
-real-history consistency gate. It checks conversation, v1 events, typed
-activity, and supported incremental readers against one another, and reports
-per-runtime counts, outcomes, violations, and timings — never content or
-paths. Scan/load/reader/probe failures prevent a pass; a runtime with no
-samples is marked unverified, not passed. Kimi's documented lack of typed
-activity and incremental readers is expected, while its legacy checks still
-run. Reads overlapping a live source change are inconclusive, not passes.
-This verifies internal consistency, not semantic correctness against an
-independent oracle. The command exits non-zero when verification fails or is
-unverified.
+After changing parsers or load wiring, run `sesskit verify`: it cross-checks conversation, v1 events, typed activity, and incremental readers, and reports per-runtime counts, outcomes, violations, and timings — never content or paths. A failing check exits non-zero.
 
 Every command prints one JSON envelope:
 
@@ -93,12 +83,11 @@ for runtime_id, items in sessions.items():
 
 See the [capability matrix](docs/INTEGRATION_GUIDE.md#capability-matrix) for typed
 activity, incremental reading, questions, native turn markers, usage, and compaction.
-Capabilities are also returned by `sesskit describe`; unavailable data is not zero
-or proof of success.
+Capabilities are also returned by `sesskit describe`; if a runtime exposes no data, SessKit reports it as unavailable — never as zero, and never as success.
 
 Read-only. It does not launch agents, resume chats, or write history.
 
-Automation that launches real agent sessions (tests, evals, probes) can keep them out of listings by placing an empty `.sesskit-ignore` file in its workspace root; see [`docs/CONTRACT.md`](docs/CONTRACT.md).
+If your automation launches real agent sessions (tests, evals, probes), keep them out of listings by placing an empty `.sesskit-ignore` file in its workspace root; see [`docs/CONTRACT.md`](docs/CONTRACT.md).
 
 ## Schemas
 
@@ -112,8 +101,7 @@ See [`schemas/`](schemas/) and [`docs/CONTRACT.md`](docs/CONTRACT.md).
 | Compatible JSON events from another language | CLI `share` + transcript v1 schema |
 | Rich evidence, usage, outcomes, or incremental readers | Python API; see the [integration guide](docs/INTEGRATION_GUIDE.md) |
 
-Transcript v1 is a compatibility projection, not every field in the richer Python
-model. `sesskit search` matches titles and excerpts, not full conversation text.
+Transcript v1 is a compatibility-oriented subset, not every field in the richer Python model. `sesskit search` matches titles and excerpts, not full conversation text.
 Exported content may contain secrets; review it before sharing or uploading.
 
 ## Non-goals (v1)
