@@ -126,6 +126,7 @@ _V2_FIXTURE_SESSIONS = [
     ("ses_emptytitle", "/repo/empty", None, 1000, 4000),
     ("ses_notitle_nouser", "/repo/drop", None, 1000, 4000),
     ("ses_gap", "/repo/gap", "gap title", 1000, 4000),
+    ("ses_goal", "/repo/goal", "goal native", 1000, 4000),
 ]
 
 _V2_FIXTURE_MESSAGES = [
@@ -213,7 +214,6 @@ _V2_FIXTURE_MESSAGES = [
         1002,
         {"time": {"created": 1002}, "content": [{"type": "text", "text": "maybe"}]},
     ),
-    # 空标题 + 有用户正文 → 保留，走 fallback
     ("ses_emptytitle", "m1", "user", 0, 1001, {"time": {"created": 1001}, "text": "fallback me please"}),
     # 无标题 + 无用户正文（只有 compaction）→ 丢弃
     (
@@ -223,6 +223,58 @@ _V2_FIXTURE_MESSAGES = [
         0,
         1001,
         {"status": "completed", "reason": "auto", "summary": "noise"},
+    ),
+    # 目标驱动会话：无 user 行，初始目标 synthetic 携带用户意图；
+    # 尾部 assistant 为纯工具行时预览应取最后一条非空正文。
+    (
+        "ses_goal",
+        "m1",
+        "synthetic",
+        5,
+        1001,
+        {
+            "metadata": {"source": "goal", "goalID": "g1"},
+            "time": {"created": 1001},
+            "text": "A goal is now active for this session.\n\n<untrusted_objective>\ncalibrate token stats\n</untrusted_objective>",
+            "description": "Goal: calibrate token stats",
+        },
+    ),
+    (
+        "ses_goal",
+        "m2",
+        "assistant",
+        6,
+        1002,
+        {
+            "time": {"created": 1002},
+            "content": [{"type": "text", "text": "first answer"}],
+            "finish": "tool-calls",
+        },
+    ),
+    (
+        "ses_goal",
+        "m3",
+        "assistant",
+        7,
+        1003,
+        {
+            "time": {"created": 1003},
+            "content": [{"type": "tool", "id": "call_1", "name": "bash"}],
+            "finish": "tool-calls",
+        },
+    ),
+    # Continue working 行只带评审备注，不得重复计入用户意图。
+    (
+        "ses_goal",
+        "m4",
+        "synthetic",
+        8,
+        1004,
+        {
+            "metadata": {"source": "goal", "goalID": "g1"},
+            "time": {"created": 1004},
+            "text": "Continue working toward the active goal.\n\n<untrusted_objective>\ncalibrate token stats\n</untrusted_objective>\n\nreviewer notes",
+        },
     ),
     # seq 跳号排序：4,5,12
     ("ses_gap", "m1", "user", 4, 1001, {"time": {"created": 1001}, "text": "first"}),
@@ -392,6 +444,19 @@ class SyntheticV2Tests(unittest.TestCase):
         info = self._by_id("ses_emptytitle")
         self.assertIsNone(info["native_title"])
         self.assertEqual(info["fallback_title"], "fallback me please")
+
+    def test_goal_synthetic_provides_user_and_last_nonempty_assistant(self):
+        info = self._by_id("ses_goal")
+        self.assertEqual(info["first_user_msg"], "calibrate token stats")
+        self.assertEqual(info["last_user_msg"], "calibrate token stats")
+        self.assertEqual(info["fallback_title"], "calibrate token stats")
+        # 尾部纯工具行不得清空预览，应回落到最后一条非空正文。
+        self.assertEqual(info["last_agent_msg"], "first answer")
+        conv = oc.load_conversation(self.db_path, "ses_goal")
+        self.assertEqual(
+            [(m.role, m.text) for m in conv],
+            [("user", "calibrate token stats"), ("assistant", "first answer")],
+        )
 
     def test_no_title_no_user_text_is_dropped(self):
         sessions = oc.scan_sessions(limit=50)

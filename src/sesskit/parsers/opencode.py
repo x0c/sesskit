@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 from collections import OrderedDict
@@ -597,6 +598,40 @@ def _error_kind_from_msg(msg: object) -> str:
     return ""
 
 
+def _synthetic_goal_text(data: dict) -> str:
+    """Extract the user objective from an OpenCode goal synthetic, else "".
+
+    Goal sessions (e.g. background workers) store the initial prompt as
+    ``type='synthetic'`` with ``metadata.source='goal'`` instead of a
+    ``type='user'`` row. The clean objective lives in ``description``
+    ("Goal: <objective>"); fall back to ``<untrusted_objective>`` in text.
+    Only the initial "A goal is now active" row is user intent — later
+    "Continue working toward the active goal" rows carry reviewer notes
+    and must not duplicate the task.
+    """
+    if not isinstance(data, dict):
+        return ""
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("source") != "goal":
+        return ""
+    description = data.get("description")
+    if isinstance(description, str) and description.strip():
+        text = description.strip()
+        if text.lower().startswith("goal:"):
+            text = text[5:].strip()
+        if text:
+            return text
+    text = data.get("text")
+    if not isinstance(text, str) or "A goal is now active" not in text:
+        return ""
+    match = re.search(
+        r"<untrusted_objective>\s*(.*?)\s*</untrusted_objective>", text, re.DOTALL
+    )
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
 
 def _build_session_info(
     row: sqlite3.Row,
@@ -718,17 +753,20 @@ def _build_session_info_v2(
 ) -> dict | None:
     """v2 单会话列表项：预览/状态/大小全部从 session_message 现算。
 
-    first/last_user_msg 取 type='user' 按 seq 首/尾行的 data.text；
-    last_agent_msg 取尾部 assistant 行的 text 拼接（0 文本但有 error 时填
-    error 文本）；size 取 SUM(LENGTH(session_message.data))——v1 的 part 源
-    在此表没有对应物，沿用它会恒为 0 并让 completion_id 尾哈希退化；
-    fallback_title 取首条 user 正文首行 60 字；title 为空是正常态，只有
-    “无标题 + 无用户正文”才丢弃（与 v1 相同的空会话规则）。
+    first/last_user_msg 取 type='user' 按 seq 首/尾行的 data.text；无 user
+    行的目标驱动会话（goal synthetic）取首个初始目标的 objective；
+    last_agent_msg 取尾部最后一条非空 assistant 文本（与 v1 取最后 text
+    part 的口径对齐，0 文本但有 error 时填 error 文本）；size 取
+    SUM(LENGTH(session_message.data))——v1 的 part 源在此表没有对应物，
+    沿用它会恒为 0 并让 completion_id 尾哈希退化；fallback_title 取首条
+    user 正文首行 60 字；title 为空是正常态，只有“无标题 + 无用户正文”
+    才丢弃（与 v1 相同的空会话规则）。
     """
     session_id = str(row["id"])
     msg_rows = conn.execute(_V2_MESSAGES_SQL, (session_id,)).fetchall()
     typed_rows: list[tuple[str, dict]] = []
     user_texts: list[str] = []
+    goal_texts: list[str] = []
     assistant_datas: list[dict] = []
     last_anchor = ""
     for msg_row in msg_rows:
@@ -741,11 +779,25 @@ def _build_session_info_v2(
             assistant_datas.append(data)
             # 原生轮次锚点：同文本不同轮次靠消息 id/seq 区分。
             last_anchor = f"{msg_row['id']}:{msg_row['seq']}"
-    first_user = user_texts[0] if user_texts else ""
-    last_user = user_texts[-1] if user_texts else ""
-    last_agent_text = (
-        _v2_assistant_text(assistant_datas[-1]) if assistant_datas else ""
-    )
+        elif row_type == "synthetic":
+            goal_text = _synthetic_goal_text(data)
+            if goal_text:
+                goal_texts.append(goal_text)
+    if user_texts:
+        first_user = user_texts[0]
+        last_user = user_texts[-1]
+    elif goal_texts:
+        first_user = goal_texts[0]
+        last_user = goal_texts[-1]
+    else:
+        first_user = ""
+        last_user = ""
+    last_agent_text = ""
+    for assistant_data in reversed(assistant_datas):
+        candidate = _v2_assistant_text(assistant_data)
+        if candidate.strip():
+            last_agent_text = candidate
+            break
     status, error_data = _status_and_error_v2(typed_rows)
     terminal_error: dict[str, object] = {}
     if status == titles.STATUS_ABORTED:
@@ -755,7 +807,11 @@ def _build_session_info_v2(
             message=error_text_from_msg(error_data),
         )
     if not last_agent_text and status == titles.STATUS_ABORTED and assistant_datas:
-        last_agent_text = error_text_from_msg(assistant_datas[-1])
+        for assistant_data in reversed(assistant_datas):
+            candidate = error_text_from_msg(assistant_data)
+            if candidate.strip():
+                last_agent_text = candidate
+                break
 
     cwd = row["directory"] or ""
     native_title = row["title"] or None
@@ -1228,11 +1284,13 @@ def delete_session(db_path: str, session_id: str) -> None:
 
 
 def _load_conversation_v2(db_path: str, session_id: str) -> list[ConversationMessage]:
-    """v2 会话按 seq 顺序读用户正文与助手 text 拼接；只认 user/assistant 行。
+    """v2 会话按 seq 顺序读用户正文与助手 text 拼接；认 user/assistant 行。
 
-    system/synthetic/compaction/idle 直接跳过；assistant 空文本但带 error 时
-    用 error 文本占位（0 文本 error 轮不丢，尾部 idle/system 不干扰排序——
-    它们根本不进列表）。
+    目标驱动会话没有 user 行，初始目标以 synthetic
+    （metadata.source='goal'）落盘；首个初始目标按 seq 位置以 user 身份
+    呈现，其它 synthetic/system/compaction/idle 直接跳过；assistant 空文本
+    但带 error 时用 error 文本占位（0 文本 error 轮不丢，尾部 idle/system
+    不干扰排序——它们根本不进列表）。
     """
     conn = _connect_ro(db_path)
     if conn is None:
@@ -1247,9 +1305,17 @@ def _load_conversation_v2(db_path: str, session_id: str) -> list[ConversationMes
     messages: list[ConversationMessage] = []
     for row in rows:
         row_type = str(row["type"] or "")
+        data = _v2_json_dict(row["data"])
+        if row_type == "synthetic":
+            goal_text = _synthetic_goal_text(data)
+            if not goal_text.strip():
+                continue
+            messages.append(
+                ConversationMessage("user", goal_text.strip(), _v2_msg_time_ms(data))  # type: ignore[arg-type]
+            )
+            continue
         if row_type not in ("user", "assistant"):
             continue
-        data = _v2_json_dict(row["data"])
         if row_type == "user":
             text = _v2_user_text(data).strip()
         else:
