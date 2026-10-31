@@ -1283,6 +1283,206 @@ def delete_session(db_path: str, session_id: str) -> None:
         _delete_session_v2(db_path, session_id)
 
 
+_CLONE_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def _clone_new_id(conn: sqlite3.Connection, prefix: str, tables: tuple[str, ...]) -> str:
+    """Generate a `ses_`/`msg_`/`prt_` id that collides with nothing in `tables`.
+
+    OpenCode ids are `<prefix>` + 26 alnum chars. Uniqueness is checked against
+    every table that carries such ids so a fork never violates a PRIMARY KEY.
+    """
+    import secrets as _secrets
+
+    for _ in range(32):
+        candidate = prefix + "".join(_secrets.choice(_CLONE_ID_ALPHABET) for _ in range(26))
+        hit = False
+        for table in tables:
+            try:
+                row = conn.execute(f'SELECT 1 FROM "{table}" WHERE id = ?', (candidate,)).fetchone()
+            except sqlite3.Error:
+                continue
+            if row is not None:
+                hit = True
+                break
+        if not hit:
+            return candidate
+    raise ValueError("无法生成不冲突的新会话 id")
+
+
+def _clone_session_v1(conn: sqlite3.Connection, session_id: str, new_id: str, now_ms: int) -> None:
+    """Copy one v1 session (session/message/part) under a new id in one transaction.
+
+    message/part rows get fresh ids (both are PRIMARY KEY); part.message_id is
+    remapped so text/file/image parts — including image-first turns — stay
+    attached to their own message. The fork is top-level: parent_id stays NULL
+    (a non-NULL parent_id means subagent and would hide the fork from the list).
+    """
+    row = conn.execute("SELECT * FROM session WHERE id = ?", (session_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"原会话不存在：{session_id}")
+    columns = list(row.keys())
+    values = dict(row)
+    values["id"] = new_id
+    values["parent_id"] = None
+    values["time_created"] = now_ms
+    values["time_updated"] = now_ms
+    values["time_archived"] = None
+    conn.execute(
+        f"INSERT INTO session ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+        [values[c] for c in columns],
+    )
+    msg_map: dict[str, str] = {}
+    for msg in conn.execute("SELECT * FROM message WHERE session_id = ?", (session_id,)):
+        msg_columns = list(msg.keys())
+        msg_values = dict(msg)
+        fresh = _clone_new_id(conn, "msg_", ("message", "session_message"))
+        msg_map[str(msg_values["id"])] = fresh
+        msg_values["id"] = fresh
+        msg_values["session_id"] = new_id
+        conn.execute(
+            f"INSERT INTO message ({', '.join(msg_columns)}) VALUES ({', '.join('?' for _ in msg_columns)})",
+            [msg_values[c] for c in msg_columns],
+        )
+    for part in conn.execute("SELECT * FROM part WHERE session_id = ?", (session_id,)):
+        part_columns = list(part.keys())
+        part_values = dict(part)
+        old_msg_id = str(part_values["message_id"])
+        if old_msg_id not in msg_map:
+            continue
+        part_values["id"] = _clone_new_id(conn, "prt_", ("part",))
+        part_values["message_id"] = msg_map[old_msg_id]
+        part_values["session_id"] = new_id
+        conn.execute(
+            f"INSERT INTO part ({', '.join(part_columns)}) VALUES ({', '.join('?' for _ in part_columns)})",
+            [part_values[c] for c in part_columns],
+        )
+
+
+def _clone_session_v2(conn: sqlite3.Connection, session_id: str, new_id: str, now_ms: int) -> None:
+    """Copy one v2 session (session_v2/session_message/blob_ref) under a new id.
+
+    Message rows keep seq/type/data verbatim (images are inline base64 in data,
+    so image-first turns survive byte-for-byte) but get fresh ids; the UNIQUE
+    (session_id, seq) index stays satisfied because the session is new.
+    blob_ref rows are remapped to the fresh message ids; blob bodies are
+    content-addressed and shared, never copied. Transient rows (inbox/pending/
+    instruction_*) are intentionally left behind. fork_session_id points at the
+    source and fork_boundary marks its last message, mirroring native fork.
+    """
+    try:
+        row = conn.execute("SELECT * FROM session_v2 WHERE id = ?", (session_id,)).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        raise ValueError(f"原会话不存在：{session_id}")
+    columns = list(row.keys())
+    values = dict(row)
+    messages = conn.execute(
+        "SELECT * FROM session_message WHERE session_id = ? ORDER BY seq ASC",
+        (session_id,),
+    ).fetchall()
+    last_source_msg = messages[-1]["id"] if messages else None
+    values["id"] = new_id
+    values["parent_id"] = None
+    values["fork_session_id"] = session_id
+    if last_source_msg is not None:
+        values["fork_boundary"] = json.dumps({"type": "through", "messageID": str(last_source_msg)})
+    else:
+        values["fork_boundary"] = None
+    values["time_created"] = now_ms
+    values["time_updated"] = now_ms
+    values["time_archived"] = None
+    conn.execute(
+        f"INSERT INTO session_v2 ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+        [values[c] for c in columns],
+    )
+    msg_map: dict[str, str] = {}
+    for msg in messages:
+        msg_columns = list(msg.keys())
+        msg_values = dict(msg)
+        fresh = _clone_new_id(conn, "msg_", ("message", "session_message"))
+        msg_map[str(msg_values["id"])] = fresh
+        msg_values["id"] = fresh
+        msg_values["session_id"] = new_id
+        conn.execute(
+            f"INSERT INTO session_message ({', '.join(msg_columns)}) VALUES ({', '.join('?' for _ in msg_columns)})",
+            [msg_values[c] for c in msg_columns],
+        )
+    for ref in conn.execute("SELECT * FROM blob_ref WHERE session_id = ?", (session_id,)).fetchall():
+        old_msg_id = str(ref["message_id"])
+        if old_msg_id not in msg_map:
+            continue
+        conn.execute(
+            "INSERT INTO blob_ref (session_id, message_id, hash, seq) VALUES (?, ?, ?, ?)",
+            (new_id, msg_map[old_msg_id], ref["hash"], ref["seq"]),
+        )
+    try:
+        extra_parts = conn.execute("SELECT * FROM session_part WHERE session_id = ?", (session_id,)).fetchall()
+    except sqlite3.Error:
+        extra_parts = []
+    for part in extra_parts:
+        old_msg_id = str(part["message_id"])
+        if old_msg_id not in msg_map:
+            continue
+        part_columns = list(part.keys())
+        part_values = dict(part)
+        part_values["message_id"] = msg_map[old_msg_id]
+        part_values["session_id"] = new_id
+        conn.execute(
+            f"INSERT INTO session_part ({', '.join(part_columns)}) VALUES ({', '.join('?' for _ in part_columns)})",
+            [part_values[c] for c in part_columns],
+        )
+
+
+def clone_session(session: SessionInfo) -> SessionInfo:
+    """把单个 OpenCode 会话复制为独立新会话（v1/v2 双表分发），返回新 SessionInfo。
+
+    原会话一行不改；新会话拿到全新 id/message id，图片等内联附件按原文复制，
+    列表按新 mtime 置顶。v2 额外记录 fork_session_id/fork_boundary（指向源会话
+    及其末条消息，与原生分叉语义一致）。瞬时行（inbox/pending/instruction_*）
+    不复制。全程单事务，失败自动 rollback，不会留下半复制状态。
+    """
+    import time as _time
+
+    db_path = str(session.get("path") or "")
+    session_id = str(session.get("id") or "")
+    if not db_path or not session_id or not os.path.isfile(db_path):
+        raise ValueError("原会话未记录历史路径，无法复制")
+    now_ms = int(_time.time() * 1000)
+    new_id = ""
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            probe = conn.execute("SELECT 1 FROM session WHERE id = ?", (session_id,)).fetchone()
+        except sqlite3.Error:
+            probe = None
+        is_v1 = probe is not None
+        if not is_v1:
+            try:
+                probe_v2 = conn.execute("SELECT 1 FROM session_v2 WHERE id = ?", (session_id,)).fetchone()
+            except sqlite3.Error:
+                probe_v2 = None
+            if probe_v2 is None:
+                raise ValueError(f"原会话不存在：{session_id}")
+        new_id = _clone_new_id(conn, "ses_", ("session", "session_v2"))
+        if is_v1:
+            _clone_session_v1(conn, session_id, new_id, now_ms)
+        else:
+            _clone_session_v2(conn, session_id, new_id, now_ms)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    info = refresh_session({"path": db_path, "id": new_id})
+    if info is None:
+        raise ValueError("复制后的会话无法被扫描识别")
+    return info
+
+
 def _load_conversation_v2(db_path: str, session_id: str) -> list[ConversationMessage]:
     """v2 会话按 seq 顺序读用户正文与助手 text 拼接；认 user/assistant 行。
 

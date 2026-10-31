@@ -573,5 +573,189 @@ class ErrorShapeTests(unittest.TestCase):
         )
 
 
+_FAKE_IMAGE_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+
+def _build_clone_fixture_db(path: str) -> None:
+    """克隆回归夹具：v2 带图首轮 + v1 文本/文件 part，同库双分支全覆盖。"""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+            time_created INTEGER, time_updated INTEGER,
+            parent_id TEXT, time_archived INTEGER);
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL);
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL);
+        CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            parent_id TEXT, time_archived INTEGER,
+            fork_session_id TEXT, fork_boundary TEXT);
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+            seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+        CREATE UNIQUE INDEX session_message_session_seq_idx
+            ON session_message (session_id, seq);
+        CREATE TABLE blob_ref (session_id TEXT, message_id TEXT, hash TEXT, seq INTEGER);
+        CREATE TABLE session_part (message_id TEXT, session_id TEXT, ordinal INTEGER,
+            type TEXT, call_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+        """
+    )
+    conn.execute(
+        "INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?,?,?)",
+        ("ses_img", "/repo/img", "img title", 1000, 2000, None, None, None, None),
+    )
+    conn.execute(
+        "INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+        (
+            "msg_img_u",
+            "ses_img",
+            "user",
+            4,
+            1001,
+            1001,
+            json.dumps(
+                {
+                    "time": {"created": 1001},
+                    "text": "[Image 1] 看这张图",
+                    "files": [{"data": _FAKE_IMAGE_B64, "mime": "image/png"}],
+                }
+            ),
+        ),
+    )
+    conn.execute(
+        "INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+        (
+            "msg_img_a",
+            "ses_img",
+            "assistant",
+            7,
+            1002,
+            1002,
+            json.dumps(
+                {
+                    "time": {"created": 1002},
+                    "content": [{"type": "text", "text": "看到了"}],
+                    "finish": "stop",
+                }
+            ),
+        ),
+    )
+    conn.execute(
+        "INSERT INTO session VALUES (?,?,?,?,?,?,?)",
+        ("ses_old", "/repo/old", "old title", 1000, 2000, None, None),
+    )
+    conn.execute(
+        "INSERT INTO message VALUES (?,?,?,?,?)",
+        ("m_old", "ses_old", 1001, 1001, json.dumps({"role": "user"})),
+    )
+    conn.execute(
+        "INSERT INTO part VALUES (?,?,?,?,?,?)",
+        ("p_old_t", "m_old", "ses_old", 1001, 1001, json.dumps({"type": "text", "text": "hello"})),
+    )
+    conn.execute(
+        "INSERT INTO part VALUES (?,?,?,?,?,?)",
+        (
+            "p_old_f",
+            "m_old",
+            "ses_old",
+            1001,
+            1001,
+            json.dumps({"type": "file", "mime": "image/png", "data": _FAKE_IMAGE_B64}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+class CloneTests(unittest.TestCase):
+    """clone_session：v1/v2 双分支复制，图片字节原样保留，原会话不动。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "opencode.db")
+        _build_clone_fixture_db(self.db_path)
+
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_clone_v2_preserves_image_and_seq(self):
+        info = oc.clone_session({"path": self.db_path, "id": "ses_img"})
+        self.assertTrue(str(info["id"]).startswith("ses_"))
+        self.assertNotEqual(info["id"], "ses_img")
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT seq, data FROM session_message WHERE session_id = ? ORDER BY seq",
+            (info["id"],),
+        ).fetchall()
+        self.assertEqual([r["seq"] for r in rows], [4, 7])
+        user_data = json.loads(rows[0]["data"])
+        self.assertEqual(user_data["text"], "[Image 1] 看这张图")
+        self.assertEqual(user_data["files"][0]["data"], _FAKE_IMAGE_B64)
+        fork = conn.execute(
+            "SELECT fork_session_id, fork_boundary FROM session_v2 WHERE id = ?",
+            (info["id"],),
+        ).fetchone()
+        self.assertEqual(fork["fork_session_id"], "ses_img")
+        boundary = json.loads(fork["fork_boundary"])
+        self.assertEqual(boundary["type"], "through")
+        # 原会话一行不改。
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM session_message WHERE session_id = 'ses_img'").fetchone()[0],
+            2,
+        )
+        # 复制体可被正常扫描与读取。
+        ref = oc.refresh_session({"path": self.db_path, "id": info["id"]})
+        self.assertIsNotNone(ref)
+        conv = oc.load_conversation(self.db_path, str(info["id"]))
+        self.assertEqual(
+            [(m.role, m.text) for m in conv],
+            [("user", "[Image 1] 看这张图"), ("assistant", "看到了")],
+        )
+
+    def test_clone_v1_copies_parts_without_orphans(self):
+        info = oc.clone_session({"path": self.db_path, "id": "ses_old"})
+        self.assertNotEqual(info["id"], "ses_old")
+        conn = self._conn()
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM message WHERE session_id = ?", (info["id"],)).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM part WHERE session_id = ?", (info["id"],)).fetchone()[0],
+            2,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM part WHERE session_id = ? AND message_id NOT IN "
+                "(SELECT id FROM message WHERE session_id = ?)",
+                (info["id"], info["id"]),
+            ).fetchone()[0],
+            0,
+        )
+        row = conn.execute("SELECT parent_id, time_archived FROM session WHERE id = ?", (info["id"],)).fetchone()
+        self.assertIsNone(row["parent_id"])
+        self.assertIsNone(row["time_archived"])
+        conv = oc.load_conversation(self.db_path, str(info["id"]))
+        self.assertEqual([(m.role, m.text) for m in conv], [("user", "hello")])
+
+    def test_clone_missing_session_raises(self):
+        with self.assertRaises(ValueError):
+            oc.clone_session({"path": self.db_path, "id": "ses_missing"})
+
+
 if __name__ == "__main__":
     unittest.main()
