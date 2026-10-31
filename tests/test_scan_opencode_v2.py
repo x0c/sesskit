@@ -756,6 +756,39 @@ class CloneTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             oc.clone_session({"path": self.db_path, "id": "ses_missing"})
 
+    def test_delete_v2_without_aux_tables(self):
+        """缺 session_pending 等辅助表的旧库：删除不得整体回滚。"""
+        oc.delete_session(self.db_path, "ses_img")
+        conn = self._conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM session_message WHERE session_id = 'ses_img'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(
+            conn.execute(
+                "SELECT 1 FROM session_v2 WHERE id = 'ses_img'"
+            ).fetchone()
+        )
+
+    def test_clone_v2_without_blob_ref_table(self):
+        raw = sqlite3.connect(self.db_path)
+        try:
+            raw.execute("DROP TABLE blob_ref")
+            raw.commit()
+        finally:
+            raw.close()
+        info = oc.clone_session({"path": self.db_path, "id": "ses_img"})
+        conn = self._conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM session_message WHERE session_id = ?",
+                (info["id"],),
+            ).fetchone()[0],
+            2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

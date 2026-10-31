@@ -1244,24 +1244,33 @@ def _delete_session_v2(db_path: str, session_id: str) -> None:
     同一事务内按 session_message → instruction_entry → instruction_state →
     session_pending → session_inbox → session_v2 有序删除：SQLite 默认没开
     外键约束，不依赖 ON DELETE CASCADE；commit/rollback 口径与 v1 一致。
+    辅助表按实际存在的删：不同版本库缺 session_pending 等表是常态（本机实测），
+    缺表不得让整个删除回滚——否则 v2 会话删不掉，分叉出来的副本也清不掉。
     """
     conn = sqlite3.connect(db_path, timeout=5.0)
     try:
+        try:
+            existing = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+        except sqlite3.Error:
+            existing = set()
         conn.execute(
             "DELETE FROM session_message WHERE session_id = ?", (session_id,)
         )
-        conn.execute(
-            "DELETE FROM instruction_entry WHERE session_id = ?", (session_id,)
-        )
-        conn.execute(
-            "DELETE FROM instruction_state WHERE session_id = ?", (session_id,)
-        )
-        conn.execute(
-            "DELETE FROM session_pending WHERE session_id = ?", (session_id,)
-        )
-        conn.execute(
-            "DELETE FROM session_inbox WHERE session_id = ?", (session_id,)
-        )
+        for table in (
+            "instruction_entry",
+            "instruction_state",
+            "session_pending",
+            "session_inbox",
+        ):
+            if table in existing:
+                conn.execute(
+                    f"DELETE FROM {table} WHERE session_id = ?", (session_id,)
+                )
         conn.execute("DELETE FROM session_v2 WHERE id = ?", (session_id,))
         conn.commit()
     except sqlite3.Error:
@@ -1409,7 +1418,13 @@ def _clone_session_v2(conn: sqlite3.Connection, session_id: str, new_id: str, no
             f"INSERT INTO session_message ({', '.join(msg_columns)}) VALUES ({', '.join('?' for _ in msg_columns)})",
             [msg_values[c] for c in msg_columns],
         )
-    for ref in conn.execute("SELECT * FROM blob_ref WHERE session_id = ?", (session_id,)).fetchall():
+    try:
+        blob_refs = conn.execute(
+            "SELECT * FROM blob_ref WHERE session_id = ?", (session_id,)
+        ).fetchall()
+    except sqlite3.Error:
+        blob_refs = []
+    for ref in blob_refs:
         old_msg_id = str(ref["message_id"])
         if old_msg_id not in msg_map:
             continue
