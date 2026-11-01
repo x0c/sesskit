@@ -118,6 +118,40 @@ Transcript v1 是面向兼容的精简视图，不包含更丰富的 Python 模�
 需要读取哪些运行时、希望得到什么输出、遇到了什么阻碍。不要提交凭据或完整私人对话；
 最小的合成或脱敏示例就能提供帮助。
 
+## 发布校验（维护者）
+
+安装用户看到[安装](#安装)即可：SessKit 尚未上架 PyPI。
+
+维护者无需信任工作树即可校验已发布的版本：
+
+```bash
+python scripts/publish.py verify --version 0.2.23 --check-only
+```
+
+`v0.2.23` 产物的预期哈希（GitHub release API 中也有记录）：
+
+- wheel `sesskit-0.2.23-py3-none-any.whl`：`sha256:30fcf7e063c29d594262a8223b368af2d0e6bd8958e3b65792ada2d9a8964d81`
+- sdist `sesskit-0.2.23.tar.gz`：`sha256:acc70a9033f0f9c945ad4f0df53600f61ff5ea5417580df5c930410c2d76f084`
+
+本地发布不依赖 CI。先校验，再用环境变量里的凭据上传——该脚本没有
+password/token 参数，密钥不会出现在 argv 或 shell 历史上。先把 PyPI
+token 存进系统密钥库一次（运行时提示输入，命令行里不出现密钥明文），
+上传时再引用：
+
+```bash
+python scripts/publish.py check-dist --version 0.2.23 --dist dist
+security add-generic-password -s pypi-sesskit -a __token__ -w
+TWINE_USERNAME=__token__ TWINE_PASSWORD="$(security find-generic-password -s pypi-sesskit -w)" \
+  python scripts/publish.py upload --version 0.2.23 --dist dist --confirm-upload
+```
+
+（Linux 请用各自的密钥库，例如 `secret-tool lookup server pypi.org`，
+保持同一模式：命令里不写密钥明文。）
+
+CI 发布由 [.github/workflows/publish-pypi.yml](.github/workflows/publish-pypi.yml)
+在 `v*` tag 推送（或手动 dispatch 已有 tag）时经 PyPI Trusted Publishing
+完成——无预存 API 令牌（GitHub 每次运行按需签发短期 OIDC 凭据）。
+
 ## 🧩 AI 编程工具链里的相关工具
 
 如果你每天在多个 AI 编程助手之间切换，看看这套本地优先工具链的其余部分：
@@ -128,6 +162,7 @@ Transcript v1 是面向兼容的精简视图，不包含更丰富的 Python 模�
 | **[subswap](https://github.com/x0c/subswap)** | 查剩余额度，一键切换 Claude Code、Codex、Cursor、Kimi Code 和 OpenCode 的账号，不用反复登录。 |
 | **[agentsync](https://github.com/x0c/agentsync)** | 以一份本地源统一同步 `AGENTS.md`、`CLAUDE.md`、skills 和 MCP 配置到各编程助手。 |
 | **[agent-doc-skills](https://github.com/x0c/agent-doc-skills)** | 可导航的项目知识库 skills（`doc-init`、`doc-update`、`doc-compact`），让 coding agent 不再每个会话都重新认识你的仓库。 |
+| **[agent-session-control](https://github.com/x0c/agent-session-control)** | 用 Python 启动与跟踪本地编码助手会话（库 + JSON CLI + ACP 适配器）；历史解析委托给 SessKit。 |
 
 ## 许可证
 

@@ -117,6 +117,42 @@ Exported content may contain secrets; review it before sharing or uploading.
 which runtimes you read, what output you need, and what blocked you. Do not post
 credentials or complete private transcripts; synthetic or redacted examples help.
 
+## Release verification (maintainers)
+
+Install users can stop at [Install](#install): SessKit is not on PyPI yet.
+
+Maintainers verify an existing release without trusting the working tree:
+
+```bash
+python scripts/publish.py verify --version 0.2.23 --check-only
+```
+
+Expected `v0.2.23` asset hashes (also recorded by the GitHub release API):
+
+- wheel `sesskit-0.2.23-py3-none-any.whl`: `sha256:30fcf7e063c29d594262a8223b368af2d0e6bd8958e3b65792ada2d9a8964d81`
+- sdist `sesskit-0.2.23.tar.gz`: `sha256:acc70a9033f0f9c945ad4f0df53600f61ff5ea5417580df5c930410c2d76f084`
+
+Local publish is not CI-only. Validate first, then upload with credentials
+from the environment only — the helper has no password/token options, so
+secrets never appear on argv or in shell history. Store the PyPI token once
+in your system secret store (prompts for the value; nothing secret is typed
+into the command line), then reference it at upload time:
+
+```bash
+python scripts/publish.py check-dist --version 0.2.23 --dist dist
+security add-generic-password -s pypi-sesskit -a __token__ -w
+TWINE_USERNAME=__token__ TWINE_PASSWORD="$(security find-generic-password -s pypi-sesskit -w)" \
+  python scripts/publish.py upload --version 0.2.23 --dist dist --confirm-upload
+```
+
+(On Linux use your secret store instead, e.g. `secret-tool lookup server
+pypi.org`, keeping the same pattern: no literal secret in the command.)
+
+CI publish runs [.github/workflows/publish-pypi.yml](.github/workflows/publish-pypi.yml)
+on a `v*` tag push (or manual dispatch of an existing tag) via PyPI Trusted
+Publishing — no stored API token (GitHub mints a short-lived OIDC credential
+per run).
+
 ## 🧩 Related Tools in the AI Coding Suite
 
 If you run multiple AI coding agents daily, check out the rest of the local-first toolkit:
@@ -127,6 +163,7 @@ If you run multiple AI coding agents daily, check out the rest of the local-firs
 | **[subswap](https://github.com/x0c/subswap)** | Check remaining quota and switch Claude Code, Codex, Cursor, Kimi Code & OpenCode accounts without logging out. |
 | **[agentsync](https://github.com/x0c/agentsync)** | Sync `AGENTS.md`, `CLAUDE.md`, skills, and MCP configs across coding agents from one local source of truth. |
 | **[agent-doc-skills](https://github.com/x0c/agent-doc-skills)** | Navigable project knowledge base skills (`doc-init`, `doc-update`, `doc-compact`) so coding agents don't rediscover your repo every session. |
+| **[agent-session-control](https://github.com/x0c/agent-session-control)** | Launch and track local coding-agent sessions from Python (library + JSON CLI + ACP adapter); history observation is delegated to SessKit. |
 
 ## License
 
