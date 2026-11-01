@@ -17,6 +17,7 @@ Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`
 - `docs/UNIFIED_ABSTRACTION_KNOWLEDGE_BASE.md`: Unified abstraction over all runtimes: session and conversation models, transcript and typed activity events, outcomes, errors, tool results, evidence, and JSON Schemas.
 - `docs/ABSTRACTION_REDESIGN.md`: Target cross-runtime abstraction: current design problems, adapter/capability, turn, typed event and error-taxonomy design, invariants, staged migration, and research evidence.
 - `docs/NATIVE_USAGE_DATA_DESIGN.md`: Native usage data scope (not evaluation), general-purpose entity/metric reuse, runtime evidence, call/message/turn/session attribution, counter reconciliation, proposed API/export, and acceptance stages.
+- `docs/RUNTIME_THROUGHPUT_KNOWLEDGE_BASE.md`: Historical tokens/s and latency evidence for six runtimes, timing/counter pairing hazards, source versions, current SessKit gaps, and read-only verification.
 - `docs/LISTING_CLI_EXPORT_KNOWLEDGE_BASE.md`: Listing, search, show, export, share, and describe surface: JSON envelope, reference resolution, excerpt rules, and atomic write safety.
 
 ## Hard constraints (agent)
