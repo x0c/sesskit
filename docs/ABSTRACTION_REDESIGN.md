@@ -95,8 +95,11 @@ Each stage lands with conformance fixtures, real-history parity for affected run
 ### 5.1 Agent-output streaming: requested follow-up research
 
 Owner request (2026-11-02): investigate whether SessKit can read agent output as
-it is produced. Research is requested for later; this update records the question,
-not a feasibility verdict, adopted API, implementation assignment or scheduled job.
+it is produced. The owner subsequently authorized OpenCode research, split by
+runtime with coordinator verification and integration. Research is now assigned;
+this is not a feasibility verdict, adopted API, implementation authorization or
+recurring scheduled job. Reports remain provisional until their sources and
+native evidence have been independently checked.
 
 Keep three different capabilities explicit:
 
