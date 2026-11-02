@@ -44,8 +44,10 @@ model per session, one message per call, or a visible message for every operatio
 
 The owner-approved outcome is richer, trustworthy data, not an evaluation
 framework. Detailed usage models, reconciliation, export, and implementation
-stages are specified in [Native usage data design](NATIVE_USAGE_DATA_DESIGN.md);
-its proposed interfaces are not current APIs.
+stages are specified in [Native usage data design](NATIVE_USAGE_DATA_DESIGN.md).
+Its snapshot API/export is implemented; incremental accounting remains a separate,
+unimplemented stage. Consult that document's current status rather than treating
+all design proposals as delivered.
 
 ### Cross-runtime structure
 
@@ -81,7 +83,7 @@ its proposed interfaces are not current APIs.
 | H | Session record split with versioned schema (P3) | F |
 | I | Bounded-tail activity state for host polling loops — proposed 2026-09-30: hosts that poll many sessions every few seconds (attention/status indicators) measured ~4 ms p95 per session per tick with their own native tail reads, while full `load_activity` snapshots cost ~16x that; they need a reader-style API that returns only the current turn state (working / waiting on a structured question / idle / error end) from a bounded tail with a persisted cursor, and `pending` interaction resolution only on explicit native evidence. Not started. | D, C |
 
-Native usage stages U1-U4 are proposed in [Native usage data design](NATIVE_USAGE_DATA_DESIGN.md#7-implementation-stages-and-acceptance): independent native records, reliable summaries, versioned snapshot export, then incremental revisions. Stage G's existing event-attached `Usage` is not evidence that those accounting stages have landed.
+Native usage stages are tracked in [Native usage data design](NATIVE_USAGE_DATA_DESIGN.md#7-implementation-stages-and-acceptance): U1-U3 provide native records, reconciled summaries and versioned snapshot export; U4 incremental revisions remain unimplemented. Stage G's event-attached `Usage` alone is not evidence of accounting completeness or incremental accounting support.
 
 Each stage lands with conformance fixtures, real-history parity for affected runtimes, and no timing regression on the `verify` report.
 
@@ -89,6 +91,48 @@ Each stage lands with conformance fixtures, real-history parity for affected run
 
 - Whether `live`/`pid` stay in the stable record or move to `ProcessObservation` only (tied to stage H).
 - The public name and versioning of the typed JSON schema that follows v1.
+
+### 5.1 Agent-output streaming: requested follow-up research
+
+Owner request (2026-11-02): investigate whether SessKit can read agent output as
+it is produced. Research is requested for later; this update records the question,
+not a feasibility verdict, adopted API, implementation assignment or scheduled job.
+
+Keep three different capabilities explicit:
+
+- **Persisted-history following:** the existing incremental readers consume native
+  records as they become readable. This does not by itself establish token/text
+  delta delivery before a message is persisted or completed.
+- **Live output observation:** research access to text fragments, exposed reasoning
+  fragments, tool events, errors and native terminal events while a runtime runs.
+  Only data actually emitted by the source is in scope; no unavailable reasoning
+  content, missing fragments or completion signals may be invented.
+- **Incremental accounting:** U4 revises token/cost records; it is not an output
+  stream and must not be presented as the same feature.
+
+The follow-up must check Claude, Codex, OpenCode, Cursor, Kimi and Pi independently
+using current official documentation, inspected native implementations and bounded
+runtime evidence. Compare local history/WAL updates with candidate native
+structured-output, SDK, protocol and externally supplied event feeds; do not assume
+that stdout, terminal repaint text or a documented live event is recoverable from
+stored history. Distinguish attaching to an already-running session from observing
+one launched through an owning executor. Evaluate observation separately from
+session launch/control; this request does not move execution ownership into SessKit.
+
+Report supported source/version, event granularity, flush/arrival latency, native
+identity and ordering, reconnect/replay/dedup/gap behavior, updates/resets, bounded
+buffering and slow-consumer behavior, permissions, privacy and read-only limits.
+Reuse the existing adapters, session/message/turn identities and evidence model;
+do not propose another parser or competing session hierarchy. Disconnecting an
+observer must not silently abort the agent. Success and reproducible error/abort
+paths need exact-session evidence; unavailable attachment or lost fragments remain
+explicit limits, not passes.
+
+Deliver a per-runtime feasibility matrix and the smallest evidence-backed next
+step, clearly separating existing support, proposed work and unsupported cases.
+No new command or streaming capability flag is advertised until implementation
+and compatibility acceptance establish it. Existing history APIs and transcript
+v1 semantics remain unchanged by this research request.
 
 ## 6. Research evidence
 
@@ -115,7 +159,7 @@ Sources: Claude Agent SDK [agent loop](https://code.claude.com/docs/en/agent-sdk
 - **Capability declaration.** vibe-kanban declares per-executor capabilities and normalizes each executor's log into shared entry types with a tool status enum (`crates/executors/src/executors/mod.rs`, `crates/executors/src/logs/mod.rs` at `BloopAI/vibe-kanban@d5cbb53`). Adopted: explicit capabilities, absent means unknown. Not adopted: spawn, approval-service, and display-oriented action types in the core model; its live patch-stream transport (it has no resumable cursor).
 - **Adapter layout at scale.** [ccusage](https://github.com/ccusage/ccusage) (19 runtime adapters, `rust/adapters/` at `7f32aaf`) keeps a per-runtime `paths/parser/loader/types` layout with fixture tests, but has no capability declaration, and runtime differences leak into CLI branches. Adopted: layout, fixture harness, Pi lineage quarantine (`adapters/pi/src/loader.rs`), cost as a separate projection. Not adopted: convention-only adapters.
 - **Outcome and refusal states.** A2A task states distinguish input-required, auth-required, rejected, canceled, and failed (`specification/a2a.proto` at `a2aproject/A2A@72b3761`; [overview](https://agent2agent.info/docs/concepts/task)). AI SDK tool parts separate `output-error` from `output-denied` and record approval reasons and automatic decisions ([UI message](https://ai-sdk.dev/docs/reference/ai-sdk-core/ui-message), [tool usage](https://ai-sdk.dev/docs/ai-sdk-ui/chatbot-tool-usage), [tool approvals](https://ai-sdk.dev/docs/agents/tool-approvals)). MCP elicitation distinguishes accept, decline, and cancel, and form versus URL modes ([spec](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation)); ACP mirrors this ([elicitation](https://agentclientprotocol.com/protocol/v2/elicitation)). Adopted: refusal and denial are never errors; resolution keeps polarity.
-- **Event vocabulary.** AG-UI defines lifecycle, text, reasoning, tool call, and interrupt events with shared ids and resumption without re-emission ([events](https://docs.ag-ui.com/concepts/events), [interrupts](https://docs.ag-ui.com/concepts/interrupts), [subagents](https://docs.ag-ui.com/concepts/subagents)). OpenTelemetry GenAI conventions provide usage and conversation vocabulary and a compaction marker, but only `error.type` is stable ([overview](https://opentelemetry.io/blog/2026/genai-observability)). Adopted: vocabulary and id-based grouping. Not adopted: OTel attribute names as SessKit fields; streaming start/content/end assembly (persisted history does not need it).
+- **Event vocabulary.** AG-UI defines lifecycle, text, reasoning, tool call, and interrupt events with shared ids and resumption without re-emission ([events](https://docs.ag-ui.com/concepts/events), [interrupts](https://docs.ag-ui.com/concepts/interrupts), [subagents](https://docs.ag-ui.com/concepts/subagents)). OpenTelemetry GenAI conventions provide usage and conversation vocabulary and a compaction marker, but only `error.type` is stable ([overview](https://opentelemetry.io/blog/2026/genai-observability)). Adopted: vocabulary and id-based grouping. Not adopted for the persisted-history projection: OTel attribute names as SessKit fields or streaming start/content/end assembly. Live-output observation is a separate, still-unresearched owner request (§5.1), not prohibited or established by that earlier decision.
 - **Incremental reading.** Log shippers identify files by content fingerprint rather than inode alone, commit offsets after processing, and reset on truncation ([Vector file source](https://vector.dev/docs/reference/configuration/sources/file), [Fluent Bit tail](https://docs.fluentbit.io/manual/data-pipeline/inputs/tail)). Adopted in the cursor design (§2).
 - **Schema evolution.** Keep versioned JSON schemas with additive evolution, open metadata maps, and raw payload preservation; code generation without versioned schema files (vibe-kanban) is not adopted.
 
