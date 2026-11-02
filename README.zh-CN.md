@@ -2,7 +2,7 @@
 
 **语言：** [English](README.md) | 简体中文
 
-从磁盘解析并导出本机 **Claude Code**、**Codex CLI**、**Cursor** 助手的会话文件，统一成一套 JSON 契约。同时支持 OpenCode、Kimi Code、Pi。
+从磁盘解析并导出本机 **Claude Code**、**Codex CLI**、**Cursor**、**OpenCode**、**Kimi Code** 和 **Pi** 助手的会话文件，统一成一套 JSON 契约。
 
 这是 **Python 解析库 + JSON 命令行**，不是终端界面，也不是会话管理器。其他工具可调用 `sesskit` CLI，或按公开 JSON Schema 自行实现。
 
@@ -11,20 +11,20 @@
 ## 用 SessKit 构建工具
 
 - 将本地对话送入自己的搜索索引或知识库。
-- 不解析运行时原始文件，直接读取原生用量与历史结局。
+- 不解析运行时原始文件，直接读取各助手的用量数据与历史记录。
 - 在自己的会话客户端中消费增量事件。
 
 从[接入指南和三个可运行示例](docs/INTEGRATION_GUIDE.md)开始。
-读取已有本地历史不需要模型账号或 API key。
+读取本地已有历史不需要模型账号或 API key。
 
 ## 安装
 
-SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装固定发布版本的 wheel。
+SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装指定版本的 wheel。
 
-需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。不宣称支持 Windows。
+需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。暂不支持 Windows。
 
 ```bash
-python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.21/sesskit-0.2.21-py3-none-any.whl"
+python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.23/sesskit-0.2.23-py3-none-any.whl"
 python -m sesskit describe
 ```
 
@@ -45,9 +45,9 @@ sesskit describe
 sesskit verify --sample 30
 ```
 
-修改解析器或加载链路后，`sesskit verify` 是必跑的真实历史一致性检查。它会对照普通对话、v1 事件、typed 活动记录和受支持的增量读取结果，并输出各运行时的计数、结局、违反项与耗时，不输出内容或路径。扫描、加载、读取或探针失败都不能判为通过；没有样本时会明确标记为未验证，而不是通过；独立读取期间若历史仍在变化，则标记为未定，也不能算通过。Kimi 暂不支持 typed 活动记录和增量读取是预期能力边界，但仍会执行旧版对话与事件检查。这项检查只验证 SessKit 自身各视图是否一致，不是独立的语义正确性判定。检查失败或未验证时，命令会以非零状态结束。
+修改解析器或加载链路后，请运行 `sesskit verify`：它会交叉核对普通对话、v1 事件、类型化活动记录和增量读取，并报告各运行时的计数、结果、违反项和耗时——不输出内容或路径。检查失败时会以非零状态退出。
 
-命令均输出同一套 JSON envelope：
+命令均输出同一套 JSON 信封：
 
 ```json
 {"ok": true, "data": {...}, "error": null, "meta": {"version": 1}}
@@ -87,7 +87,25 @@ for runtime_id, items in sessions.items():
 
 只读。不会启动助手、恢复对话，也不会改写历史文件。
 
-会真实启动助手会话的自动化（测试、评测、探针）可以在工作区根目录放一个空的 `.sesskit-ignore` 文件，让这些会话不进列表；见 [`docs/CONTRACT.md`](docs/CONTRACT.md)。
+会真实启动助手会话的自动化（测试、评测、探针）可以在工作区根目录放一个空的 `.sesskit-ignore` 文件，即可将其排除在列表之外；见 [`docs/CONTRACT.md`](docs/CONTRACT.md)。
+
+## 原生指标（当前源码）
+
+当前源码提供去重对账后的 Token／费用数据，以及历史耗时和生成速度。
+请在源码仓库中运行 `python -m pip install .`；上面的固定发布版 wheel
+不包含后续的全部对账修正和测速功能。
+
+```bash
+sesskit usage pi:SESSION_ID
+sesskit usage pi:SESSION_ID --message-id MESSAGE_ID
+sesskit performance pi:SESSION_ID
+sesskit performance pi:SESSION_ID --detail records --limit 100
+```
+
+Python 接口：`load_usage`、`summarize_usage`、`UsageSelection`、`load_performance`。
+保留每次调用、消息、轮次和会话的统计范围、覆盖情况与原生计时含义；
+缺失不是零，客户端耗时也不是服务端纯解码速度。SessKit 提供数据，不做评测打分。
+运行时支持、筛选、示例和 Schema 见[接入指南](docs/INTEGRATION_GUIDE.md#historical-timing-and-generation-speed)。
 
 ## 契约
 
@@ -99,24 +117,70 @@ for runtime_id, items in sessions.items():
 |---|---|
 | 普通对话 | Python `load_session_conversation`，或 CLI `show` / `export` |
 | 在其他语言中读取兼容 JSON 事件 | CLI `share` + transcript v1 schema |
-| 丰富的证据、用量、结局或增量读取 | Python API，见[接入指南](docs/INTEGRATION_GUIDE.md) |
+| 丰富的证据、用量、结果或增量读取 | Python API，见[接入指南](docs/INTEGRATION_GUIDE.md) |
 
-Transcript v1 是兼容投影，不包含更丰富的 Python 模型中的所有字段。
+Transcript v1 是面向兼容的精简视图，不包含更丰富的 Python 模型中的所有字段。
 `sesskit search` 搜索标题和摘要，不搜索完整对话正文。
-导出内容可能包含秘密；分享或上传前请先检查。
+导出内容可能包含密钥等敏感信息；分享或上传前请先检查。
 
 ## 非目标（v1）
 
 - 启动或控制助手
 - 终端界面或会话管理器
 - 写入或删除会话历史
-- Go / TypeScript 绑定（请消费 CLI / Schema）
+- Go / TypeScript 绑定（请直接使用 CLI / Schema）
 
 ## 你在构建什么？
 
 [反馈你的接入场景](https://github.com/x0c/sesskit/issues/new?template=integration.yml)：
 需要读取哪些运行时、希望得到什么输出、遇到了什么阻碍。不要提交凭据或完整私人对话；
 最小的合成或脱敏示例就能提供帮助。
+
+## 发布校验（维护者）
+
+安装用户看到[安装](#安装)即可：SessKit 尚未上架 PyPI。
+
+维护者无需信任工作树即可校验已发布的版本：
+
+```bash
+python scripts/publish.py verify --version 0.2.23 --check-only
+```
+
+`v0.2.23` 产物的预期哈希（GitHub release API 中也有记录）：
+
+- wheel `sesskit-0.2.23-py3-none-any.whl`：`sha256:30fcf7e063c29d594262a8223b368af2d0e6bd8958e3b65792ada2d9a8964d81`
+- sdist `sesskit-0.2.23.tar.gz`：`sha256:acc70a9033f0f9c945ad4f0df53600f61ff5ea5417580df5c930410c2d76f084`
+
+本地发布不依赖 CI。先校验，再用环境变量里的凭据上传——该脚本没有
+password/token 参数，密钥不会出现在 argv 或 shell 历史上。先把 PyPI
+token 存进系统密钥库一次（运行时提示输入，命令行里不出现密钥明文），
+上传时再引用：
+
+```bash
+python scripts/publish.py check-dist --version 0.2.23 --dist dist
+security add-generic-password -s pypi-sesskit -a __token__ -w
+TWINE_USERNAME=__token__ TWINE_PASSWORD="$(security find-generic-password -s pypi-sesskit -w)" \
+  python scripts/publish.py upload --version 0.2.23 --dist dist --confirm-upload
+```
+
+（Linux 请用各自的密钥库，例如 `secret-tool lookup server pypi.org`，
+保持同一模式：命令里不写密钥明文。）
+
+CI 发布由 [.github/workflows/publish-pypi.yml](.github/workflows/publish-pypi.yml)
+在 `v*` tag 推送（或手动 dispatch 已有 tag）时经 PyPI Trusted Publishing
+完成——无预存 API 令牌（GitHub 每次运行按需签发短期 OIDC 凭据）。
+
+## 🧩 AI 编程工具链里的相关工具
+
+如果你每天在多个 AI 编程助手之间切换，看看这套本地优先工具链的其余部分：
+
+| 仓库 | 说明 |
+| :--- | :--- |
+| **[corral](https://github.com/corral-dev/corral)** | 在终端会话管理器里并排跑 Claude Code、Codex、OpenCode、Cursor 和 Pi，再从 iPhone 或 Mac 上继续。 |
+| **[subswap](https://github.com/x0c/subswap)** | 查剩余额度，一键切换 Claude Code、Codex、Cursor、Kimi Code 和 OpenCode 的账号，不用反复登录。 |
+| **[agentsync](https://github.com/x0c/agentsync)** | 以一份本地源统一同步 `AGENTS.md`、`CLAUDE.md`、skills 和 MCP 配置到各编程助手。 |
+| **[agent-doc-skills](https://github.com/x0c/agent-doc-skills)** | 可导航的项目知识库 skills（`doc-init`、`doc-update`、`doc-compact`），让 coding agent 不再每个会话都重新认识你的仓库。 |
+| **[agent-session-control](https://github.com/x0c/agent-session-control)** | 用 Python 启动与跟踪本地编码助手会话（库 + JSON CLI + ACP 适配器）；历史解析委托给 SessKit。 |
 
 ## 许可证
 

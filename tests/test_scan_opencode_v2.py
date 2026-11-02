@@ -49,8 +49,7 @@ class LiveV2Tests(unittest.TestCase):
         self.db = db
 
     def test_v2_success_status_last_agent_and_conversation(self):
-        sessions = oc.scan_sessions(limit=500)
-        info = _scan_by_id(sessions, LIVE_V2_OK)
+        info = oc.refresh_session({"path": self.db, "id": LIVE_V2_OK})
         self.assertIsNotNone(info, "v2 success session must be listed")
         assert info is not None
         self.assertEqual(info["status_tag"], titles.STATUS_DONE)
@@ -67,8 +66,7 @@ class LiveV2Tests(unittest.TestCase):
         )
 
     def test_v2_quota_error_is_aborted_with_error_text(self):
-        sessions = oc.scan_sessions(limit=500)
-        info = _scan_by_id(sessions, LIVE_V2_QUOTA)
+        info = oc.refresh_session({"path": self.db, "id": LIVE_V2_QUOTA})
         self.assertIsNotNone(info, "v2 quota session must be listed")
         assert info is not None
         # 空标题是正常态：有用户正文就不得丢弃，走 fallback。
@@ -86,8 +84,7 @@ class LiveV2Tests(unittest.TestCase):
     def test_dual_table_session_still_served_by_v1(self):
         """双表并存的迁移行走 v1：v1 有 67 条 message，v2 只有 11 条；
         走 v1 时对话轮数远多于 v2 行数，且 scan 行为保持 v1 口径。"""
-        sessions = oc.scan_sessions(limit=500)
-        info = _scan_by_id(sessions, LIVE_DUAL_V1)
+        info = oc.refresh_session({"path": self.db, "id": LIVE_DUAL_V1})
         self.assertIsNotNone(info)
         assert info is not None
         self.assertEqual(info["native_title"], "swarm-manager 代码审查优化")

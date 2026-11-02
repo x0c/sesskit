@@ -96,6 +96,7 @@ from sesskit.usage import (
     UsageSnapshot,
     UsageSummary,
     ValueQuality,
+    assemble_snapshot,
     cost_summary_to_dict,
     decode_usage_cursor,
     describe_support,
@@ -110,11 +111,40 @@ from sesskit.usage import (
     summarize_observations,
     summarize_usage,
     summary_to_dict,
+    unsupported_snapshot,
     usage_capabilities,
 )
 from sesskit.visibility import visible_in_conversation, visible_in_v1
 
+_PERFORMANCE_EXPORTS = frozenset(
+    {
+        "PERFORMANCE_SCHEMA_ID",
+        "PerformanceCapabilities",
+        "PerformanceRecord",
+        "PerformanceSnapshot",
+        "load_performance",
+        "make_performance_record",
+        "performance_capabilities",
+        "performance_record_to_dict",
+        "performance_snapshot_to_dict",
+        "performance_summary",
+        "unsupported_performance_snapshot",
+        "validate_performance_view",
+    }
+)
+
+
+def __getattr__(name: str):
+    """Re-export performance on demand without taxing history-only imports."""
+    if name in _PERFORMANCE_EXPORTS:
+        from sesskit import performance as _performance
+
+        return getattr(_performance, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
+    "PERFORMANCE_SCHEMA_ID",
     "SCHEMA_ID",
     "USAGE_SCHEMA_ID",
     "ActivityEvent",
@@ -152,6 +182,9 @@ __all__ = [
     "NormalizedUsage",
     "OperationKind",
     "PageResult",
+    "PerformanceCapabilities",
+    "PerformanceRecord",
+    "PerformanceSnapshot",
     "PiActivityReader",
     "PollResult",
     "RecordStanding",
@@ -181,6 +214,7 @@ __all__ = [
     "Violation",
     "__version__",
     "as_typed",
+    "assemble_snapshot",
     "classify_agent_error",
     "classify_error",
     "claude_continuation_target",
@@ -198,14 +232,20 @@ __all__ = [
     "list_adapters",
     "load_activity",
     "load_events",
+    "load_performance",
     "load_session_conversation",
     "load_usage",
+    "make_performance_record",
     "make_session_info",
     "metric_summary_to_dict",
     "native_http_status",
     "observation_to_dict",
     "open_activity_reader",
     "pair_invocations",
+    "performance_capabilities",
+    "performance_record_to_dict",
+    "performance_snapshot_to_dict",
+    "performance_summary",
     "project_session_conversation",
     "reconcile",
     "record_to_dict",
@@ -222,7 +262,10 @@ __all__ = [
     "supports_incremental",
     "to_v1_dicts",
     "turn_id_for",
+    "unsupported_performance_snapshot",
+    "unsupported_snapshot",
     "usage_capabilities",
+    "validate_performance_view",
     "visible_in_conversation",
     "visible_in_v1",
     "with_classification",

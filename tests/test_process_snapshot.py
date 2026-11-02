@@ -26,21 +26,29 @@ from sesskit.parsers.common import (
 @unittest.skipUnless(sys.platform == "darwin", "ps 表复用只在 darwin 生效")
 class ProcessSnapshotTests(unittest.TestCase):
     def test_ps_table_covers_pgrep_exact_match(self):
+        def pgrep(name):
+            try:
+                raw = subprocess.check_output(
+                    ["pgrep", "-x", name], stderr=subprocess.DEVNULL
+                ).decode().split()
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode != 1:
+                    raise
+                raw = []
+            return {int(x) for x in raw if x.isdigit()}
+
+        names = ("codex", "agent", "opencode", "kimi", "pi", "claude")
+        before = {name: pgrep(name) for name in names}
         clear_ps_cmdline_cache()
         table = _ps_axo_pid_command()
         self.assertTrue(table.strip(), "本机应能读到 ps 全表")
-        for name in ("codex", "agent", "opencode", "kimi", "pi", "claude"):
+        for name in names:
             with self.subTest(process=name):
                 from_ps = set(_exact_pids_from_ps_table(name, table) or [])
-                try:
-                    raw = subprocess.check_output(
-                        ["pgrep", "-x", name], stderr=subprocess.DEVNULL
-                    ).decode().split()
-                except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-                    raw = []
-                from_pgrep = {int(x) for x in raw if x.isdigit()}
+                # Only processes observed on both sides existed at snapshot time.
+                stable = before[name] & pgrep(name)
                 self.assertFalse(
-                    from_pgrep - from_ps,
+                    stable - from_ps,
                     f"ps 表漏掉了 pgrep 能找到的 {name} 进程",
                 )
 

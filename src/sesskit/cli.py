@@ -30,6 +30,7 @@ from sesskit.envelope import (
 )
 from sesskit.models import format_message_time, session_key
 from sesskit.paths import assert_not_history_path, atomic_write_json
+from sesskit.performance_cli import cmd_performance
 from sesskit.registry import ConversationLoadError, ParserRegistry, default_registry
 from sesskit.transcript import SCHEMA_ID, count_events, load_events
 
@@ -833,6 +834,24 @@ COMMANDS = [
             {"flags": ["--json"], "kwargs": {"action": "store_true", "help": "single-line JSON output (same as --compact)"}},
         ],
         "returns": {"schema": "sesskit.usage/v1", "summary": "scoped totals with coverage", "detail": "optional paged records/observations"},
+    },
+    {
+        "name": "performance",
+        "help": "Show preserved native timing/rate evidence for one session (bounded summary plus paged records)",
+        "handler": cmd_performance,
+        "args": [
+            {"flags": ["session"], "kwargs": {"help": "id, prefix, or runtime:id"}},
+            {"flags": ["--detail"], "kwargs": {"choices": ["summary", "records"], "default": "summary", "help": "summary (default) or paged record list"}},
+            {"flags": ["--limit"], "kwargs": {"type": int, "default": None, "help": "detail page size 1..1000 (detail mode only)"}},
+            {"flags": ["--cursor"], "kwargs": {"help": "opaque page cursor from a previous detail page (detail mode only)"}},
+            {"flags": ["--view"], "kwargs": {"choices": ["all-branches", "active-branch"], "default": "all-branches", "help": "performance history view"}},
+            {"flags": ["--turn-id"], "kwargs": {"help": "restrict to one native turn id (mutually exclusive with --message-id)"}},
+            {"flags": ["--message-id"], "kwargs": {"help": "restrict to one native message/response id (mutually exclusive with --turn-id)"}},
+            {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
+            {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
+            {"flags": ["--json"], "kwargs": {"action": "store_true", "help": "single-line JSON output (same as --compact)"}},
+        ],
+        "returns": {"schema": "sesskit.performance/v1", "summary": "bounded timing/rate summary", "detail": "optional paged records"},
     },
     {
         "name": "share",

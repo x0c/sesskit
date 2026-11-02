@@ -275,7 +275,7 @@ def test_capability_table_tracks_actual_adapters():
 
 
 def test_readmes_use_same_published_wheel_and_route_to_examples():
-    url = "https://github.com/x0c/sesskit/releases/download/v0.2.21/sesskit-0.2.21-py3-none-any.whl"
+    url = "https://github.com/x0c/sesskit/releases/download/v0.2.23/sesskit-0.2.23-py3-none-any.whl"
     for filename in ("README.md", "README.zh-CN.md"):
         content = (ROOT / filename).read_text(encoding="utf-8")
         assert f'python -m pip install "{url}"' in content

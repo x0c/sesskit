@@ -12,12 +12,12 @@ Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`
 - `docs/GITHUB_DISCOVERY.md`: About description, Topics, and README first-screen rules with need-query baselines; skipping it reuses session-manager search queries or misdescribes SessKit as a session manager.
 - `docs/INTEGRATION_GUIDE.md`: Host-independent adoption, fixed-release installation, runnable search/analysis/incremental recipes, verified capabilities, data limits, and public integration feedback.
 - `docs/CONTRACT.md`: session contract — envelope, schemas, load wiring, listing modes, write safety, status tags and abnormal endings, and verification.
-- `schemas/*.json` and `src/sesskit/schemas/*.json`: JSON envelope fields and transcript event types; both copies stay identical.
+- `schemas/*.json` and `src/sesskit/schemas/*.json`: session/conversation/transcript, usage and historical-performance datasets; both copies stay identical.
 - `docs/RUNTIME_PARSING_KNOWLEDGE_BASE.md`: Native history parsing for six runtimes: scan, plain-turn load, liveness, versioning, and per-runtime success versus abnormal signals.
 - `docs/UNIFIED_ABSTRACTION_KNOWLEDGE_BASE.md`: Unified abstraction over all runtimes: session and conversation models, transcript and typed activity events, outcomes, errors, tool results, evidence, and JSON Schemas.
 - `docs/ABSTRACTION_REDESIGN.md`: Target cross-runtime abstraction: current design problems, adapter/capability, turn, typed event and error-taxonomy design, invariants, staged migration, and research evidence.
-- `docs/NATIVE_USAGE_DATA_DESIGN.md`: Native usage data scope (not evaluation), general-purpose entity/metric reuse, runtime evidence, call/message/turn/session attribution, counter reconciliation, proposed API/export, and acceptance stages.
-- `docs/RUNTIME_THROUGHPUT_KNOWLEDGE_BASE.md`: Historical tokens/s and latency evidence for six runtimes, timing/counter pairing hazards, source versions, current SessKit gaps, and read-only verification.
+- `docs/NATIVE_USAGE_DATA_DESIGN.md`: Native usage data scope (not evaluation), general-purpose entity/metric reuse, runtime evidence, call/message/turn/session attribution, counter reconciliation, implemented snapshot API/export, remaining incremental scope, and acceptance stages.
+- `docs/RUNTIME_THROUGHPUT_KNOWLEDGE_BASE.md`: Historical tokens/s and latency evidence, implemented performance API/CLI, interval semantics, native timing/counter pairing hazards, snapshot consistency and read-only verification.
 - `docs/LISTING_CLI_EXPORT_KNOWLEDGE_BASE.md`: Listing, search, show, export, share, and describe surface: JSON envelope, reference resolution, excerpt rules, and atomic write safety.
 
 ## Hard constraints (agent)

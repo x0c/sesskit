@@ -270,6 +270,118 @@ OpenCode timing coverage; one successful local Kimi timing sample; closed Claude
 writer semantics; undecoded Cursor binaries; no provider-exact decode validation.
 These are declared capability boundaries, not silent passes.
 
+## Implementation contract (historical snapshot API)
+
+The implementation exposes the snapshot contract below. Supported rates remain
+client-observed intervals, not provider-exact decode speed. Final integration must
+exercise the public API and installed CLI on the same native sessions as the
+independent counter/timing checks; worker completion alone is not delivery.
+
+Snapshot reads share a bounded, complete-line JSONL reader with usage. The opened
+file's identity/size/stamps are checked before and after reading; replacement,
+truncation or concurrent writes report unavailable instead of combining a newer
+watermark with older rows. This uses Python's [file-descriptor stat](https://docs.python.org/3/library/os.html#os.fstat),
+not a path reopened for each phase. SQLite usage reads keep one read transaction.
+An unmatched native selector returns an empty selected result, retains source
+coverage and reports unlinked/unmatched counts. Missing Codex history is an
+unavailable snapshot, not a model-validation exception. Invalid or overflowing
+rate arithmetic remains unavailable with diagnostics, never a fabricated rate.
+
+The owner authorized delivery of all evidence-backed historical performance data
+on 2026-11-01. Deliver a separate read-only performance projection over the existing
+adapter registry: Python `load_performance(session, history_view="all_branches")`
+and `sesskit performance SESSION_REF`, dataset `sesskit.performance/v1`.
+Existing usage totals, transcript v1, statuses and legacy Usage semantics stay
+unchanged. Performance records are timing/rate observations, never additive billing
+rows or a second session/turn hierarchy. No executor, live collector, pricing,
+network lookup, generated-token estimate or new runtime dependency is introduced.
+
+- `PerformanceRecord` is one named timing interval on an existing native operation,
+  with native session/message/response/turn identifiers only where established.
+  Fields: performance_id, runtime, session_ref, record (safe native locator),
+  scope_kind/scope_id, kind, duration_ms, output_tokens/output_semantics,
+  tokens_per_second (nullable), rate_basis (derived/unavailable), clock,
+  started_at/ended_at (optional UTC epoch seconds), message_id/turn_id/response_id,
+  model/provider, evidence and diagnostics. Multiple intervals on one operation
+  are not independent token consumption. IDs are session-qualified and stable
+  within one source generation; no content hashes or rewrite-stability promise.
+- Pure arithmetic may derive output_tokens * 1000 / duration_ms only after the
+  adapter explicitly authorizes the numerator/interval association and successful
+  native outcome. Reject booleans, negative counts, nonfinite values and nonpositive
+  durations without manufacturing zeros or losing the source locator. Invalid or
+  untrusted measurements retain diagnostics; failed/aborted placeholder counters
+  never become measured zero speed. No native provider-decode claim is exposed.
+- Interval kinds: response_elapsed, provider_phase_elapsed, step_elapsed,
+  stream_elapsed, turn_elapsed, first_output_latency, first_part_latency,
+  request_to_reply_elapsed, thinking_elapsed, session_elapsed, session_api_elapsed,
+  session_api_without_retries_elapsed, session_tool_elapsed, native_duration.
+  Output semantics: inclusive_output, visible_output, provider_output, unknown.
+  Explicit clock and evidence distinguish monotonic, wall, mixed and unknown.
+- Pi: response elapsed rates; OpenCode: correctly paired provider-phase/whole-step
+  rates with visible versus inclusive output explicit; Kimi: nested step.end
+  stream rates plus client first-part and other native timing evidence; Codex:
+  matching final within-turn output/turn elapsed and native first-output latency;
+  Claude: preserve joined request-to-reply and other verified duration evidence,
+  but do not derive a rate from unverified dispatch/flush/finality assumptions.
+  Cursor and other unverified adapters remain explicitly unsupported.
+- `PerformanceSnapshot` carries state, runtime/session_ref/history_view, records,
+  entries_read, watermark, observed_operations, coverage and diagnostics.
+  Coverage is partial/unknown/not_recorded/unsupported, never falsely complete.
+  A supported readable source with no timing is empty/not_recorded; read failure
+  is unavailable, never empty success. Capabilities distinguish timing kinds,
+  rate kinds and supported branch views. Pi supports both native branch views;
+  unsupported view requests fail rather than silently fall back.
+- The CLI uses the existing envelope/ref resolver. Default summary is bounded:
+  coverage, record_count, rate_count, observed_operations, kinds, and one latest
+  record in native source order (not an average across unlike intervals).
+  `--detail records --limit N --cursor TOKEN` pages details; default 100,
+  maximum 1000. Summary rejects limit/cursor. Native turn/message filters are
+  mutually exclusive and preserve unmatched/unlinked counts. Cursors bind source,
+  session, view and selectors; malformed/stale cursors fail explicitly.
+  Standard exit codes remain: usage 2, missing 3, ambiguity 5, unreadable 1;
+  supported-but-empty and unsupported coverage return explicit successful states.
+- Add matching `schemas/performance.v1.json` and packaged copy, public exports,
+  help/describe and executable examples. JSON contains only bounded typed metrics,
+  safe identifiers and evidence: never native message content, paths, credentials
+  or raw request/config payloads. No unbounded record list in summary output.
+- Reuse raw native feeds and existing tree/DB interpretation; adapters own native
+  differences while the common model/calculation/serialization stays runtime-free.
+  Kimi step usage remains a performance numerator and is not added again to usage
+  totals. This does not authorize unrelated accounting repairs or parser rewrites.
+- Acceptance: deterministic native fixtures and schema/CLI paging/error tests;
+  unchanged transcript/usage behavior, real adapter wiring, exact native-data
+  oracles on installed runtimes, fresh success and reproducible abnormal checks,
+  complete supported Python/platform diagnostics and locally installed artifact.
+  Mark actual auth/quota/platform limits explicitly, never as passes. Public
+  release/version/tag changes are not part of this feature request by default.
+
+## Delivery verification (2026-11-02)
+
+- Independent native-data oracles checked the public usage/performance APIs for
+  Pi, OpenCode, Kimi, Codex and Claude; Cursor returned explicit unsupported
+  states. SQLite checks used the native read-only CLI. Counter/interval arithmetic
+  matched the exact selected histories; Claude emitted no guessed rate. This is
+  stored-history evidence, not fresh provider execution or provider decode timing.
+- The integrated artifact passed the full macOS suite on Python 3.10, 3.11, 3.12,
+  3.13 and 3.15: 953 tests and 42 subtests per interpreter. One historical Claude
+  incident fixture was absent and explicitly skipped. A concurrent pytest cleanup
+  warning was isolated to shared temporary directories; the 3.15 rerun with its own
+  `--basetemp` passed without warnings.
+- Linux validation exposed a fixture relying on inode reuse/timestamp precision
+  and a Git 2.34 sparse-checkout expectation; the deterministic replacement and
+  actual-selection regressions are documented in [CONTRACT.md](CONTRACT.md#verification-mandatory-when-changing-parsers-or-load-wiring).
+  Linux has no native agent histories; its live-history/process skips are not
+  native-runtime acceptance. No platform support expansion is claimed.
+- Full logs, native-oracle script, source-tree identity and artifact/install
+  receipts are retained privately under
+  `~/.config/sesskit/development/unfinished-audit-20261102-lIxXi4/`.
+  Source installations must use that committed artifact rather than a dirty
+  checkout containing unrelated pending runtime or documentation changes.
+- Snapshot usage and historical performance are delivered capabilities. Usage
+  upsert readers (U4), unverified Cursor timing and provider-exact decode speed
+  remain unsupported; the CLI does not advertise a completed incremental usage
+  API or replace missing measurements with estimates.
+
 ## References
 
 [P1]: https://github.com/earendil-works/pi/blob/6291b9bcc3ee9480c2caba8676fc2f6cd321eaa9/packages/ai/src/types.ts#L585-L615

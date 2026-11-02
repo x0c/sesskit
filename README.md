@@ -2,7 +2,7 @@
 
 **Languages:** English | [简体中文](README.zh-CN.md)
 
-Parse and export local **Claude Code**, **Codex CLI**, and **Cursor** agent session files from disk into one JSON schema. Also reads OpenCode, Kimi Code, and Pi.
+Parse and export local **Claude Code**, **Codex CLI**, **Cursor**, **OpenCode**, **Kimi Code**, and **Pi** agent session files from disk into one JSON schema.
 
 This is a **Python library and JSON CLI** — not a TUI, not a session manager. Other tools integrate by shelling out to `sesskit` or by validating against the published JSON Schema.
 
@@ -11,7 +11,7 @@ This is a **Python library and JSON CLI** — not a TUI, not a session manager. 
 ## Build with SessKit
 
 - Feed local conversations into your own search index or knowledge base.
-- Inspect native usage and historical outcomes without parsing runtime files.
+- Inspect usage and historical outcomes without parsing runtime files.
 - Follow incremental events in your own session client.
 
 Start with the [integration guide and three runnable examples](docs/INTEGRATION_GUIDE.md).
@@ -21,10 +21,10 @@ No model account or API key is needed to read existing local history.
 
 SessKit is not on PyPI yet. Install the fixed-release wheel in your project's virtual environment.
 
-Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not claimed on Windows.
+Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not supported on Windows.
 
 ```bash
-python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.21/sesskit-0.2.21-py3-none-any.whl"
+python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.23/sesskit-0.2.23-py3-none-any.whl"
 python -m sesskit describe
 ```
 
@@ -45,17 +45,7 @@ sesskit describe
 sesskit verify --sample 30
 ```
 
-After changing parsers or load wiring, `sesskit verify` is the required
-real-history consistency gate. It checks conversation, v1 events, typed
-activity, and supported incremental readers against one another, and reports
-per-runtime counts, outcomes, violations, and timings — never content or
-paths. Scan/load/reader/probe failures prevent a pass; a runtime with no
-samples is marked unverified, not passed. Kimi's documented lack of typed
-activity and incremental readers is expected, while its legacy checks still
-run. Reads overlapping a live source change are inconclusive, not passes.
-This verifies internal consistency, not semantic correctness against an
-independent oracle. The command exits non-zero when verification fails or is
-unverified.
+After changing parsers or load wiring, run `sesskit verify`: it cross-checks conversation, v1 events, typed activity, and incremental readers, and reports per-runtime counts, outcomes, violations, and timings — never content or paths. A failing check exits non-zero.
 
 Every command prints one JSON envelope:
 
@@ -80,6 +70,25 @@ for runtime_id, items in sessions.items():
         fresh = refresh_session(session)
 ```
 
+## Native metrics (current source)
+
+The current source adds reconciled token/cost data and historical timing/rates.
+Install that checkout with `python -m pip install .`; the fixed wheel above does
+not include every later calibration or performance addition.
+
+```bash
+sesskit usage pi:SESSION_ID
+sesskit usage pi:SESSION_ID --message-id MESSAGE_ID
+sesskit performance pi:SESSION_ID
+sesskit performance pi:SESSION_ID --detail records --limit 100
+```
+
+Python: `load_usage`, `summarize_usage`, `UsageSelection`, and `load_performance`.
+Keep per-call/message/turn/session scope, coverage and native timing meanings;
+missing values are not zero and client timing is not provider decode speed.
+SessKit supplies data, not evaluation scores. See the [integration guide](docs/INTEGRATION_GUIDE.md#historical-timing-and-generation-speed)
+for runtime support, selectors, examples and schemas.
+
 ## What it reads
 
 | Runtime | Role |
@@ -93,12 +102,11 @@ for runtime_id, items in sessions.items():
 
 See the [capability matrix](docs/INTEGRATION_GUIDE.md#capability-matrix) for typed
 activity, incremental reading, questions, native turn markers, usage, and compaction.
-Capabilities are also returned by `sesskit describe`; unavailable data is not zero
-or proof of success.
+Capabilities are also returned by `sesskit describe`; if a runtime exposes no data, SessKit reports it as unavailable — never as zero, and never as success.
 
 Read-only. It does not launch agents, resume chats, or write history.
 
-Automation that launches real agent sessions (tests, evals, probes) can keep them out of listings by placing an empty `.sesskit-ignore` file in its workspace root; see [`docs/CONTRACT.md`](docs/CONTRACT.md).
+If your automation launches real agent sessions (tests, evals, probes), keep them out of listings by placing an empty `.sesskit-ignore` file in its workspace root; see [`docs/CONTRACT.md`](docs/CONTRACT.md).
 
 ## Schemas
 
@@ -112,8 +120,7 @@ See [`schemas/`](schemas/) and [`docs/CONTRACT.md`](docs/CONTRACT.md).
 | Compatible JSON events from another language | CLI `share` + transcript v1 schema |
 | Rich evidence, usage, outcomes, or incremental readers | Python API; see the [integration guide](docs/INTEGRATION_GUIDE.md) |
 
-Transcript v1 is a compatibility projection, not every field in the richer Python
-model. `sesskit search` matches titles and excerpts, not full conversation text.
+Transcript v1 is a compatibility-oriented subset, not every field in the richer Python model. `sesskit search` matches titles and excerpts, not full conversation text.
 Exported content may contain secrets; review it before sharing or uploading.
 
 ## Non-goals (v1)
@@ -128,6 +135,54 @@ Exported content may contain secrets; review it before sharing or uploading.
 [Share your integration use case](https://github.com/x0c/sesskit/issues/new?template=integration.yml):
 which runtimes you read, what output you need, and what blocked you. Do not post
 credentials or complete private transcripts; synthetic or redacted examples help.
+
+## Release verification (maintainers)
+
+Install users can stop at [Install](#install): SessKit is not on PyPI yet.
+
+Maintainers verify an existing release without trusting the working tree:
+
+```bash
+python scripts/publish.py verify --version 0.2.23 --check-only
+```
+
+Expected `v0.2.23` asset hashes (also recorded by the GitHub release API):
+
+- wheel `sesskit-0.2.23-py3-none-any.whl`: `sha256:30fcf7e063c29d594262a8223b368af2d0e6bd8958e3b65792ada2d9a8964d81`
+- sdist `sesskit-0.2.23.tar.gz`: `sha256:acc70a9033f0f9c945ad4f0df53600f61ff5ea5417580df5c930410c2d76f084`
+
+Local publish is not CI-only. Validate first, then upload with credentials
+from the environment only — the helper has no password/token options, so
+secrets never appear on argv or in shell history. Store the PyPI token once
+in your system secret store (prompts for the value; nothing secret is typed
+into the command line), then reference it at upload time:
+
+```bash
+python scripts/publish.py check-dist --version 0.2.23 --dist dist
+security add-generic-password -s pypi-sesskit -a __token__ -w
+TWINE_USERNAME=__token__ TWINE_PASSWORD="$(security find-generic-password -s pypi-sesskit -w)" \
+  python scripts/publish.py upload --version 0.2.23 --dist dist --confirm-upload
+```
+
+(On Linux use your secret store instead, e.g. `secret-tool lookup server
+pypi.org`, keeping the same pattern: no literal secret in the command.)
+
+CI publish runs [.github/workflows/publish-pypi.yml](.github/workflows/publish-pypi.yml)
+on a `v*` tag push (or manual dispatch of an existing tag) via PyPI Trusted
+Publishing — no stored API token (GitHub mints a short-lived OIDC credential
+per run).
+
+## 🧩 Related Tools in the AI Coding Suite
+
+If you run multiple AI coding agents daily, check out the rest of the local-first toolkit:
+
+| Repository | Description |
+| :--- | :--- |
+| **[corral](https://github.com/corral-dev/corral)** | Run Claude Code, Codex, OpenCode, Cursor & Pi side-by-side in a terminal session manager, then continue from iPhone or Mac. |
+| **[subswap](https://github.com/x0c/subswap)** | Check remaining quota and switch Claude Code, Codex, Cursor, Kimi Code & OpenCode accounts without logging out. |
+| **[agentsync](https://github.com/x0c/agentsync)** | Sync `AGENTS.md`, `CLAUDE.md`, skills, and MCP configs across coding agents from one local source of truth. |
+| **[agent-doc-skills](https://github.com/x0c/agent-doc-skills)** | Navigable project knowledge base skills (`doc-init`, `doc-update`, `doc-compact`) so coding agents don't rediscover your repo every session. |
+| **[agent-session-control](https://github.com/x0c/agent-session-control)** | Launch and track local coding-agent sessions from Python (library + JSON CLI + ACP adapter); history observation is delegated to SessKit. |
 
 ## License
 

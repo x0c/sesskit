@@ -195,7 +195,7 @@ def test_capability_declarations():
     assert caps["cursor"].usage_data is False
     assert caps["cursor"].compaction_markers is False
     assert caps["cursor"].message_origin is True
-    assert caps["kimi"].usage_data is False
+    assert caps["kimi"].usage_data is True
     assert caps["kimi"].compaction_markers is False
     assert caps["kimi"].message_origin is False
     # Error-only turns: declared behind an explicit flag by every

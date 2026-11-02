@@ -20,7 +20,7 @@ project's virtual environment and install the published wheel. If you need a new
 environment, run `python3 -m venv .venv && . .venv/bin/activate` first.
 
 ```bash
-python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.21/sesskit-0.2.21-py3-none-any.whl"
+python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.23/sesskit-0.2.23-py3-none-any.whl"
 python -m sesskit describe
 ```
 
@@ -28,12 +28,13 @@ This avoids Git and local build tools. Use the same interpreter for installation
 and your application. For a standalone CLI, `pipx install` accepts the same wheel
 URL. Windows is not a supported platform.
 
-The examples below live in the repository's `examples/` directory and source
-archives built from this checkout. The published 0.2.21 wheel and source archive
-predate these recipes: download the three Python files from GitHub or clone the
-repository, and run them with the interpreter above. The wheel installs only the
-library and CLI. They also work with the fixed release; a source installation
-or `PYTHONPATH` is not needed. Review output locally: export and follow output may
+The example files live in the repository's `examples/` directory and source
+archives; wheels install only the library and CLI. The original search,
+activity-usage and follow recipes work with the fixed release. The newer usage
+calibration and historical-performance additions below require the current
+source checkout until included in a tagged release: run `python -m pip install .`
+from that checkout with your application's interpreter. No `PYTHONPATH` override
+is needed. Review output locally: export and follow output may
 contain private prompts, code, tool output, or credentials from native history.
 Nothing is uploaded automatically. Do not redirect output onto native history.
 
@@ -98,6 +99,50 @@ total carries its coverage (`complete`/`partial`/`unknown`/`conflicted`/
 under `src/sesskit/schemas/`). The [native usage data design](NATIVE_USAGE_DATA_DESIGN.md)
 specifies the full reconciliation rules. SessKit supplies native data;
 evaluation and the meaning of an external task remain with the consumer.
+
+## Historical timing and generation speed
+
+Source: [performance.py](../examples/performance.py). The current source exposes
+`load_performance(session)` and the `sesskit.performance/v1` schema in addition
+to the separate usage dataset. Both projections reuse the runtime adapter registry;
+the shared core contains no runtime-specific accounting or timing policy.
+
+```bash
+sesskit performance pi:SESSION_ID
+sesskit performance pi:SESSION_ID --detail records --limit 100
+sesskit performance pi:SESSION_ID --message-id MESSAGE_ID
+python examples/performance.py --runtime pi --limit 3
+```
+
+```python
+from sesskit import load_performance, performance_summary
+
+snapshot = load_performance(session)
+report = performance_summary(snapshot)
+```
+
+| Runtime | Preserved historical performance |
+|---|---|
+| Pi | Response elapsed time and a compatible output-token rate; both branch views |
+| OpenCode | Provider-phase and whole-step elapsed rates, with visible output explicit |
+| Kimi | Native step/stream intervals, first-part latency and compatible stream rates |
+| Codex | Whole-turn elapsed rate and native first-output latency, not per-call decode speed |
+| Claude | Request-to-reply and recorded duration evidence; no rate from unverified endpoints |
+| Cursor | Explicitly unsupported historical metrics; no guessed rates |
+
+Rates retain their interval and output semantics. Never average unlike intervals,
+sum overlapping durations, or mistake client timing for provider decode speed.
+Missing timing and failed/aborted placeholder counters never become zero speed.
+An unmatched selector reports an empty selection plus unlinked/unmatched counts;
+unreadable history is an error. `--detail records` pages with source/query-bound
+cursors; a changed source requires restarting the page sequence. Both schema
+copies ship with the library. The [throughput knowledge base](RUNTIME_THROUGHPUT_KNOWLEDGE_BASE.md)
+records native evidence and limitations.
+
+The activity example above intentionally remains a non-additive compatibility
+view. Kimi's versioned usage support does not imply typed-activity support.
+Incremental activity reading below does not provide incremental accounting:
+usage/performance consumers reload snapshots to observe corrections.
 
 ## 3. Follow one session
 
@@ -177,7 +222,7 @@ Current adapter declarations (also returned by `sesskit describe`):
 | claude | Yes | Yes | Yes | Yes | Yes | Yes |
 | codex | Yes | Yes | Yes | Yes | Yes | Yes |
 | opencode | Yes | Yes | Yes | Yes | Yes | Yes |
-| kimi | No | No | No | No | No | No |
+| kimi | No | No | No | No | Yes | No |
 | cursor | Yes | Yes | Yes | No | No | No |
 | pi | Yes | Yes | No | Yes | Yes | Yes |
 

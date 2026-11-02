@@ -29,6 +29,7 @@ class OpenCodeAdapter(RuntimeAdapter):
         usage_data=True,
         compaction_markers=True,
         message_origin=True,
+        performance_data=True,
     )
 
     def scan(self, limit: int = 50, keep_ids: set[str] | None = None,
@@ -67,6 +68,38 @@ class OpenCodeAdapter(RuntimeAdapter):
         from sesskit.transcript import _parse_opencode
 
         return _parse_opencode(session)
+
+    def load_usage(self, session: dict, *, history_view: str = "all_branches") -> Any:
+        from sesskit import usage as _usage
+
+        runtime = str(session.get("source") or self.id)
+        session_id = str(session.get("id") or "")
+        session_ref = f"{runtime}:{session_id}" if session_id else None
+        path = str(session.get("path") or "")
+        diagnostics: list[str] = []
+        if history_view == "active_branch":
+            diagnostics.append("branch_views_unsupported_fallback_all_branches")
+        try:
+            observations, _rollup, entries_read, watermark = _usage._load_opencode_usage(
+                path, session_id)
+        except OSError:
+            observations, entries_read, watermark = [], 0, None
+        return _usage.assemble_snapshot(
+            runtime=runtime, session_ref=session_ref, history_view=history_view,
+            observations=observations, entries_read=entries_read,
+            watermark=watermark,
+            extra_diagnostics=tuple(diagnostics))
+
+    def performance_capabilities(self) -> Any:
+        from sesskit.performance_adapters import opencode as _performance
+
+        return _performance.CAPABILITIES
+
+    def load_performance(self, session: dict, *,
+                         history_view: str = "all_branches") -> Any:
+        from sesskit.performance_adapters import opencode as _performance
+
+        return _performance.load(session, history_view=history_view)
 
     def open_reader(self, session: dict, cursor: Any = None) -> Any:
         from sesskit.activity_reader import open_activity_reader

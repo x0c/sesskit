@@ -602,6 +602,9 @@ def _claude_usage(message: dict, record: str) -> Usage | None:
         fields["output_tokens"] = _claude_int(usage.get("output_tokens"))
         fields["cache_read_tokens"] = _claude_int(usage.get("cache_read_input_tokens"))
         fields["cache_write_tokens"] = _claude_int(usage.get("cache_creation_input_tokens"))
+        details = usage.get("output_tokens_details")
+        if isinstance(details, dict):
+            fields["reasoning_tokens"] = _claude_int(details.get("thinking_tokens"))
     if all(value is None for value in fields.values()) and not isinstance(model, str):
         return None
     return Usage(

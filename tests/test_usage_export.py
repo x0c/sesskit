@@ -262,3 +262,184 @@ def test_cli_selector_counts(tmp_path, capsys):
     assert code == 0
     assert out["data"]["matched_records"] == 1
     assert out["data"]["summary"]["metrics"]["input_total"]["known_total"] == 100
+
+
+def _write_opencode_db(path: str, session_id: str = "ses_rollup1") -> None:
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, cost REAL,"
+        " tokens_input INTEGER, tokens_output INTEGER,"
+        " tokens_reasoning INTEGER, tokens_cache_read INTEGER,"
+        " tokens_cache_write INTEGER, model TEXT)")
+    conn.execute(
+        "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT,"
+        " type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER,"
+        " data TEXT)")
+    conn.execute(
+        "INSERT INTO session_v2"
+        " (id, cost, tokens_input, tokens_output, tokens_reasoning,"
+        "  tokens_cache_read, tokens_cache_write, model)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (session_id, 0.5, 300, 200, 40, 10, 5, '{"id": "m1"}'))
+    messages = [
+        ("m1", "assistant", 1, {
+            "modelID": "m1", "cost": 0.2,
+            "tokens": {"input": 200, "output": 150, "reasoning": 30,
+                       "cache": {"read": 10, "write": 5}}}),
+        ("m2", "assistant", 2, {
+            "modelID": "m1", "cost": 0.1,
+            "tokens": {"input": 50, "output": 20, "reasoning": 5,
+                       "cache": {"read": 0, "write": 0}}}),
+    ]
+    for mid, mtype, seq, data in messages:
+        conn.execute(
+            "INSERT INTO session_message"
+            " (id, session_id, type, seq, time_created, time_updated, data)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (mid, session_id, mtype, seq, seq, seq, json.dumps(data)))
+    conn.commit()
+    conn.close()
+
+
+def test_load_usage_opencode_session_rollup_sets_complete_total(tmp_path):
+    import sqlite3
+
+    db_path = str(tmp_path / "opencode.db")
+    _write_opencode_db(db_path)
+    snapshot = usage_mod.load_usage(
+        _session(source="opencode", sid="ses_rollup1", path=db_path))
+    assert snapshot.state == "available"
+    assert snapshot.summary is not None
+    # Message details: input (200+10+5)+(50+0+0) = 265;
+    # output (150+30)+(20+5) = 205; total 470.
+    assert snapshot.summary.input_total.detail_total == 265
+    # Session row: input 300+10+5 = 315; output 200+40 = 240; total 555.
+    assert snapshot.summary.total_tokens.complete_total == 555
+    assert snapshot.summary.total_tokens.detail_total == 470
+    assert snapshot.summary.total_tokens.unattributed == 85
+    assert snapshot.summary.cost.complete_total == 0.5
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT tokens_input FROM session_v2 WHERE id = 'ses_rollup1'").fetchone()
+    conn.close()
+    assert row is not None
+
+
+def _write_kimi_wire(path: str) -> None:
+    rows = [
+        {"type": "metadata"},
+        {"type": "llm.request", "agentId": "main", "kind": "loop",
+         "provider": "openai", "model": "qwen3.5-9b"},
+        {"type": "usage.record", "agentId": "main", "model": "localmodel",
+         "usage": {"inputOther": 15, "output": 2,
+                   "inputCacheRead": 41789, "inputCacheCreation": 0},
+         "usageScope": "turn", "time": 1790772283338},
+        {"type": "token_counting.turn_recorded", "agentId": "main",
+         "turnId": 0, "length": 4, "tokens": 41806, "time": 1790772284052},
+    ]
+    _write_jsonl(path, rows)
+
+
+def test_load_usage_kimi_turn_delta_available(tmp_path):
+    path = str(tmp_path / "wire.jsonl")
+    _write_kimi_wire(path)
+    snapshot = usage_mod.load_usage(
+        _session(source="kimi", sid="session_demo", path=path))
+    assert snapshot.state == "available"
+    assert snapshot.summary is not None
+    assert snapshot.summary.input_total.known_total == 41804
+    assert snapshot.summary.output_total.known_total == 2
+    assert snapshot.summary.total_tokens.known_total == 41806
+    assert snapshot.summary.total_tokens.complete_total is None
+    caps = usage_mod.usage_capabilities("kimi")
+    assert caps.supported is True
+    assert caps.entity_granularities == ("turn",)
+
+
+def test_load_usage_kimi_empty_wire_is_not_recorded(tmp_path):
+    path = str(tmp_path / "wire.jsonl")
+    _write_jsonl(path, [{"type": "metadata"}])
+    snapshot = usage_mod.load_usage(
+        _session(source="kimi", sid="session_demo", path=path))
+    assert snapshot.state == "empty"
+    assert snapshot.summary is not None
+    assert snapshot.summary.coverage == "not_recorded"
+
+
+def test_load_usage_claude_cost_state_combines_models(tmp_path):
+    path = str(tmp_path / "s.jsonl")
+    _write_jsonl(path, [
+        {"type": "assistant", "message": {
+            "id": "m1", "model": "claude-opus-5-5",
+            "usage": {"input_tokens": 2, "output_tokens": 100,
+                      "cache_read_input_tokens": 10,
+                      "cache_creation_input_tokens": 20,
+                      "output_tokens_details": {"thinking_tokens": 40}},
+            "content": [{"type": "text", "text": "hi"}]}},
+        {"type": "cost-state", "sessionId": "abc12345",
+         "totalCostUSD": 1.5,
+         "modelUsage": {
+             "claude-opus-5-5": {"inputTokens": 2, "outputTokens": 100,
+                                 "thinkingTokens": 40,
+                                 "cacheReadInputTokens": 10,
+                                 "cacheCreationInputTokens": 20,
+                                 "costUSD": 1.4},
+             "claude-haiku-5-5": {"inputTokens": 5, "outputTokens": 10,
+                                  "thinkingTokens": 0,
+                                  "cacheReadInputTokens": 0,
+                                  "cacheCreationInputTokens": 0,
+                                  "costUSD": 0.1}}},
+    ])
+    snapshot = usage_mod.load_usage(_session(path=path))
+    assert snapshot.state == "available"
+    assert snapshot.summary is not None
+    assert snapshot.summary.reasoning.known_total == 40
+    assert snapshot.summary.total_tokens.complete_total == 147
+    assert snapshot.summary.cost.complete_total == 1.5
+
+
+def test_load_usage_unknown_runtime_is_unsupported():
+    snapshot = usage_mod.load_usage(_session(source="bogus", sid="x", path="/tmp/none"))
+    assert snapshot.state == "unsupported"
+    assert snapshot.summary is not None
+
+
+def test_load_usage_routes_through_adapter_registry(tmp_path):
+    from sesskit.adapters import get_adapter
+
+    path = str(tmp_path / "wire.jsonl")
+    _write_kimi_wire(path)
+    session = _session(source="kimi", sid="session_demo", path=path)
+    via_registry = usage_mod.load_usage(session)
+    via_adapter = get_adapter("kimi").load_usage(session)
+    assert via_registry.state == "available"
+    assert ([o.observation_id for o in via_registry.observations]
+            == [o.observation_id for o in via_adapter.observations])
+    assert via_registry.summary is not None and via_adapter.summary is not None
+    assert (via_registry.summary.total_tokens.known_total
+            == via_adapter.summary.total_tokens.known_total == 41806)
+
+
+def test_observation_ids_are_session_qualified_end_to_end(tmp_path):
+    path = str(tmp_path / "s.jsonl")
+    _write_jsonl(path, _claude_rows())
+    snapshot = usage_mod.load_usage(_session(path=path))
+    assert snapshot.state == "available"
+    ids = [o.observation_id for o in snapshot.observations]
+    assert ids == ["claude:abc12345:line:1:usage", "claude:abc12345:line:2:usage"]
+    again = usage_mod.load_usage(_session(path=path))
+    assert [o.observation_id for o in again.observations] == ids
+
+
+def test_equal_lines_in_different_sessions_stay_distinct(tmp_path):
+    first = str(tmp_path / "a.jsonl")
+    second = str(tmp_path / "b.jsonl")
+    _write_jsonl(first, _claude_rows())
+    _write_jsonl(second, _claude_rows())
+    snap_a = usage_mod.load_usage(_session(sid="abc11111", path=first))
+    snap_b = usage_mod.load_usage(_session(sid="abc22222", path=second))
+    ids_a = {o.observation_id for o in snap_a.observations}
+    ids_b = {o.observation_id for o in snap_b.observations}
+    assert ids_a.isdisjoint(ids_b)

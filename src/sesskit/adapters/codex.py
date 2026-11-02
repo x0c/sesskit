@@ -69,6 +69,38 @@ class CodexAdapter(RuntimeAdapter):
 
         return _parse_codex(session)
 
+    def load_usage(self, session: dict, *, history_view: str = "all_branches") -> Any:
+        from sesskit import usage as _usage
+
+        runtime = str(session.get("source") or self.id)
+        session_id = str(session.get("id") or "")
+        session_ref = f"{runtime}:{session_id}" if session_id else None
+        path = str(session.get("path") or "")
+        diagnostics: list[str] = []
+        if history_view == "active_branch":
+            diagnostics.append("branch_views_unsupported_fallback_all_branches")
+        try:
+            observations, entries_read, watermark, read_diagnostics = _usage._load_jsonl_usage(
+                path, "codex", session_id or None)
+            diagnostics.extend(read_diagnostics)
+        except OSError:
+            observations, entries_read, watermark = [], 0, None
+        return _usage.assemble_snapshot(
+            runtime=runtime, session_ref=session_ref, history_view=history_view,
+            observations=observations, entries_read=entries_read,
+            watermark=watermark,
+            extra_diagnostics=tuple(diagnostics))
+
+    def performance_capabilities(self) -> Any:
+        from sesskit.performance_adapters import codex as _perf_codex
+
+        return _perf_codex.get_capabilities()
+
+    def load_performance(self, session: dict, *, history_view: str = "all_branches") -> Any:
+        from sesskit.performance_adapters import codex as _perf_codex
+
+        return _perf_codex.load(session, history_view=history_view)
+
     def open_reader(self, session: dict, cursor: Any = None) -> Any:
         from sesskit.activity_reader import open_activity_reader
 

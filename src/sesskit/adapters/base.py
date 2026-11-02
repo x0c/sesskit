@@ -49,6 +49,11 @@ class Capabilities:
     subagent_linkage: bool = False
     #: Model/token usage data is exposed.
     usage_data: bool = False
+    #: Native timing/rate evidence is preserved for the performance
+    #: projection (``load_performance`` returns ``available``/``empty``/
+    #: ``unavailable`` instead of ``unsupported``). This marks recorded
+    #: client timing evidence, never provider decode-speed proof.
+    performance_data: bool = False
     #: Native context-compaction boundaries are exposed as typed markers.
     compaction_markers: bool = False
     #: User-message events carry a native-evidence origin
@@ -119,6 +124,21 @@ class RuntimeAdapter(ABC):
     def load_events(self, session: dict) -> list[dict]:
         """Project the session to v1 transcript dicts (byte-compatible)."""
 
+    def load_usage(self, session: dict, *, history_view: str = "all_branches") -> Any:
+        """Load preserved token/cost usage for a scanned session dict.
+
+        The default reports ``unsupported``; runtimes with a verified
+        native usage mapping override this to feed their native rows into
+        :mod:`sesskit.usage` and assemble the snapshot there.
+        """
+        from sesskit.usage import unsupported_snapshot
+
+        runtime = str(session.get("source") or self.id or "unknown")
+        session_id = str(session.get("id") or "")
+        session_ref = f"{runtime}:{session_id}" if session_id else None
+        return unsupported_snapshot(runtime=runtime, session_ref=session_ref,
+                                    history_view=history_view)
+
     def open_reader(self, session: dict, cursor: Any = None) -> Any:
         """Open an incremental reader; raises when unsupported."""
         from sesskit.activity_reader import IncrementalUnsupported
@@ -127,6 +147,40 @@ class RuntimeAdapter(ABC):
             f"incremental reading is unsupported for runtime {self.id!r}; "
             "use load_activity instead",
         )
+
+    def performance_capabilities(self) -> Any:
+        """Describe this runtime's performance timing/rate support.
+
+        The default reports unsupported; runtimes with verified native
+        timing evidence override this to describe their timing kinds,
+        rate kinds and branch views.
+        """
+        from sesskit.performance import PerformanceCapabilities
+
+        return PerformanceCapabilities(runtime=self.id or "unknown",
+                                       supported=False)
+
+    def load_performance(self, session: dict, *,
+                         history_view: str = "all_branches") -> Any:
+        """Load preserved timing/rate observations for a scanned session dict.
+
+        The default reports ``unsupported``; supported runtimes override
+        this to feed their native rows into :mod:`sesskit.performance`
+        through ``sesskit.performance_adapters.<runtime>`` (lazily).
+        """
+        from sesskit.performance import (
+            unsupported_performance_snapshot,
+            validate_performance_view,
+        )
+
+        runtime = str(session.get("source") or self.id or "unknown")
+        session_id = str(session.get("id") or "")
+        session_ref = f"{runtime}:{session_id}" if session_id else None
+        validate_performance_view(history_view,
+                                  self.performance_capabilities())
+        return unsupported_performance_snapshot(
+            runtime=runtime, session_ref=session_ref,
+            history_view=history_view)
 
     @abstractmethod
     def signature(self) -> Any:

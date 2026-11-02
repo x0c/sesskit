@@ -72,8 +72,30 @@ class UsageObservation:
             raise ValueError(f"unsupported operation: {self.operation!r}")
 
 
-def _observation_id(runtime: str, record: str, index: int) -> str:
+def _observation_id(runtime: str, record: str, index: int, *,
+                    session_id: str | None = None, field: str | None = None) -> str:
+    """Stable native identity for one usage reading.
+
+    With a session id the id derives only from session plus the native
+    record/field locator, so repeated loads of one generation agree
+    regardless of how many earlier observations were returned; without
+    one it falls back to the legacy collector-index form. Rewrite-stable
+    ids across generations are not promised.
+    """
+    if session_id and field:
+        return f"{runtime}:{session_id}:{record}:{field}"
     return f"{runtime}:{record}:{index}"
+
+
+def _unique_observation_id(seen: set[str], base: str) -> str:
+    """Deduplicate within one collection deterministically (same input, same ids)."""
+    candidate = base
+    serial = 2
+    while candidate in seen:
+        candidate = f"{base}#{serial}"
+        serial += 1
+    seen.add(candidate)
+    return candidate
 
 
 def _native_evidence(record: str, field: str | None = None) -> Evidence:
@@ -94,19 +116,62 @@ def _int(value: object) -> int | None:
 
 # --- Claude ---
 
-def collect_claude_observations(rows: list[tuple[int, dict]]) -> list[UsageObservation]:
+def _claude_subdivisions(usage: dict) -> tuple[tuple[str, int], ...]:
+    """Token-unit native breakdowns kept namespaced, never summed.
+
+    Cache-retention tiers are subsets of the cache-creation bucket;
+    server-tool request counts are usage-adjacent request units, not
+    tokens. Both survive as labeled evidence with inclusion unresolved.
+    """
+    subdivisions: list[tuple[str, int]] = []
+    cache_creation = usage.get("cache_creation")
+    if isinstance(cache_creation, dict):
+        for key, name in (("ephemeral_1h_input_tokens", "cache_creation_1h"),
+                          ("ephemeral_5m_input_tokens", "cache_creation_5m")):
+            parsed = _int(cache_creation.get(key))
+            if parsed is not None:
+                subdivisions.append((name, parsed))
+    server_tool_use = usage.get("server_tool_use")
+    if isinstance(server_tool_use, dict):
+        for key, name in (("web_search_requests", "server_tool_web_search_requests"),
+                          ("web_fetch_requests", "server_tool_web_fetch_requests")):
+            parsed = _int(server_tool_use.get(key))
+            if parsed is not None:
+                subdivisions.append((name, parsed))
+    return tuple(subdivisions)
+
+
+def _claude_reasoning(usage: dict) -> int | None:
+    details = usage.get("output_tokens_details")
+    if isinstance(details, dict):
+        return _int(details.get("thinking_tokens"))
+    return None
+
+
+def collect_claude_observations(rows: list[tuple[int, dict]], *,
+                                session_id: str | None = None) -> list[UsageObservation]:
     """Preserve one observation per assistant message carrying usage.
 
     A model response split into thinking/text/tool fragments shares one
     native record and message id; each fragment row currently yields its
     own observation with the same correlation identity so a later stage
-    can collapse them to a single call. Placeholder/output-finality
+    can collapse them to a single call. Native thinking tokens ride as
+    the reasoning subset of output; cache-retention tiers and server-tool
+    request counts survive as namespaced subdivisions, never addends.
+    Session `cost-state` rows yield one cumulative session observation per
+    model (revisions fold to latest per model; distinct models combine at
+    summary time, never conflict). Placeholder/output-finality
     resolution is explicitly out of scope here: quality stays unknown
     unless the source marks it.
     """
     observations: list[UsageObservation] = []
+    seen: set[str] = set()
     for lineno, entry in rows:
         if not isinstance(entry, dict):
+            continue
+        if entry.get("type") == "cost-state":
+            _claude_cost_state_observations(entry, lineno, session_id, seen,
+                                            observations)
             continue
         message = entry.get("message")
         if not isinstance(message, dict):
@@ -122,11 +187,16 @@ def collect_claude_observations(rows: list[tuple[int, dict]]) -> list[UsageObser
             "output_tokens": _int(usage.get("output_tokens")) if isinstance(usage, dict) else None,
             "cache_read_tokens": _int(usage.get("cache_read_input_tokens")) if isinstance(usage, dict) else None,
             "cache_write_tokens": _int(usage.get("cache_creation_input_tokens")) if isinstance(usage, dict) else None,
+            "reasoning_tokens": _claude_reasoning(usage) if isinstance(usage, dict) else None,
         }
-        if all(value is None for value in fields.values()) and not isinstance(model, str):
+        subdivisions = _claude_subdivisions(usage) if isinstance(usage, dict) else ()
+        if (all(value is None for value in fields.values()) and not subdivisions
+                and not isinstance(model, str)):
             continue
         observations.append(UsageObservation(
-            observation_id=_observation_id("claude", record, len(observations)),
+            observation_id=_unique_observation_id(
+                seen, _observation_id("claude", record, len(observations),
+                                      session_id=session_id, field="usage")),
             runtime="claude",
             record=record,
             scope_kind="message",
@@ -142,8 +212,76 @@ def collect_claude_observations(rows: list[tuple[int, dict]]) -> list[UsageObser
             response_id=str(native_id) if isinstance(native_id, str) and native_id else None,
             message_id=str(native_id) if isinstance(native_id, str) and native_id else None,
             quality="unknown",
+            native_subdivisions=subdivisions,
         ))
     return observations
+
+
+def _claude_cost_state_observations(entry: dict, lineno: int,
+                                      session_id: str | None,
+                                      seen: set[str],
+                                      out: list[UsageObservation]) -> None:
+    """One cumulative session observation per model in a `cost-state` row.
+
+    The row is a writer-maintained session aggregate with per-model token
+    buckets and recorded cost. An empty `modelUsage` mapping yields no
+    observation: absent differs from zero. Cost basis stays unknown: the
+    row carries no provider-reported versus estimate marker.
+    """
+    record = f"line:{lineno}"
+    model_usage = entry.get("modelUsage")
+    if not isinstance(model_usage, dict) or not model_usage:
+        return
+    native_session = entry.get("sessionId")
+    scope_id = str(native_session) if isinstance(native_session, str) and native_session else None
+    for model_name, buckets in model_usage.items():
+        if not isinstance(model_name, str) or not model_name.strip() or not isinstance(buckets, dict):
+            continue
+        cost = buckets.get("costUSD")
+        cost_value = (
+            float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0
+            else None
+        )
+        fields = {
+            "input_tokens": _int(buckets.get("inputTokens")),
+            "output_tokens": _int(buckets.get("outputTokens")),
+            "cache_read_tokens": _int(buckets.get("cacheReadInputTokens")),
+            "cache_write_tokens": _int(buckets.get("cacheCreationInputTokens")),
+            "reasoning_tokens": _int(buckets.get("thinkingTokens")),
+        }
+        subdivisions: list[tuple[str, int]] = []
+        for key, name in (("cacheCreationEphemeral1hInputTokens", "cache_creation_1h"),
+                          ("cacheCreationEphemeral5mInputTokens", "cache_creation_5m"),
+                          ("webSearchRequests", "server_tool_web_search_requests")):
+            parsed = _int(buckets.get(key))
+            if parsed is not None:
+                subdivisions.append((name, parsed))
+        if all(value is None for value in fields.values()) and cost_value is None:
+            continue
+        out.append(UsageObservation(
+            observation_id=_unique_observation_id(
+                seen, _observation_id("claude", record, len(out),
+                                      session_id=session_id,
+                                      field=f"modelUsage:{model_name.strip()}")),
+            runtime="claude",
+            record=record,
+            scope_kind="session",
+            counter_kind="cumulative",
+            operation="model_call",
+            operation_detail="cost_state",
+            usage=Usage(
+                _native_evidence(record, "modelUsage"),
+                model_name.strip(),
+                cost=cost_value,
+                **fields,  # type: ignore[arg-type]
+            ),
+            evidence=_native_evidence(record, "modelUsage"),
+            scope_id=scope_id,
+            counter_name="cost_state",
+            cost_basis="unknown",
+            quality="unknown",
+            native_subdivisions=tuple(subdivisions),
+        ))
 
 
 # --- Codex ---
@@ -156,23 +294,32 @@ def _codex_turn_id(payload: dict) -> str | None:
     return None
 
 
-def collect_codex_observations(rows: list[tuple[int, dict]]) -> list[UsageObservation]:
+def collect_codex_observations(rows: list[tuple[int, dict]], *,
+                               session_id: str | None = None) -> list[UsageObservation]:
     """Preserve every usage-shaped Codex record without collapsing revisions.
 
-    Both request-level ``usage`` blocks (keyed by response id) and
-    ``turn_token_usage`` cumulative snapshots are kept as separate
-    observations in file order. A later reconciliation stage selects the
-    latest valid snapshot per counter epoch; this collector must not
-    keep only the first (``setdefault``) or sum the revisions.
+    Request-level ``usage`` blocks (keyed by response id),
+    ``turn_token_usage`` cumulative snapshots, and ``thread_token_usage``
+    session-cumulative snapshots are each kept as separate observations in
+    file order. Turn and thread snapshots carry no response linkage of
+    their own: the turn snapshot stays turn-scoped, the thread snapshot is
+    session-scoped (the candidate session ``complete_total``), and a later
+    reconciliation stage selects the latest valid snapshot per counter
+    epoch; this collector must not keep only the first (``setdefault``)
+    or sum the revisions.
     Legacy ``token_count`` info blocks are preserved with unknown request
     linkage rather than dropped.
     """
     observations: list[UsageObservation] = []
+    seen: set[str] = set()
 
     def add(
         *, record: str, block: dict, payload: dict,
         scope_kind: ScopeKind, counter_kind: CounterKind,
         response_id: str | None, turn_id: str | None,
+        thread_id: str | None = None,
+        counter_name: str | None = None,
+        field: str | None = None,
     ) -> None:
         fields = {
             "input_tokens": _int(block.get("input_tokens")),
@@ -185,8 +332,13 @@ def collect_codex_observations(rows: list[tuple[int, dict]]) -> list[UsageObserv
         model = payload.get("model")
         if all(value is None for value in fields.values()) and not isinstance(model, str):
             return
+        if counter_name is None:
+            counter_name = "turn_token_usage" if counter_kind == "cumulative" else "usage"
         observations.append(UsageObservation(
-            observation_id=_observation_id("codex", record, len(observations)),
+            observation_id=_unique_observation_id(
+                seen, _observation_id("codex", record, len(observations),
+                                      session_id=session_id,
+                                      field=field or counter_name)),
             runtime="codex",
             record=record,
             scope_kind=scope_kind,
@@ -198,10 +350,10 @@ def collect_codex_observations(rows: list[tuple[int, dict]]) -> list[UsageObserv
                 **fields,  # type: ignore[arg-type]
             ),
             evidence=_native_evidence(record, "payload"),
-            scope_id=response_id or turn_id,
+            scope_id=thread_id or response_id or turn_id,
             response_id=response_id,
             turn_id=turn_id,
-            counter_name="turn_token_usage" if counter_kind == "cumulative" else "usage",
+            counter_name=counter_name,
             quality="unknown",
         ))
 
@@ -215,6 +367,8 @@ def collect_codex_observations(rows: list[tuple[int, dict]]) -> list[UsageObserv
             continue
         if entry_type == "token_usage_record":
             turn_id = _codex_turn_id(payload)
+            thread_id = payload.get("thread_id")
+            thread_id = thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
             response_id = payload.get("response_id")
             response_id = response_id.strip() if isinstance(response_id, str) and response_id.strip() else None
             turn_block = payload.get("turn_token_usage")
@@ -227,6 +381,15 @@ def collect_codex_observations(rows: list[tuple[int, dict]]) -> list[UsageObserv
                 add(record=record, block=request_block, payload=payload,
                     scope_kind="call", counter_kind="absolute",
                     response_id=response_id, turn_id=turn_id)
+            thread_block = payload.get("thread_token_usage")
+            if isinstance(thread_block, dict):
+                # Session-cumulative counter for the whole thread: the
+                # candidate session ``complete_total``. Kept separate from
+                # turn snapshots; reconciliation folds revisions to latest.
+                add(record=record, block=thread_block, payload=payload,
+                    scope_kind="session", counter_kind="cumulative",
+                    response_id=None, turn_id=None, thread_id=thread_id,
+                    counter_name="thread_token_usage")
             continue
         if entry_type == "event_msg" and isinstance(payload.get("info"), dict):
             info = payload["info"]
@@ -236,7 +399,8 @@ def collect_codex_observations(rows: list[tuple[int, dict]]) -> list[UsageObserv
                     add(record=record, block=block, payload={**payload, **info},
                         scope_kind="turn" if key.startswith("total") else "call",
                         counter_kind="cumulative" if key.startswith("total") else "absolute",
-                        response_id=None, turn_id=_codex_turn_id(payload) or _codex_turn_id(info))
+                        response_id=None, turn_id=_codex_turn_id(payload) or _codex_turn_id(info),
+                        field=key)
     return observations
 
 
@@ -250,14 +414,19 @@ def collect_opencode_observations(
     messages: list[dict],
     steps: list[dict] | None = None,
     session_rollup: dict | None = None,
+    *,
+    session_id: str | None = None,
 ) -> list[UsageObservation]:
     """Preserve per-message, per-step and session-aggregate OpenCode usage.
 
     Each level is a separate observation with its own scope; message/step
-    values and session aggregates must never enter the same sum. The
-    collector does not decide which level is complete for a session.
+    values and session aggregates must never enter the same sum. Steps keep
+    their model-operation identity with unknown turn linkage so they stay
+    inspectable without joining additive sums. The collector does not
+    decide which level is complete for a session.
     """
     observations: list[UsageObservation] = []
+    seen: set[str] = set()
 
     def tokens_of(data: dict) -> dict:
         tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
@@ -297,7 +466,9 @@ def collect_opencode_observations(
             continue
         record = f"message:{mid}" if isinstance(mid, str) and mid else "message:unknown"
         observations.append(UsageObservation(
-            observation_id=_observation_id("opencode", record, len(observations)),
+            observation_id=_unique_observation_id(
+                seen, _observation_id("opencode", record, len(observations),
+                                      session_id=session_id, field="tokens")),
             runtime="opencode",
             record=record,
             scope_kind="message",
@@ -321,10 +492,15 @@ def collect_opencode_observations(
             continue
         record = f"step:{sid}" if isinstance(sid, str) and sid else "step:unknown"
         observations.append(UsageObservation(
-            observation_id=_observation_id("opencode", record, len(observations)),
+            observation_id=_unique_observation_id(
+                seen, _observation_id("opencode", record, len(observations),
+                                      session_id=session_id, field="tokens")),
             runtime="opencode",
             record=record,
-            scope_kind="turn",
+            # A step is a model operation, not an established user turn:
+            # keep its identity and native marker inspectable without
+            # letting it join additive turn sums beside message details.
+            scope_kind="unknown",
             counter_kind="absolute",
             operation="model_call",
             operation_detail="step",
@@ -340,7 +516,9 @@ def collect_opencode_observations(
         model = model_of(session_rollup)
         if not (all(value is None for value in fields.values()) and cost is None and model is None):
             observations.append(UsageObservation(
-                observation_id=_observation_id("opencode", "session", len(observations)),
+                observation_id=_unique_observation_id(
+                    seen, _observation_id("opencode", "session", len(observations),
+                                          session_id=session_id, field="tokens")),
                 runtime="opencode",
                 record="session:rollup",
                 scope_kind="session",
@@ -362,7 +540,8 @@ def _pi_int(value: object) -> int | None:
     return _int(value)
 
 
-def collect_pi_observations(entries: list[dict]) -> list[UsageObservation]:
+def collect_pi_observations(entries: list[dict], *,
+                            session_id: str | None = None) -> list[UsageObservation]:
     """Preserve every Pi usage carrier, including text-less assistant turns.
 
     Covers assistant message usage (even when the message carries only
@@ -372,6 +551,7 @@ def collect_pi_observations(entries: list[dict]) -> list[UsageObservation]:
     decide their accounting scope.
     """
     observations: list[UsageObservation] = []
+    seen: set[str] = set()
 
     def usage_from(data: dict, record: str) -> Usage | None:
         usage = data.get("usage")
@@ -431,7 +611,9 @@ def collect_pi_observations(entries: list[dict]) -> list[UsageObservation]:
             else:
                 operation = "unknown"
             observations.append(UsageObservation(
-                observation_id=_observation_id("pi", record, len(observations)),
+                observation_id=_unique_observation_id(
+                    seen, _observation_id("pi", record, len(observations),
+                                          session_id=session_id, field="usage")),
                 runtime="pi",
                 record=record,
                 scope_kind="message" if role == "assistant" else "unknown",
@@ -464,7 +646,9 @@ def collect_pi_observations(entries: list[dict]) -> list[UsageObservation]:
             if parsed is None:
                 continue
             observations.append(UsageObservation(
-                observation_id=_observation_id("pi", record, len(observations)),
+                observation_id=_unique_observation_id(
+                    seen, _observation_id("pi", record, len(observations),
+                                          session_id=session_id, field="usage")),
                 runtime="pi",
                 record=record,
                 scope_kind="unknown",
@@ -481,8 +665,66 @@ def collect_pi_observations(entries: list[dict]) -> list[UsageObservation]:
     return observations
 
 
-SUPPORTED_RUNTIMES = ("claude", "codex", "opencode", "pi")
-UNSUPPORTED_RUNTIMES = ("cursor", "kimi")
+# --- Kimi ---
+
+def collect_kimi_observations(rows: list[tuple[int, dict]], *,
+                              session_id: str | None = None) -> list[UsageObservation]:
+    """Preserve every Kimi `usage.record` turn delta, in file order.
+
+    The wire log's `usage.record` carries one turn's billed model usage
+    (`inputOther` uncached input, `output`, `inputCacheRead`,
+    `inputCacheCreation`) with `usageScope: "turn"` but no native turn id,
+    so each record takes a generation-local source-position scope id
+    (`line:N`): distinct native records stay distinct and additive, and a
+    repeated full-file load yields the same records. `token_counting.*`
+    events are local context-size measurements (a different metric
+    family from billed usage, corroborating but never linked here) and
+    are intentionally not collected.
+    """
+    observations: list[UsageObservation] = []
+    seen: set[str] = set()
+    for lineno, entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type") or "") != "usage.record":
+            continue
+        record = f"line:{lineno}"
+        detail = entry.get("usage")
+        model = entry.get("model")
+        if not isinstance(detail, dict) and not isinstance(model, str):
+            continue
+        fields = {
+            "input_tokens": _int(detail.get("inputOther")) if isinstance(detail, dict) else None,
+            "output_tokens": _int(detail.get("output")) if isinstance(detail, dict) else None,
+            "cache_read_tokens": _int(detail.get("inputCacheRead")) if isinstance(detail, dict) else None,
+            "cache_write_tokens": _int(detail.get("inputCacheCreation")) if isinstance(detail, dict) else None,
+        }
+        if all(value is None for value in fields.values()) and not isinstance(model, str):
+            continue
+        observations.append(UsageObservation(
+            observation_id=_unique_observation_id(
+                seen, _observation_id("kimi", record, len(observations),
+                                      session_id=session_id, field="usage")),
+            runtime="kimi",
+            record=record,
+            scope_kind="turn",
+            counter_kind="absolute",
+            operation="model_call",
+            operation_detail="usage.record",
+            usage=Usage(
+                _native_evidence(record, "usage"),
+                model.strip() if isinstance(model, str) and model.strip() else None,
+                **fields,  # type: ignore[arg-type]
+            ),
+            evidence=_native_evidence(record, "usage"),
+            scope_id=record,
+            quality="unknown",
+        ))
+    return observations
+
+
+SUPPORTED_RUNTIMES = ("claude", "codex", "opencode", "pi", "kimi")
+UNSUPPORTED_RUNTIMES = ("cursor",)
 
 
 def describe_support(runtime: str) -> Literal["supported", "unsupported"]:
@@ -592,17 +834,22 @@ def _normalize_claude(observation: UsageObservation) -> NormalizedUsage:
         if input_total is not None and output_total is not None
         else None
     )
+    derivation = ["anthropic_inclusive_input", "reasoning_subset_of_output"]
+    if (usage.reasoning_tokens is not None and output_total is not None
+            and usage.reasoning_tokens > output_total):
+        derivation.append("reasoning_exceeds_output")
     return NormalizedUsage(
         input_total=input_total,
         input_uncached=usage.input_tokens,
         cache_read=usage.cache_read_tokens,
         cache_write=usage.cache_write_tokens,
         output_total=output_total,
+        reasoning=usage.reasoning_tokens,
         total=total,
         cost=usage.cost,
         cost_basis=observation.cost_basis,
         gaps=gaps,
-        derivation=("anthropic_inclusive_input",),
+        derivation=tuple(derivation),
     )
 
 
@@ -704,11 +951,47 @@ def _normalize_codex(observation: UsageObservation) -> NormalizedUsage:
     )
 
 
+def _normalize_kimi(observation: UsageObservation) -> NormalizedUsage:
+    # One turn's billed buckets: uncached input plus cache read/write.
+    # Verified against native `token_counting` totals on a live session
+    # (inputOther + output + cacheRead + cacheCreation equals the recorded
+    # turn token count); the counting record itself is a separate metric
+    # family and is never linked here.
+    usage = observation.usage
+    parts = {
+        "input.input_uncached": usage.input_tokens,
+        "input.cache_read": usage.cache_read_tokens,
+        "input.cache_write": usage.cache_write_tokens,
+    }
+    present = {name: value for name, value in parts.items() if value is not None}
+    gaps = tuple(sorted(set(parts) - set(present))) if present else ()
+    input_total = sum(present.values()) if present else None
+    output_total = usage.output_tokens
+    total = (
+        input_total + output_total
+        if input_total is not None and output_total is not None
+        else None
+    )
+    return NormalizedUsage(
+        input_total=input_total,
+        input_uncached=usage.input_tokens,
+        cache_read=usage.cache_read_tokens,
+        cache_write=usage.cache_write_tokens,
+        output_total=output_total,
+        total=total,
+        cost=usage.cost,
+        cost_basis=observation.cost_basis,
+        gaps=gaps,
+        derivation=("kimi_inclusive_input",),
+    )
+
+
 _NORMALIZERS = {
     "claude": _normalize_claude,
     "pi": _normalize_pi,
     "opencode": _normalize_opencode,
     "codex": _normalize_codex,
+    "kimi": _normalize_kimi,
 }
 
 
@@ -731,6 +1014,18 @@ def _record_key(observation: UsageObservation) -> tuple:
     if observation.counter_kind == "cumulative" and observation.turn_id:
         return ("counter", observation.runtime, observation.turn_id,
                 observation.counter_name or "", observation.scope_kind)
+    if (observation.counter_kind == "cumulative"
+            and observation.scope_kind == "session"
+            and observation.scope_id):
+        # Session-cumulative revisions (one native thread/session counter
+        # observed repeatedly) fold to the latest revision like turn
+        # counters; they never become conflicting duplicates of each other.
+        # The reported model joins the key so per-model session rollups
+        # stay separate records that the summary combines across disjoint
+        # model dimensions instead of mistaking them for conflicts.
+        return ("counter", observation.runtime, observation.scope_id,
+                observation.counter_name or "", observation.scope_kind,
+                observation.usage.model)
     if observation.scope_id:
         return ("scope", observation.runtime, observation.scope_kind, observation.scope_id)
     return ("record", observation.runtime, observation.record, observation.observation_id)
@@ -934,6 +1229,85 @@ def _effective_total(normalized: NormalizedUsage) -> tuple[int | None, bool]:
     return None, False
 
 
+def _combine_session_rollups(
+    members: list[UsageRecord],
+) -> tuple[UsageRecord, list[str]]:
+    """Sum disjoint session-counter partitions (e.g. per-model rollups).
+
+    Each member must already be the reconciled record for its partition.
+    Token metrics sum across partitions only when present in every member;
+    otherwise the combined metric stays missing with a `rollup.*` gap.
+    Costs sum only within one currency/basis group. The members stay
+    inspectable as records; the combined record carries their union of
+    observation ids and subdivisions for the scoped `complete_total`.
+    """
+    first = members[0]
+    diagnostics = ["model_rollups_combined"]
+    gaps: set[str] = set(first.normalized.gaps)
+    summed: dict[str, int | None] = {}
+    for field in ("input_total", "input_uncached", "cache_read", "cache_write",
+                  "output_total", "reasoning", "total", "reported_total"):
+        values = [getattr(member.normalized, field) for member in members]
+        if all(value is not None for value in values):
+            summed[field] = sum(values)  # type: ignore[arg-type]
+        else:
+            summed[field] = None
+            if any(value is not None for value in values):
+                gaps.add(f"rollup.{field}")
+    currencies = {member.normalized.currency for member in members}
+    bases = {member.normalized.cost_basis for member in members}
+    costs = [member.normalized.cost for member in members]
+    if len(currencies) == 1 and len(bases) == 1 and all(cost is not None for cost in costs):
+        cost = sum(costs)  # type: ignore[arg-type]
+        currency = members[0].normalized.currency
+        basis = members[0].normalized.cost_basis
+    else:
+        cost, currency, basis = None, None, "unknown"
+        if any(item is not None for item in costs):
+            gaps.add("rollup.cost")
+            diagnostics.append("rollup_cost_basis_mismatch")
+    derivations: list[str] = []
+    for member in members:
+        for item in member.normalized.derivation:
+            if item not in derivations:
+                derivations.append(item)
+    normalized = NormalizedUsage(
+        input_total=summed["input_total"],
+        input_uncached=summed["input_uncached"],
+        cache_read=summed["cache_read"],
+        cache_write=summed["cache_write"],
+        output_total=summed["output_total"],
+        reasoning=summed["reasoning"],
+        total=summed["total"],
+        reported_total=summed["reported_total"],
+        cost=cost,
+        currency=currency,
+        cost_basis=basis,  # type: ignore[arg-type]
+        gaps=tuple(sorted(gaps)),
+        derivation=tuple(derivations),
+    )
+    scope_ids = {member.scope_id for member in members}
+    record = UsageRecord(
+        usage_id=f"{first.runtime}:rec:combined-session",
+        runtime=first.runtime,
+        observation_ids=tuple(
+            observation_id for member in members for observation_id in member.observation_ids),
+        scope_kind="session",
+        counter_kind=first.counter_kind,
+        operation=first.operation,
+        normalized=normalized,
+        revision=0,
+        standing="firm",
+        scope_id=next(iter(scope_ids)) if len(scope_ids) == 1 else None,
+        counter_name=first.counter_name,
+        native_subdivisions=tuple(
+            item for member in members for item in member.native_subdivisions),
+        diagnostics=tuple(
+            diagnostics + [f"combined:{member.usage_id}" for member in members]),
+    )
+    return record, diagnostics
+
+
 def summarize(
     records: list[UsageRecord],
     *,
@@ -961,7 +1335,8 @@ def summarize(
         diagnostics.append(f"conflicted_excluded:{len(conflicted)}")
 
     details = [record for record in firm
-               if record.scope_kind in {"call", "message"} and record.counter_kind == "absolute"]
+               if record.counter_kind == "absolute"
+               and record.scope_kind in {"call", "message", "turn"}]
     rollups = [record for record in firm if record.scope_kind == "session"]
     turn_cumulatives = [record for record in firm
                         if record not in details and record not in rollups
@@ -987,8 +1362,19 @@ def summarize(
 
     group_views: list[_GroupView] = []
     for key, members in groups.items():
-        member_details = tuple(record for record in members
-                               if record.scope_kind in {"call", "message"})
+        fine_details = tuple(record for record in members
+                             if record.counter_kind == "absolute"
+                             and record.scope_kind in {"call", "message"})
+        turn_totals = tuple(record for record in members
+                            if record.counter_kind == "absolute"
+                            and record.scope_kind == "turn")
+        if turn_totals and fine_details:
+            # A turn total covering the same turn as finer call/message
+            # details would double-count beside them: the finer
+            # attribution wins and the turn total stays inspectable.
+            diagnostics.append(f"turn_total_overlaps_details:{key}")
+            turn_totals = ()
+        member_details = fine_details + turn_totals
         member_intervals = [record for record in members if record not in member_details]
         if not member_intervals:
             group_views.append(_GroupView(key, member_details, None))
@@ -1015,13 +1401,41 @@ def summarize(
     if len(rollups) == 1:
         rollup = rollups[0]
     elif rollups:
-        first_norm = rollups[0].normalized
-        if all(_metrics_equal(first_norm, other.normalized) for other in rollups[1:]):
-            rollup = rollups[0]
-            diagnostics.append("duplicate_rollups_agree")
-        else:
+        partitions: dict[tuple, list[UsageRecord]] = {}
+        for record in rollups:
+            partitions.setdefault(
+                (record.model, record.provider,
+                 record.counter_kind, record.counter_name), []).append(record)
+        if len(partitions) == 1:
+            members = next(iter(partitions.values()))
+            first_norm = members[0].normalized
+            if all(_metrics_equal(first_norm, other.normalized) for other in members[1:]):
+                rollup = members[0]
+                diagnostics.append("duplicate_rollups_agree")
+            else:
+                rollup_conflict = True
+                diagnostics.append("session_rollups_disagree")
+        elif any(next(iter(part)).counter_kind != "cumulative" for part in partitions.values()):
+            # Only cumulative session counters combine; mixing absolute
+            # session snapshots with cumulative ones has no safe arithmetic.
             rollup_conflict = True
             diagnostics.append("session_rollups_disagree")
+        else:
+            combined_members: list[UsageRecord] = []
+            consistent = True
+            for members in partitions.values():
+                first_norm = members[0].normalized
+                if not all(_metrics_equal(first_norm, other.normalized)
+                           for other in members[1:]):
+                    consistent = False
+                    break
+                combined_members.append(members[0])
+            if not consistent:
+                rollup_conflict = True
+                diagnostics.append("session_rollups_disagree")
+            else:
+                rollup, extra = _combine_session_rollups(combined_members)
+                diagnostics.extend(extra)
 
     selected: list[UsageRecord] = []
     for view in group_views:
@@ -1412,6 +1826,16 @@ _USAGE_CAPABILITIES: dict[str, UsageCapabilities] = {
         auxiliary_support=True,
         incremental_support=False,
     ),
+    "kimi": UsageCapabilities(
+        "kimi", True,
+        source_variants=("usage.record",),
+        metric_families=("input", "cache_read", "cache_write", "output"),
+        entity_granularities=("turn",),
+        counter_kinds=("absolute",),
+        branch_views=("all_branches",),
+        auxiliary_support=False,
+        incremental_support=False,
+    ),
 }
 
 
@@ -1473,35 +1897,29 @@ def _file_watermark(path: str) -> str | None:
     return f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
 
 
-def _read_jsonl_rows(path: str) -> list[tuple[int, dict]]:
-    rows: list[tuple[int, dict]] = []
-    try:
-        with open(path, encoding="utf-8", errors="replace") as file:
-            for lineno, line in enumerate(file, 1):
-                try:
-                    entry = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if isinstance(entry, dict):
-                    rows.append((lineno, entry))
-    except OSError:
-        pass
-    return rows
+def _load_jsonl_usage(path: str, runtime: str,
+                      session_id: str | None = None) -> tuple[list[UsageObservation], int, str, tuple[str, ...]]:
+    from sesskit.native_jsonl import read_jsonl_snapshot
 
-
-def _load_jsonl_usage(path: str, runtime: str) -> tuple[list[UsageObservation], int, str | None]:
-    rows = _read_jsonl_rows(path)
+    feed = read_jsonl_snapshot(path)
     if runtime == "claude":
-        return collect_claude_observations(rows), len(rows), _file_watermark(path)
-    return collect_codex_observations(rows), len(rows), _file_watermark(path)
+        observations = collect_claude_observations(feed.rows, session_id=session_id)
+    elif runtime == "kimi":
+        observations = collect_kimi_observations(feed.rows, session_id=session_id)
+    else:
+        observations = collect_codex_observations(feed.rows, session_id=session_id)
+    return observations, feed.entries_read, feed.watermark, feed.diagnostics
 
 
-def _load_pi_usage(path: str, history_view: str) -> tuple[list[UsageObservation], int, str | None]:
+def _load_pi_usage(path: str, history_view: str,
+                   session_id: str | None = None) -> tuple[list[UsageObservation], int, str, tuple[str, ...]]:
     from sesskit.activity import _pi_compactions
+    from sesskit.native_jsonl import read_jsonl_snapshot
     from sesskit.parsers import pi as scan_pi
 
-    entries = scan_pi.read_entries(path)
-    watermark = _file_watermark(path)
+    feed = read_jsonl_snapshot(path)
+    entries = [entry for _, entry in feed.rows]
+    watermark = feed.watermark
     if history_view == "active_branch":
         branch = scan_pi.active_messages(entries)
         # _pi_compactions keeps only compaction entries feeding this branch.
@@ -1512,12 +1930,66 @@ def _load_pi_usage(path: str, history_view: str) -> tuple[list[UsageObservation]
             (item for item in entries if id(item) in wanted),
             key=lambda item: positions[id(item)],
         )
-        return collect_pi_observations(scoped), len(entries), watermark
-    return collect_pi_observations(entries), len(entries), watermark
+        observations = collect_pi_observations(scoped, session_id=session_id)
+    else:
+        observations = collect_pi_observations(entries, session_id=session_id)
+    return observations, feed.entries_read, watermark, feed.diagnostics
+
+
+def _opencode_session_rollup(
+    conn: object, table: str, session_id: str,
+) -> dict | None:
+    """Read the stored session aggregate (v1 ``session`` or v2 ``session_v2``).
+
+    The row carries the writer-maintained per-session token/cost totals
+    plus the session model. A missing row, missing columns (older schemas)
+    or an all-absent aggregate yields None: absent differs from zero, and
+    the message details still stand on their own.
+    """
+    import sqlite3 as _sqlite3
+
+    assert table in {"session", "session_v2"}
+    try:
+        row = conn.execute(  # type: ignore[union-attr]
+            f"SELECT cost, tokens_input, tokens_output, tokens_reasoning,"
+            f" tokens_cache_read, tokens_cache_write, model"
+            f" FROM {table} WHERE id = ? LIMIT 1",
+            (session_id,)).fetchone()
+    except _sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    try:
+        cost, in_tokens, out_tokens, reasoning, cache_read, cache_write, model_raw = (
+            row[0], row[1], row[2], row[3], row[4], row[5], row[6])
+    except (IndexError, TypeError):
+        return None
+    rollup: dict = {
+        "tokens": {
+            "input": in_tokens,
+            "output": out_tokens,
+            "reasoning": reasoning,
+            "cache": {"read": cache_read, "write": cache_write},
+        },
+        "cost": cost,
+    }
+    if isinstance(model_raw, str) and model_raw.strip():
+        try:
+            parsed = json.loads(model_raw)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            rollup["model"] = parsed
+        else:
+            rollup["modelID"] = model_raw.strip()
+    elif isinstance(model_raw, dict):
+        rollup["model"] = model_raw
+    return rollup
 
 
 def _load_opencode_usage(path: str, session_id: str) -> tuple[list[UsageObservation], list[dict] | None, int, str | None]:
-    """Read v1/v2 message usage; stored session aggregates are not present in this schema."""
+    """Read v1/v2 message usage and rollups from one consistent transaction."""
+    import hashlib
     import sqlite3
 
     from sesskit.parsers import opencode as scan_opencode
@@ -1525,7 +1997,18 @@ def _load_opencode_usage(path: str, session_id: str) -> tuple[list[UsageObservat
     conn = scan_opencode.connect_ro(path)
     if conn is None:
         return [], None, 0, None
+
+    def finish(observations, count):
+        stat = os.stat(path)
+        digest = hashlib.sha256(f"{stat.st_dev}:{stat.st_ino}:{session_id}".encode())
+        # The transaction data, not main-file mtime, includes pending WAL writes.
+        for observation in observations:
+            digest.update(repr(observation_to_dict(observation)).encode())
+            digest.update(b"\n")
+        return observations, None, count, digest.hexdigest()
+
     try:
+        conn.execute("BEGIN")
         tables = {str(row[0]) for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         messages: list[dict] = []
@@ -1534,15 +2017,15 @@ def _load_opencode_usage(path: str, session_id: str) -> tuple[list[UsageObservat
             try:
                 has_session = conn.execute(
                     "SELECT 1 FROM session WHERE id = ? LIMIT 1", (session_id,)).fetchone()
-            except sqlite3.Error:
-                has_session = None
+            except sqlite3.Error as exc:
+                raise OSError("history_unreadable") from exc
             if has_session is not None:
                 try:
                     rows = conn.execute(
                         "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC",
                         (session_id,)).fetchall()
-                except sqlite3.Error:
-                    return [], None, 0, _file_watermark(path)
+                except sqlite3.Error as exc:
+                    raise OSError("history_unreadable") from exc
                 for row in rows:
                     count += 1
                     try:
@@ -1553,14 +2036,16 @@ def _load_opencode_usage(path: str, session_id: str) -> tuple[list[UsageObservat
                         data = dict(data)
                         data.setdefault("id", row[0])
                         messages.append(data)
-                return collect_opencode_observations(messages), None, count, _file_watermark(path)
+                rollup = _opencode_session_rollup(conn, "session", session_id)
+                return finish(collect_opencode_observations(
+                    messages, session_rollup=rollup, session_id=session_id or None), count)
         if "session_message" in tables:
             try:
                 rows = conn.execute(
                     "SELECT id, data FROM session_message WHERE session_id = ? ORDER BY seq ASC, id ASC",
                     (session_id,)).fetchall()
-            except sqlite3.Error:
-                return [], None, 0, _file_watermark(path)
+            except sqlite3.Error as exc:
+                raise OSError("history_unreadable") from exc
             for row in rows:
                 count += 1
                 try:
@@ -1571,10 +2056,51 @@ def _load_opencode_usage(path: str, session_id: str) -> tuple[list[UsageObservat
                     data = dict(data)
                     data.setdefault("id", row[0])
                     messages.append(data)
-            return collect_opencode_observations(messages), None, count, _file_watermark(path)
-        return [], None, 0, _file_watermark(path)
+            rollup = _opencode_session_rollup(conn, "session_v2", session_id)
+            return finish(collect_opencode_observations(
+                messages, session_rollup=rollup, session_id=session_id or None), count)
+        raise OSError("history_format_unreadable")
+    except sqlite3.Error as exc:
+        raise OSError("history_unreadable") from exc
     finally:
         conn.close()
+
+
+def assemble_snapshot(*, runtime: str, session_ref: str | None,
+                      history_view: str,
+                      observations: list[UsageObservation],
+                      entries_read: int, watermark: str | None,
+                      extra_diagnostics: tuple[str, ...] = ()) -> UsageSnapshot:
+    """Reconcile native observations into a versioned usage snapshot.
+
+    Adapter feeds call this after reading their native history: a missing
+    watermark means the history was unreadable (``unavailable``, never
+    empty success); a readable history without recorded usage is ``empty``
+    with ``not_recorded`` coverage, never a zero-cost session.
+    """
+    if watermark is None:
+        summary = summarize([], session_ref=session_ref, runtime=runtime,
+                            history_view=history_view, observed_count=0)
+        return UsageSnapshot("unavailable", runtime, session_ref, history_view,
+                             None, (), (), summary, entries_read, 0,
+                             ("history_unreadable",))
+    records = reconcile(observations)
+    summary = summarize(records, session_ref=session_ref, runtime=runtime,
+                        history_view=history_view, observed_count=len(observations))
+    state: LoadState = "available" if observations else "empty"
+    return UsageSnapshot(state, runtime, session_ref, history_view, watermark,
+                         tuple(observations), tuple(records), summary,
+                         entries_read, len(observations), tuple(extra_diagnostics))
+
+
+def unsupported_snapshot(*, runtime: str, session_ref: str | None,
+                         history_view: str) -> UsageSnapshot:
+    """Usage state for a runtime with no verified usage mapping."""
+    summary = summarize([], session_ref=session_ref, runtime=runtime,
+                        history_view=history_view, observed_count=0)
+    return UsageSnapshot("unsupported", runtime, session_ref,
+                         history_view, None, (), (), summary, 0, 0,
+                         ("runtime_usage_unsupported",))
 
 
 def load_usage(session: dict, *, history_view: str = "all_branches") -> UsageSnapshot:
@@ -1582,68 +2108,28 @@ def load_usage(session: dict, *, history_view: str = "all_branches") -> UsageSna
 
     ``history_view`` is ``all_branches`` (default, the session's own
     operations) or ``active_branch`` (Pi only; other runtimes fall back to
-    the full history with a diagnostic). Unknown runtimes and runtimes
-    without a verified usage mapping yield ``unsupported``; missing or
-    unreadable history yields ``unavailable``. A readable history without
-    recorded usage is ``empty`` with ``not_recorded`` coverage.
+    the full history with a diagnostic). Dispatch goes through the runtime
+    adapter registry: each adapter owns its native feed, while
+    reconciliation and summaries stay in this module's runtime-agnostic
+    core. Unknown runtimes and runtimes without a verified usage mapping
+    yield ``unsupported``; missing or unreadable history yields
+    ``unavailable``. A readable history without recorded usage is ``empty``
+    with ``not_recorded`` coverage.
     """
+    from sesskit.adapters import get_adapter
+
     runtime = str(session.get("source") or "")
     session_id = str(session.get("id") or "")
     session_ref = f"{runtime}:{session_id}" if runtime and session_id else None
     if history_view not in {"all_branches", "active_branch"}:
         raise ValueError(f"unsupported history view: {history_view!r}")
-    if runtime in UNSUPPORTED_RUNTIMES or runtime not in SUPPORTED_RUNTIMES:
-        summary = summarize([], session_ref=session_ref, runtime=runtime or "unknown",
-                            history_view=history_view, observed_count=0)
-        return UsageSnapshot("unsupported", runtime or "unknown", session_ref,
-                             history_view, None, (), (), summary, 0, 0,
-                             ("runtime_usage_unsupported",))
-    path = str(session.get("path") or "")
-    if not path or not os.path.isfile(path):
-        summary = summarize([], session_ref=session_ref, runtime=runtime,
-                            history_view=history_view, observed_count=0)
-        return UsageSnapshot("unavailable", runtime, session_ref, history_view,
-                             None, (), (), summary, 0, 0, ("history_unreadable",))
-    diagnostics: list[str] = []
-    observations: list[UsageObservation] = []
-    entries_read = 0
-    watermark: str | None = None
-    if runtime in {"claude", "codex"}:
-        try:
-            observations, entries_read, watermark = _load_jsonl_usage(path, runtime)
-        except OSError:
-            observations, entries_read, watermark = [], 0, None
-        if history_view == "active_branch":
-            diagnostics.append("branch_views_unsupported_fallback_all_branches")
-    elif runtime == "pi":
-        try:
-            observations, entries_read, watermark = _load_pi_usage(path, history_view)
-        except OSError:
-            observations, entries_read, watermark = [], 0, None
-    elif runtime == "opencode":
-        if history_view == "active_branch":
-            diagnostics.append("branch_views_unsupported_fallback_all_branches")
-        try:
-            observations, _rollup, entries_read, watermark = _load_opencode_usage(path, session_id)
-        except OSError:
-            observations, entries_read, watermark = [], 0, None
-    else:
-        summary = summarize([], session_ref=session_ref, runtime=runtime,
-                            history_view=history_view, observed_count=0)
-        return UsageSnapshot("unsupported", runtime, session_ref, history_view,
-                             None, (), (), summary, 0, 0, ("runtime_usage_unsupported",))
-    if watermark is None:
-        summary = summarize([], session_ref=session_ref, runtime=runtime,
-                            history_view=history_view, observed_count=0)
-        return UsageSnapshot("unavailable", runtime, session_ref, history_view,
-                             None, (), (), summary, entries_read, 0, ("history_unreadable",))
-    records = reconcile(observations)
-    summary = summarize(records, session_ref=session_ref, runtime=runtime,
-                        history_view=history_view, observed_count=len(observations))
-    state: LoadState = "available" if observations else "empty"
-    return UsageSnapshot(state, runtime, session_ref, history_view, watermark,
-                         tuple(observations), tuple(records), summary,
-                         entries_read, len(observations), tuple(diagnostics))
+    try:
+        adapter = get_adapter(runtime)
+    except KeyError:
+        return unsupported_snapshot(runtime=runtime or "unknown",
+                                    session_ref=session_ref,
+                                    history_view=history_view)
+    return adapter.load_usage(session, history_view=history_view)
 
 
 def summarize_usage(snapshot: UsageSnapshot, *,
@@ -1878,8 +2364,10 @@ __all__ = [
     "UsageSnapshot",
     "UsageSummary",
     "ValueQuality",
+    "assemble_snapshot",
     "collect_claude_observations",
     "collect_codex_observations",
+    "collect_kimi_observations",
     "collect_opencode_observations",
     "collect_pi_observations",
     "decode_usage_cursor",
@@ -1896,5 +2384,6 @@ __all__ = [
     "summarize_observations",
     "summarize_usage",
     "summary_to_dict",
+    "unsupported_snapshot",
     "usage_capabilities",
 ]

@@ -30,7 +30,7 @@ def inspect_session(session: dict) -> dict:
         "outcome_evidence": asdict(snapshot.outcome.evidence),
         "terminal_error_kind": snapshot.outcome.error.kind if snapshot.outcome.error else None,
         "usage_state": (
-            "unsupported" if not capabilities.usage_data
+            "unsupported" if snapshot.state == "unsupported" or not capabilities.usage_data
             else "recorded" if observations else "not_recorded"
         ),
         # Usage can repeat across text/thinking blocks and messages in one turn.

@@ -19,6 +19,8 @@ Exit codes: `0` ok, `1` error, `2` usage, `3` not found, `5` ambiguous.
 | `schemas/session.v1.json` (packaged as `sesskit/schemas/…`) | List/search session object |
 | `schemas/conversation.v1.json` | Plain-text message in show/export |
 | `schemas/transcript.v1.json` | Rich event in share (`schema` field = `sesskit.transcript/v1`) |
+| `schemas/usage.v1.json` | Reconciled native token/cost observations and scoped summaries |
+| `schemas/performance.v1.json` | Named timing intervals and explicitly paired historical rates |
 
 Root `schemas/` is the doc-facing copy; wheels also ship identical files under `src/sesskit/schemas/`. When changing a schema, update **both** locations in the same change.
 
@@ -347,6 +349,25 @@ A live-history test with existing but empty history directories is unverified
 ## Verification (mandatory when changing parsers or load wiring)
 
 Unit regressions must use deterministic native-history fixtures rather than requiring a particular compaction, relation or origin distribution in a developer's recent sessions. Keep the same semantic assertions and real loader path. The separate `sesskit verify` gate and exact-file live checks below remain required; a fixture pass is never real-history evidence.
+
+Exact native regression fixtures must be resolved with `refresh_session` by id,
+not searched only within a recent top-N list: an older but readable success/error
+fixture is still valid after newer sessions arrive. Process-snapshot comparisons
+must bracket the snapshot and compare stable PIDs; processes started after a
+snapshot cannot establish that it omitted a process. Replacement fixtures create
+the replacement while the old inode still exists, rather than relying on unlink /
+recreate to defeat inode reuse or coarse filesystem clocks. Concurrent interpreter
+checks use separate pytest `--basetemp` directories to avoid shared cleanup races.
+
+Single-file helper checkout tests assert actual file selection, not one Git
+version\'s exit code: Git 2.34 may accept a cone-mode file argument while selecting
+sibling files, whereas newer Git rejects it. The maintained workflow uses
+`--no-cone`; its regression must prove both helper execution and sibling exclusion
+([Git directory-only cone contract](https://git-scm.com/docs/git-sparse-checkout#_internals_cone_pattern_set)).
+Initialize the requested cone mode explicitly on older Git rather than relying on
+`set` to change configuration. Source archives include the publishing helper and
+workflow referenced by their shipped tests; wheels continue to ship only the
+library, CLI and schemas.
 
 ### Conformance verifier contract
 

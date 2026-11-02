@@ -1,9 +1,16 @@
 # Native usage data design
 
-Status: owner-approved product boundary; proposed technical contract. Internal
-collector scaffolding exists at `46d9a2e`, but U1 acceptance is incomplete (§2.4).
-The proposed public load/summary/reader APIs, CLI and usage schema have not landed.
-This document update changes no parser or runtime implementation.
+Status: the public snapshot API, summaries, `sesskit usage` and dual-copy usage
+schema are implemented (U1-U3), including the adapter and native-data calibration
+follow-ups in §2.5-§2.7. Earlier scaffold findings in §2.4 are historical, not a
+claim that the public API is still absent. Source-specific attribution and
+conflicts remain explicit; unsupported data is never estimated.
+
+This delivery closes the existing offline token-data and historical-performance
+requests. It does not add an evaluator or infer consumer tasks. Incremental usage
+upserts (U4, §6.3) remain a separate, unimplemented capability; snapshot consumers
+reload to observe revised native counters. Activity capability alone must not be
+used to imply that its compatibility usage projection supports Kimi.
 
 ## 1. Purpose and boundary
 
@@ -139,6 +146,112 @@ it with another parser. U2 acceptance requires resolving these identity/scope
 assumptions before trusting additive totals. At this committed checkpoint U1
 is partial and U2-U4 are unimplemented; subsequent working changes require their
 own verification and do not inherit acceptance from these probes.
+
+### 2.5 Session-rollup calibration evidence (2026-10-31)
+
+Working-tree slice, verified against exact native histories (counts only, no
+content exported). Code paths: `collect_codex_observations` (`thread_token_usage`
+as session-scope cumulative), `_record_key` session-counter folding,
+`_opencode_session_rollup` (`session`/`session_v2` aggregate row).
+
+- Codex: `thread_token_usage` snapshots were previously dropped; revisions now
+  fold to the latest session record. Exact session
+  `rollout-2026-10-31T15-01-39-01a190c3…`: 552 observations / 443 records,
+  `known_total == complete_total == 14134726`, equal to the native last
+  `thread_token_usage.total_tokens`. New-format `event_msg/token_count` rows
+  carry identical numbers with no turn/response linkage and stay ambiguous
+  (excluded from sums, never double-counted).
+- OpenCode: the `session`/`session_v2` aggregate row is now read as the
+  session rollup (previously message details only, `complete_total` always
+  null). Exact session `ses_e6e779135ffextCQE8RitLJxrA`: `complete_total`
+  7933895 equals the row formula (non-cached input + cache read/write,
+  visible output + reasoning); recorded zero cost stays zero.
+- Claude: exact session `3de6db43-…`: 194 observations collapse to 104 records
+  (57 repeated native message ids folded); inclusive-input arithmetic
+  (`input + cache_read + cache_creation`) spot-checked against the native row.
+  `cost-state` per-model session rollups, `thinking_tokens` (as the reasoning
+  subset of output) and cache-tier/server-tool subdivisions are now collected;
+  multi-`cost-state` revisions fold per model and combine across models at
+  summary time (`model_rollups_combined`), never conflicting across models.
+- Pi: exact session `…e5f7e4df`: 82/82, `known` input/output equal the native
+  per-message sums; single-basis cost sums to one group. No live `toolResult`
+  usage or `compaction` usage was observed; those paths stay defensive.
+- Cursor: `store.db` blobs carry model names only, no token/cost fields in the
+  sampled workspace (`02ddfea3…/1e98f360…`, 72 blobs) — `unsupported` stays,
+  with this evidence instead of a bare default.
+- Kimi: `usage.record` turn deltas are now collected (scope turn, absolute,
+  source-position identity) and sum at session scope; inclusive input
+  (`inputOther + cacheRead + cacheCreation`) verified against the native
+  `token_counting.turn_recorded` total on the one live sample (41806).
+  `token_counting.*` stays uncollected: local context-size measurement, a
+  different metric family from billed usage. Empty wires report
+  `empty`/`not_recorded`. The adapter-level `usage_data` flag still reads
+  False (typed-activity-era declaration); the versioned usage surface
+  (`describe_support`, `usage_capabilities`, `load_usage`) is authoritative
+  for token stats until that flag is aligned.
+
+Still open from §2.4 after this slice (§2.7 closed adapter dispatch,
+session-qualified observation ids, the OpenCode step scope, and the Kimi
+flag): session-qualified rewrite-stable ids across generations (explicitly
+unpromised), one shared native-token mapping with activity, legacy Codex
+`total_token_usage` scope, Pi cost-basis/tool-link metadata.
+
+### 2.6 Claude message-Σ versus `cost-state` verdict (2026-10-31)
+
+Two exact sessions localize the relation precisely (segment scan: rollup
+deltas between consecutive `cost-state` rows against message sums in the
+same line ranges; counts only):
+
+- `3de6db43-…`: every segment agrees (cache 1.0×, output 0.996×);
+  `complete_total` is set per metric (cache 15443276, total 15708115,
+  cost 5.7596788…), overall `partial` on hook-spend residuals.
+- `52b37164-…` (5 `cost-state` revisions): segments 1–3 and 5 agree
+  **exactly** (e.g. seg1 cum `(148, 11378628, 230620, 78695)` on both
+  sides), while lines 953–1885 (102 messages, ~2-day span incl. a ~50h idle
+  gap and a 2.1.310→2.1.311 client upgrade, no retries/errors/compaction/
+  sidechain markers) report ~5× what the rollup delta counts. Same-file
+  `input_tokens` is constantly the ~2-token uncached sliver while rollup
+  uncached is 16× larger (background hook calls live only in the rollup:
+  haiku 7079 of 7353).
+
+Verdict: the two sources carry comparable quantities (proven by the exact
+segments), so a disagreeing session is a genuine data conflict, not a
+formula error — no global re-mapping. Per §4.2 the summary reports
+`conflicted` with both sides preserved (`reported_total` kept,
+`complete_total` null) on that session, while cost (message rows carry no
+cost) still completes from the rollup. `input_uncached` residuals stay
+`partial` with unattributed hook spend rather than conflicting. The seg4
+mechanism (post-upgrade/resume undercount in the writer's counters) is a
+native-data question, not something SessKit may paper over by estimating.
+
+### 2.7 Adapter-routed loads and session-qualified identity (2026-10-31)
+
+`load_usage` now dispatches through the adapter registry
+(`get_adapter(runtime).load_usage(...)`): each adapter owns its native
+feed (paths, row reads, session id) and assembles via the shared
+`assemble_snapshot` core, so reconciliation and summaries stay
+runtime-agnostic. Unknown runtimes miss the registry and report
+`unsupported`; runtimes without a verified mapping (Cursor, and any new
+adapter before it wires usage) inherit the base default, also
+`unsupported` — no hardcoded runtime list on the dispatch path.
+
+Observation ids are session-qualified when the loader passes a session
+id: `{runtime}:{session}:{record}:{field}` (one field per native
+counter/model block, e.g. Codex `line:7:thread_token_usage`, Claude
+`line:9:modelUsage:m1`), deterministic across repeated loads of one
+generation and disjoint across sessions with identical line numbers.
+Without a session id (synthetic probes) the legacy
+`{runtime}:{record}:{index}` form is kept byte-stable. Same-record
+collisions take deterministic `#2`-style suffixes. Rewrite-stable ids
+across generations are still not promised; paging stays bound to the
+source watermark cursor.
+
+Kimi's adapter now declares `usage_data=True` (capability table and
+adapter test aligned): the versioned usage surface
+(`describe_support`, `usage_capabilities`, `load_usage`) is authoritative
+for token stats, while typed-activity adaptation stays deferred. Verified
+end to end: registry-routed and direct-adapter snapshots agree
+observation-for-observation on a live wire fixture.
 
 ## 3. Data model
 
@@ -531,9 +644,10 @@ projection scope differs from accounting scope.
 
 ## 7. Implementation stages and acceptance
 
-No parser fixes are part of this design-only change. Complete the partial U1
-scaffold against §2.4 before treating it as delivered. Each stage is a complete,
-tested slice; do not expose an unfinished command/capability.
+U1-U3 are implemented snapshot capabilities; §2.4 records their original scaffold
+checkpoint and §2.5-§2.7 track the follow-up work. U4 is not advertised or enabled.
+Each stage needs its own native-data and installed-artifact evidence; earlier
+fixture results alone do not establish acceptance of later changes.
 
 | Stage | Work and owning locations | Gate |
 |---|---|---|

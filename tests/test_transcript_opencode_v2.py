@@ -83,7 +83,8 @@ class LiveV2EventsTests(unittest.TestCase):
         assistants = [e["text"] for e in events if e["type"] == "assistant_message"]
         self.assertTrue(any("Go usage limit exceeded" in t for t in assistants))
         # 尾部 idle failed 不出对话事件，但 status_tag 仍是中断。
-        info = next(s for s in oc.scan_sessions(limit=500) if s["id"] == LIVE_V2_QUOTA)
+        info = oc.refresh_session({"path": self.db, "id": LIVE_V2_QUOTA})
+        self.assertIsNotNone(info, "exact native quota fixture must remain readable")
         self.assertEqual(info["status_tag"], "⚠️已中断")
 
     def test_dual_session_still_uses_v1_events(self):

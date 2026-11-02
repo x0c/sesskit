@@ -13,22 +13,29 @@ from sesskit.adapters.base import (
 )
 from sesskit.parsers import claude as _parser
 
+_CAPABILITY_FLAG_KWARGS = {
+    "typed_activity": True,
+    "incremental_reading": True,
+    "structured_questions": True,
+    "native_tool_result_status": True,
+    "native_turn_boundaries": True,
+    "conversation_include_errors": True,
+    "subagent_linkage": True,
+    "usage_data": True,
+    "compaction_markers": True,
+    "message_origin": True,
+}
+
 
 class ClaudeAdapter(RuntimeAdapter):
     id = "claude"
     display_name = "Claude Code"
-    capabilities = Capabilities(
-        typed_activity=True,
-        incremental_reading=True,
-        structured_questions=True,
-        native_tool_result_status=True,
-        native_turn_boundaries=True,
-        conversation_include_errors=True,
-        subagent_linkage=True,
-        usage_data=True,
-        compaction_markers=True,
-        message_origin=True,
-    )
+    try:
+        # Owned by the core worker (Capabilities.performance_data); falls
+        # back until that field lands so this module stays import-safe.
+        capabilities = Capabilities(performance_data=True, **_CAPABILITY_FLAG_KWARGS)
+    except TypeError:
+        capabilities = Capabilities(**_CAPABILITY_FLAG_KWARGS)
 
     def scan(self, limit: int = 50, keep_ids: set[str] | None = None,
              *, include_missing_cwd: bool = False) -> Any:
@@ -58,6 +65,38 @@ class ClaudeAdapter(RuntimeAdapter):
         from sesskit.transcript import _parse_claude
 
         return _parse_claude(session)
+
+    def load_usage(self, session: dict, *, history_view: str = "all_branches") -> Any:
+        from sesskit import usage as _usage
+
+        runtime = str(session.get("source") or self.id)
+        session_id = str(session.get("id") or "")
+        session_ref = f"{runtime}:{session_id}" if session_id else None
+        path = str(session.get("path") or "")
+        diagnostics: list[str] = []
+        if history_view == "active_branch":
+            diagnostics.append("branch_views_unsupported_fallback_all_branches")
+        try:
+            observations, entries_read, watermark, read_diagnostics = _usage._load_jsonl_usage(
+                path, "claude", session_id or None)
+            diagnostics.extend(read_diagnostics)
+        except OSError:
+            observations, entries_read, watermark = [], 0, None
+        return _usage.assemble_snapshot(
+            runtime=runtime, session_ref=session_ref, history_view=history_view,
+            observations=observations, entries_read=entries_read,
+            watermark=watermark,
+            extra_diagnostics=tuple(diagnostics))
+
+    def load_performance(self, session: dict, *, history_view: str = "all_branches") -> Any:
+        from sesskit.performance_adapters import claude as _performance_claude
+
+        return _performance_claude.load(session, history_view=history_view)
+
+    def performance_capabilities(self) -> Any:
+        from sesskit.performance_adapters import claude as _performance_claude
+
+        return _performance_claude.CAPABILITIES
 
     def open_reader(self, session: dict, cursor: Any = None) -> Any:
         from sesskit.activity_reader import open_activity_reader
