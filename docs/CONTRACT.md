@@ -52,11 +52,12 @@ restart rehydrates/reset-reconciles the current tail. `end` is observer lifecycl
 not agent success. Native error/outcome evidence remains separate from observer
 `error` and process liveness. No U4 accounting is added.
 
-Loss of history readability invalidates cached availability. Restoring an
-identical file/database must rebuild a fresh reader generation, even when inode,
-size and timestamps match the cached source. A prior unavailable state must not
-survive a no-change fast path. This applies to the existing Pi, Claude/Codex,
-Cursor and OpenCode readers as well as the stream's degraded history view.
+Shared cache-validity reasoning and the deterministic reproducer are in
+[availability recovery](~/.config/agentsync/docs/AGENT_SESSION_INTEGRATION_GUIDE.md#availability-recovery-is-not-content-version-continuity).
+SessKit specifically requires a fresh reader generation after an unavailable
+source becomes readable, even for identical identity/stamps. This applies to
+Pi, Claude/Codex, Cursor and OpenCode readers, unavailable-cursor reopens and the
+stream's degraded history view.
 
 `sesskit stream` emits one bare JSON record per line, including failure `end`
 records before startup. Default observation budgets are 60 s, 1000 total records

@@ -65,7 +65,7 @@ all design proposals as delivered.
 ## 3. Invariants
 
 - Unknown stays unknown: no success, answer, or completion is inferred without evidence.
-- v1 transcript output and the CLI envelope stay byte-compatible until a versioned schema change.
+- v1 transcript output and existing snapshot-command envelopes stay byte-compatible until a versioned schema change. The additive message stream uses its own `sesskit.message-stream/v1` JSONL contract.
 - SessKit remains host-neutral: no host names, paths, claims, or policies in core. Host behavior enters only through per-call extensions.
 - Kimi typed-activity adaptation is deferred; existing Kimi behavior is unchanged.
 
@@ -90,34 +90,44 @@ Each stage lands with conformance fixtures, real-history parity for affected run
 ## 5. Open decisions
 
 - Whether `live`/`pid` stay in the stable record or move to `ProcessObservation` only (tied to stage H).
-- The public name and versioning of the typed JSON schema that follows v1.
+- The public name and versioning of the complete typed-activity schema that follows transcript v1. The separately versioned message-stream records do not replace that pending schema.
 
-### 5.1 Agent-output streaming: requested follow-up research
+### 5.1 Third-party message streaming and native attachment
 
 Owner request (2026-11-02): investigate whether SessKit can read agent output as
 it is produced. The owner subsequently authorized OpenCode research, split by
 runtime with coordinator verification and integration. The checked findings are
 recorded in [Agent output streaming knowledge base](STREAMING_OUTPUT_KNOWLEDGE_BASE.md):
 native live-output paths exist, but access to an already-running session depends
-on its exposed observer surface. The study does not adopt an API, authorize
-implementation or create a recurring scheduled job. Source/documentation evidence
-and exercised native-history checks remain distinct from unperformed live tests.
+on its exposed observer surface. On 2026-11-03 the owner adopted third-party
+message streaming with automatic service degradation, superseding the initial
+research-only boundary. The current source implements `open_message_stream`,
+caller-owned native input bridges and the `sesskit stream` JSONL command; see the
+[message streaming guide](MESSAGE_STREAMING_GUIDE.md) for the delivered contract
+and acceptance limits. Unavailable live input automatically falls back to history;
+this is normal behavior, not a separate approval gate.
+
+Format normalization and persisted-history following do not establish automatic
+passive attachment to a private process. Source/documentation evidence, exercised
+history/consumer paths and unperformed live transport tests remain distinct.
+Execution ownership, U4 accounting and recurring scheduled jobs are not added.
 
 Keep three different capabilities explicit:
 
 - **Persisted-history following:** the existing incremental readers consume native
   records as they become readable. This does not by itself establish token/text
   delta delivery before a message is persisted or completed.
-- **Live output observation:** research access to text fragments, exposed reasoning
-  fragments, tool events, errors and native terminal events while a runtime runs.
+- **Live output observation:** normalize supplied text fragments, exposed reasoning
+  fragments, tool events, errors and native terminal events while a runtime runs;
+  a transport's actual attachment and delivery still need separate evidence.
   Only data actually emitted by the source is in scope; no unavailable reasoning
   content, missing fragments or completion signals may be invented.
 - **Incremental accounting:** U4 revises token/cost records; it is not an output
   stream and must not be presented as the same feature.
 
-The follow-up must check Claude, Codex, OpenCode, Cursor, Kimi and Pi independently
-using current official documentation, inspected native implementations and bounded
-runtime evidence. Compare local history/WAL updates with candidate native
+Future native-transport integrations must check Claude, Codex, OpenCode, Cursor,
+Kimi and Pi independently against current official documentation, inspected native
+implementations and bounded runtime evidence. Compare local history/WAL updates with candidate native
 structured-output, SDK, protocol and externally supplied event feeds; do not assume
 that stdout, terminal repaint text or a documented live event is recoverable from
 stored history. Distinguish attaching to an already-running session from observing
@@ -133,11 +143,11 @@ observer must not silently abort the agent. Success and reproducible error/abort
 paths need exact-session evidence; unavailable attachment or lost fragments remain
 explicit limits, not passes.
 
-Deliver a per-runtime feasibility matrix and the smallest evidence-backed next
-step, clearly separating existing support, proposed work and unsupported cases.
-No new command or streaming capability flag is advertised until implementation
-and compatibility acceptance establish it. Existing history APIs and transcript
-v1 semantics remain unchanged by this research request.
+The [research matrix](STREAMING_OUTPUT_KNOWLEDGE_BASE.md#runtime-feasibility)
+continues to separate source feasibility from exercised behavior. Advertise only
+implemented and accepted observation contracts, not unperformed native attachment
+or replay guarantees. Existing history APIs, transcript v1 and snapshot-command
+envelopes are unchanged; only the additive stream has a separate JSONL protocol.
 
 ## 6. Research evidence
 

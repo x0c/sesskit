@@ -20,10 +20,13 @@
 
 This domain is the user-facing surface of SessKit: session discovery output
 (`list`, `search`), single-session reads (`show`), bulk and share exports
-(`export`, `share`), and command introspection (`describe`). Every command
-prints one JSON envelope (`ok`, `data`, `error`, `meta`) so shells, scripts,
-and other languages consume SessKit without importing Python. Exit codes stay
-stable: 0 ok, 1 error, 2 usage, 3 not found, 5 ambiguous.
+(`export`, `share`), and command introspection (`describe`). Those snapshot
+commands print one JSON envelope (`ok`, `data`, `error`, `meta`). The additive
+`stream` observer prints versioned bare JSONL records, including structured error
+ends; its source/degradation and budget contract lives in the
+[message streaming guide](MESSAGE_STREAMING_GUIDE.md). Both paths serve other
+languages without importing Python. Snapshot exit codes stay stable: 0 ok,
+1 error, 2 usage, 3 not found, 5 ambiguous.
 
 Canonical terms: envelope (the single printed JSON object), session payload
 (one scanned session record with excerpt and status fields), list (bounded
@@ -54,7 +57,7 @@ graph TD
 
 ## §2 Core business flows / state machines
 
-### Envelope and exit contract
+### Snapshot envelope and exit contract
 
 Success prints `{"ok": true, "data": {...}, "error": null, "meta":
 {"version": 1}}`. Failure prints `ok: false` with `data: null` and an `error`
@@ -109,8 +112,10 @@ pointing at the describe command itself.
 
 | Directory (relative to project root) | Contents | Key classes / file count |
 |------|------|--------|
-| `src/sesskit/cli.py` | All six command implementations plus dispatch | `cmd_list()`, `cmd_search()`, `cmd_show()`, `cmd_export()`, `cmd_share()`, `cmd_describe()`, `resolve_ref()`, `build_parser()`, `dispatch()`, `main()` |
-| `src/sesskit/envelope.py` | Envelope constructors and exit codes | `ok()`, `err()`, `print_envelope()`, `ApiError`, `API_VERSION`, `EXIT_OK`, `EXIT_ERROR`, `EXIT_USAGE`, `EXIT_NOT_FOUND`, `EXIT_AMBIGUOUS` |
+| `src/sesskit/cli.py` | Snapshot handlers and shared command registration/dispatch | `cmd_list()`, `cmd_search()`, `cmd_show()`, `cmd_export()`, `cmd_share()`, `cmd_describe()`, `resolve_ref()`, `build_parser()`, `dispatch()`, `main()` |
+| `src/sesskit/streaming_cli.py` | JSONL observer, input framing and observation budgets | `cmd_stream()`, `StreamCommand.run()`, `print_stream_error()` |
+| `src/sesskit/streaming.py` | Message-stream records and live/history reconciliation | `open_message_stream()`, `MessageStream` |
+| `src/sesskit/envelope.py` | Snapshot envelope constructors and exit codes | `ok()`, `err()`, `print_envelope()`, `ApiError`, `API_VERSION`, `EXIT_OK`, `EXIT_ERROR`, `EXIT_USAGE`, `EXIT_NOT_FOUND`, `EXIT_AMBIGUOUS` |
 | `src/sesskit/registry.py` | Scan fan-out backing list and search | `ParserRegistry.scan_all()`, `default_registry()` |
 | `src/sesskit/titles.py` | Excerpt clipping and title helpers used by list payloads | Excerpt limit, `_title_line()`, handoff-digest helpers, completion-id helpers |
 | `src/sesskit/paths.py` | Write-safety helpers for export and share | `assert_not_history_path()`, `atomic_write_json()`, `realpath_or_abs()` |
@@ -127,6 +132,7 @@ pointing at the describe command itself.
 | Bulk export by time | `src/sesskit/cli.py` | `cmd_export()`, `_parse_time_bound()` | Time-bound parsing plus per-session plain loads |
 | Build and write share payload | `src/sesskit/cli.py` | `build_share_payload()`, `write_share_envelope()`, `cmd_share()` | Rich events plus metadata; atomic write with protected-path checks |
 | Stage share in cache | `src/sesskit/cli.py` | `share_cache_path()`, `export_share_to_cache()` | Repeatable cache location under the product cache dir |
+| Observe one session's message updates | `src/sesskit/streaming_cli.py` | `cmd_stream()`, `StreamCommand.run()` | JSONL, read-only, bounded by default; unavailable native feed degrades to history |
 | Print command help as data | `src/sesskit/cli.py` | `cmd_describe()`, `_describe_command()` | Unknown names route back to describe hints |
 | Dispatch argv | `src/sesskit/cli.py` | `build_parser()`, `dispatch()`, `main()` | JSON argument parser plus subcommand routing |
 | Build success or error envelopes | `src/sesskit/envelope.py` | `ok()`, `err()`, `print_envelope()` | Single envelope shape with version meta |
@@ -142,7 +148,8 @@ envelope fields that callers filter, clip, or match on.
 
 | Table/field | Entity/Mapper | Business meaning | Change notes |
 |---|---|---|---|
-| Envelope `ok` / `data` / `error` / `meta` | `src/sesskit/envelope.py` envelope | Single output contract for every command | Never print bare payloads; always wrap success and failure the same way |
+| Envelope `ok` / `data` / `error` / `meta` | `src/sesskit/envelope.py` envelope | Snapshot-command output contract | Preserve existing success/failure envelopes; do not apply this wrapper to `stream` |
+| Stream `schema` / `type` / `generation` / `mode` | `src/sesskit/streaming.py` records | Independently parseable `sesskit.message-stream/v1` observations | Whole-value upsert/reset semantics; errors also use end records; see the dedicated guide |
 | Envelope `error.code` / `message` / `hint` / `next_commands` | `src/sesskit/envelope.py` error object | Machine code plus human guidance plus follow-ups | Keep hints actionable with exact next commands |
 | `session_payload()` projection | `src/sesskit/cli.py` session shaping | Field-selected session view | Projection never changes scan or filter semantics |
 | `first_user_msg` / `last_user_msg` / `last_agent_msg` | `src/sesskit/titles.py` excerpt pipeline | Bounded 300-character previews | Handoff digests extracted before clipping; error text may fill agent excerpts on abnormal ends |
@@ -155,8 +162,9 @@ envelope fields that callers filter, clip, or match on.
 
 ## §5 This domain's flow / component / job / MQ entry index
 
-No queues, crons, or flow engines exist. This section indexes the read and
-write pipelines behind the commands.
+Snapshot commands have no scheduler or flow engine. This section indexes their
+read/write pipelines; the observer's bounded native-input queue and degradation
+flow are documented in the message streaming guide.
 
 | Type | Id | Code entry | When used |
 |---|---|---|---|
@@ -185,7 +193,8 @@ write pipelines behind the commands.
 
 ## §7 Common easy-to-miss conditions and validation paths
 
-- After changing any command: run `python3 -m pytest tests/test_cli_smoke.py -q` and confirm envelope shapes plus exit codes hold.
+- After changing snapshot commands: run `python3 -m pytest tests/test_cli_smoke.py -q` and confirm envelope shapes plus exit codes hold.
+- After changing `stream`: run `python3 -m pytest tests/test_message_stream.py -ra`; verify independently parseable data/error-end lines, automatic degradation, restored-source recovery and observation budgets. Do not wrap its output in a snapshot envelope.
 - After changing list or search: run `sesskit list --top 5 --compact` and `sesskit search refactor --top 3`, then confirm one JSON envelope per command with bounded excerpts and ranked snippets.
 - After changing show: run `sesskit show <session-id-or-prefix> --full` for a known session plus one unknown id, and confirm the known session prints messages while the unknown id returns a not-found envelope (exit 3) and a prefix collision returns an ambiguous envelope (exit 5).
 - After changing export or share: run `sesskit export --since 7d --out /tmp/sesskit-verify.json` and `sesskit share <session-id> --out /tmp/sesskit-share.json`, then confirm both outputs parse as JSON envelopes and neither output path can be a history path (guard refuses with a clear error).
@@ -196,11 +205,12 @@ write pipelines behind the commands.
 
 - `docs/RUNTIME_PARSING_KNOWLEDGE_BASE.md`: covers native scan and load behavior behind list, search, show, export, and share; read together when changing scanner filters or excerpt inputs.
 - `docs/UNIFIED_ABSTRACTION_KNOWLEDGE_BASE.md`: covers the session, conversation, transcript, activity, outcome, and schema contracts projected by these commands; read together when changing payload shapes.
-- `docs/CONTRACT.md`: covers the file-level envelope, listing-mode, and write-safety rules enforced here; read before changing command semantics.
+- `docs/CONTRACT.md`: covers snapshot envelopes, the separate message-stream protocol, listing modes and write safety; read before changing command semantics.
+- `docs/MESSAGE_STREAMING_GUIDE.md`: owns message observation inputs, automatic history degradation, JSONL records, budgets and native-transport limits.
 
 ## §9 Coverage and to-be-filled items
 
-- Code-inference coverage: six command flows plus envelope, resolution, excerpt, and write-safety helpers traced from argv dispatch to JSON output; read versus write pipelines separated.
+- Code-inference coverage: snapshot flows plus envelope, resolution, excerpt and write-safety helpers; the message-stream entry points and separate JSONL/error protocol are routed to their owning guide. Read versus write pipelines remain separated.
 - Domain-language unification: command verbs used canonically in body; internal function names kept in §3; payload field names match the session-record contract.
 - User / materials: command examples drawn from README quick start; validation allowance confirmed 2026-09-29; hotspot and trap inputs reused from the runtime domains.
 - Multi-source evidence enrichment: CLI source read in full; envelope, paths, and cache helpers read; smoke and excerpt tests referenced; live command sampling still pending in this doc session.

@@ -15,12 +15,12 @@ Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`
 - `schemas/*.json` and `src/sesskit/schemas/*.json`: session/conversation/transcript, usage and historical-performance datasets and message-stream records; both copies stay identical.
 - `docs/RUNTIME_PARSING_KNOWLEDGE_BASE.md`: Native history parsing for six runtimes: scan, plain-turn load, liveness, versioning, and per-runtime success versus abnormal signals.
 - `docs/UNIFIED_ABSTRACTION_KNOWLEDGE_BASE.md`: Unified abstraction over all runtimes: session and conversation models, transcript and typed activity events, outcomes, errors, tool results, evidence, and JSON Schemas.
-- `docs/ABSTRACTION_REDESIGN.md`: Cross-runtime abstraction, adapter/capability, turn/event/error design, invariants and migration status, plus the owner-approved agent-output streaming research scope, distinct from history following and incremental accounting.
+- `docs/ABSTRACTION_REDESIGN.md`: Cross-runtime abstraction, adapter/capability, turn/event/error design, invariants and migration status, plus delivered third-party message observation, automatic history degradation and remaining native-attachment boundaries, distinct from incremental accounting.
 - `docs/NATIVE_USAGE_DATA_DESIGN.md`: Native usage data scope (not evaluation), general-purpose entity/metric reuse, runtime evidence, call/message/turn/session attribution, counter reconciliation, implemented snapshot API/export, remaining incremental scope, and acceptance stages.
 - `docs/RUNTIME_THROUGHPUT_KNOWLEDGE_BASE.md`: Historical tokens/s and latency evidence, implemented performance API/CLI, interval semantics, native timing/counter pairing hazards, snapshot consistency and read-only verification.
 - `docs/STREAMING_OUTPUT_KNOWLEDGE_BASE.md`: Six-runtime live-output research, native source pins and attachment limits, plus the adopted third-party streaming and automatic-degradation requirements.
 - `docs/MESSAGE_STREAMING_GUIDE.md`: Python/JSONL message-stream integration, host-supplied native feed formats, automatic history degradation, upsert/reset/cursor semantics, budgets, detach/privacy limits and source-release availability.
-- `docs/LISTING_CLI_EXPORT_KNOWLEDGE_BASE.md`: Listing, search, show, export, share, and describe surface: JSON envelope, reference resolution, excerpt rules, and atomic write safety.
+- `docs/LISTING_CLI_EXPORT_KNOWLEDGE_BASE.md`: Snapshot CLI/export surface and the separate JSONL stream route: output contracts, reference resolution, excerpt rules, stream entry points and atomic write safety.
 
 ## Hard constraints (agent)
 

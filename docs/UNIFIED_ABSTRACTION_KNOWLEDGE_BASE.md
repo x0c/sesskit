@@ -26,8 +26,11 @@ and activity events without learning each native format. The abstraction has
 four layers: session identity and metadata (`SessionInfo`), plain conversation
 (`ConversationMessage`), rich transcript events (v1 dicts), and the additive
 typed activity view (`ActivitySnapshot` with evidence, outcomes, and structured
-errors). JSON Schemas plus a single CLI envelope make the contract consumable
-from any language by shelling out.
+errors). JSON Schemas and snapshot-command envelopes make those views consumable
+from any language. The additive [message stream](MESSAGE_STREAMING_GUIDE.md)
+reuses normalized activity inside separately versioned JSONL observations; it
+neither replaces transcript v1 nor makes native transport ownership part of the
+history model.
 
 Canonical terms in body text: session (one scanned history unit with stable
 `source` plus `id`), conversation (ordered plain `user` / `assistant` turns),
