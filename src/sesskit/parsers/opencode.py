@@ -1212,84 +1212,179 @@ def _is_v1_session(db_path: str, session_id: str) -> bool:
         conn.close()
 
 
-def _delete_session_v1(db_path: str, session_id: str) -> None:
-    """彻底删除单个 OpenCode 会话，不可恢复。
-
-    OpenCode 所有会话共享一个 SQLite 库，删除必须按 session_id 精确删行，不能
-    像其他运行时那样直接删文件（会连带删掉全部其他会话）。这是全仓第一处
-    可写 SQLite 连接（其余所有 DB 访问，包括本文件的 `_connect_ro`，都是
-    `mode=ro` 只读打开）；按外键依赖顺序在一个事务内删 part → message →
-    session，成功后 commit，任何一步失败自动 rollback，不会留下半删状态。
-    """
-    conn = sqlite3.connect(db_path, timeout=5.0)
+def _delete_session_tables(conn: sqlite3.Connection) -> set[str]:
+    """Writable-connection table inventory for deletes (missing tables are normal)."""
     try:
-        conn.execute(
-            "DELETE FROM part WHERE message_id IN "
-            "(SELECT id FROM message WHERE session_id = ?)",
-            (session_id,),
-        )
-        conn.execute("DELETE FROM message WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM session WHERE id = ?", (session_id,))
-        conn.commit()
+        return {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
     except sqlite3.Error:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+        return set()
 
 
-def _delete_session_v2(db_path: str, session_id: str) -> None:
-    """删除单个 v2 会话（只落在 session_v2 / session_message 里的新会话）。
-
-    同一事务内按 session_message → instruction_entry → instruction_state →
-    session_pending → session_inbox → session_v2 有序删除：SQLite 默认没开
-    外键约束，不依赖 ON DELETE CASCADE；commit/rollback 口径与 v1 一致。
-    辅助表按实际存在的删：不同版本库缺 session_pending 等表是常态（本机实测），
-    缺表不得让整个删除回滚——否则 v2 会话删不掉，分叉出来的副本也清不掉。
-    """
-    conn = sqlite3.connect(db_path, timeout=5.0)
+def _delete_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     try:
-        try:
-            existing = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+        return {
+            str(row[1])
+            for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        }
+    except sqlite3.Error:
+        return set()
+
+
+def _collect_delete_targets(
+    conn: sqlite3.Connection, existing: set[str], session_id: str
+) -> list[str]:
+    """删除目标 id：自身 + parent_id 链上的全部子会话（含跨 v1/v2 的混排）。
+
+    原生 `opencode session delete` 语义是“删一个会话及其子会话”；子会话
+    parent_id 非空、本来就不进列表，但不一起删会留下孤儿历史。fork 副本的
+    fork_session_id 不是 parent_id（独立顶层会话），不受牵连。
+    """
+    targets: list[str] = []
+    seen: set[str] = set()
+    queue = [session_id]
+    while queue:
+        sid = queue.pop()
+        if sid in seen:
+            continue
+        seen.add(sid)
+        targets.append(sid)
+        for table in ("session", "session_v2"):
+            if table not in existing:
+                continue
+            if "parent_id" not in _delete_table_columns(conn, table):
+                continue
+            try:
+                children = conn.execute(
+                    f'SELECT id FROM "{table}" WHERE parent_id = ?', (sid,)
                 ).fetchall()
-            }
-        except sqlite3.Error:
-            existing = set()
-        conn.execute(
-            "DELETE FROM session_message WHERE session_id = ?", (session_id,)
-        )
-        for table in (
-            "instruction_entry",
-            "instruction_state",
-            "session_pending",
-            "session_inbox",
-        ):
-            if table in existing:
+            except sqlite3.Error:
+                continue
+            for (child,) in children:
+                if child not in seen:
+                    queue.append(str(child))
+    return targets
+
+
+def _delete_session_rows(
+    conn: sqlite3.Connection, existing: set[str], targets: list[str]
+) -> None:
+    """在一个事务内按 session_id 精确删除目标会话（含子会话）的全部行。
+
+    v1/v2 双表并存的迁移行必须两边一起删：只删一边会让另一边在下次扫描里
+    重新可见（v2 扫描靠 NOT EXISTS 排除已落在 v1 的 id，一旦 v1 行没了、
+    残留的 v2 行就变成“新会话”冒出来——用户看到的就是“删不掉”）。
+    actor 侧表（todo/job/share/schedule/event）同属该会话的私有历史，
+    一起清掉，不留孤儿行；blob/instruction_blob 按 hash 全局复用，
+    不属于任何单个会话，绝不碰。
+    """
+    placeholders = ", ".join("?" for _ in targets)
+    columns: dict[str, set[str]] = {}
+
+    def cols(table: str) -> set[str]:
+        if table not in columns:
+            columns[table] = _delete_table_columns(conn, table)
+        return columns[table]
+
+    def delete_where(table: str, column: str) -> None:
+        if table not in existing or column not in cols(table):
+            return
+        try:
+            conn.execute(
+                f'DELETE FROM "{table}" WHERE "{column}" IN ({placeholders})',
+                targets,
+            )
+        except sqlite3.Error as exc:
+            if "no such table" in str(exc) or "no such column" in str(exc):
+                return
+            raise
+
+    # part 先按 message 归属删（兼容极老库缺 part.session_id 的形态），
+    # 再按 session_id 兜底；message 行删掉后子查询就看不到了，所以顺序在前。
+    if "part" in existing and "message" in existing and "id" in cols("message"):
+        try:
+            conn.execute(
+                f'DELETE FROM "part" WHERE message_id IN '
+                f'(SELECT id FROM "message" WHERE session_id IN ({placeholders}))',
+                targets,
+            )
+        except sqlite3.Error as exc:
+            if "no such table" not in str(exc) and "no such column" not in str(exc):
+                raise
+    for table in (
+        "part",
+        "message",
+        "session_message",
+        "session_part",
+        "blob_ref",
+        "instruction_entry",
+        "instruction_state",
+        "session_pending",
+        "session_inbox",
+        "todo",
+        "session_share",
+        "schedule",
+    ):
+        delete_where(table, "session_id")
+    if "job" in existing:
+        job_cols = cols("job")
+        try:
+            if "session_id" in job_cols and "child_session_id" in job_cols:
                 conn.execute(
-                    f"DELETE FROM {table} WHERE session_id = ?", (session_id,)
+                    f'DELETE FROM "job" WHERE session_id IN ({placeholders}) '
+                    f'OR child_session_id IN ({placeholders})',
+                    (*targets, *targets),
                 )
-        conn.execute("DELETE FROM session_v2 WHERE id = ?", (session_id,))
-        conn.commit()
-    except sqlite3.Error:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+            elif "session_id" in job_cols:
+                conn.execute(
+                    f'DELETE FROM "job" WHERE session_id IN ({placeholders})',
+                    targets,
+                )
+        except sqlite3.Error as exc:
+            if "no such table" not in str(exc) and "no such column" not in str(exc):
+                raise
+    for table in ("event", "event_sequence"):
+        delete_where(table, "aggregate_id")
+    for table in ("session", "session_v2"):
+        if table not in existing:
+            continue
+        try:
+            conn.execute(
+                f'DELETE FROM "{table}" WHERE id IN ({placeholders})', targets
+            )
+        except sqlite3.Error as exc:
+            if "no such table" in str(exc) or "no such column" in str(exc):
+                continue
+            raise
 
 
 def delete_session(db_path: str, session_id: str) -> None:
-    """彻底删除单个 OpenCode 会话，不可恢复（v1/v2 双表分发）。
+    """彻底删除单个 OpenCode 会话及其子会话，不可恢复。
 
-    id 落在 v1 session 表里（含双表并存的迁移行）走 v1 删除，原样保留；
-    否则走 v2 删除。不存在 id 的两条路径都是无操作提交，与原有行为一致。
+    v1/v2 双表 + 全部会话级侧表一次事务提交：双表并存的迁移行两边一起删，
+    否则残留的那边会在下次扫描里重新可见（“删不掉”的根因）。不存在的 id
+    是无操作提交，与原有行为一致；库文件不存在也不建空库，直接返回。
     """
-    if _is_v1_session(db_path, session_id):
-        _delete_session_v1(db_path, session_id)
-    else:
-        _delete_session_v2(db_path, session_id)
+    if not db_path or not session_id or not os.path.isfile(db_path):
+        return
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        existing = _delete_session_tables(conn)
+        if not existing:
+            conn.commit()
+            return
+        targets = _collect_delete_targets(conn, existing, session_id)
+        _delete_session_rows(conn, existing, targets)
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 _CLONE_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"

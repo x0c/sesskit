@@ -519,7 +519,9 @@ class SyntheticV2Tests(unittest.TestCase):
         sessions = oc.scan_sessions(limit=50)
         self.assertIsNone(_scan_by_id(sessions, "ses_err"))
 
-    def test_delete_dual_id_uses_v1_path(self):
+    def test_delete_dual_id_removes_both_sides(self):
+        """双表并存的迁移行必须两边一起删：只删 v1 会让残留的 v2 行在下次
+        扫描里重新可见（v2 靠 NOT EXISTS 排除 v1 id），用户看到的就是删不掉。"""
         oc.delete_session(self.db_path, "ses_dual")
         conn = sqlite3.connect(self.db_path)
         try:
@@ -532,14 +534,91 @@ class SyntheticV2Tests(unittest.TestCase):
                 ).fetchone()[0],
                 0,
             )
-            # v2 影子行保留（v1 路径只删 v1 三表，与原有行为一致）。
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM session_message WHERE session_id = ?",
+                    ("ses_dual",),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM session_v2 WHERE id = ?", ("ses_dual",)
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            conn.close()
+        sessions = oc.scan_sessions(limit=50)
+        self.assertIsNone(_scan_by_id(sessions, "ses_dual"))
+
+    def test_delete_removes_children_and_side_tables(self):
+        """子会话（parent_id 链）与会话级侧表一起清，不留孤儿行。"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE todo (session_id TEXT, content TEXT);
+                CREATE TABLE job (id TEXT, session_id TEXT, child_session_id TEXT);
+                CREATE TABLE session_share (session_id TEXT, id TEXT);
+                CREATE TABLE event (id TEXT, aggregate_id TEXT);
+                """
+            )
+            conn.execute(
+                "INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?)",
+                ("ses_child", "/repo/dual", "child", 1001, 4001, "ses_ok", None),
+            )
+            conn.execute("INSERT INTO todo VALUES (?, ?)", ("ses_ok", "do it"))
+            conn.execute(
+                "INSERT INTO job VALUES (?, ?, ?)", ("j1", "ses_ok", "ses_ok")
+            )
+            conn.execute(
+                "INSERT INTO session_share VALUES (?, ?)", ("ses_ok", "sh1")
+            )
+            conn.execute("INSERT INTO event VALUES (?, ?)", ("e1", "ses_ok"))
+            conn.commit()
+        finally:
+            conn.close()
+        oc.delete_session(self.db_path, "ses_ok")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            for table, column, value in (
+                ("session_v2", "id", "ses_ok"),
+                ("session_v2", "id", "ses_child"),
+                ("session_message", "session_id", "ses_ok"),
+                ("todo", "session_id", "ses_ok"),
+                ("job", "session_id", "ses_ok"),
+                ("session_share", "session_id", "ses_ok"),
+                ("event", "aggregate_id", "ses_ok"),
+            ):
+                self.assertEqual(
+                    conn.execute(
+                        f'SELECT COUNT(*) FROM "{table}" WHERE "{column}" = ?',
+                        (value,),
+                    ).fetchone()[0],
+                    0,
+                    f"{table} orphan for ses_ok",
+                )
+            # 同库其他会话不受牵连。
             self.assertIsNotNone(
                 conn.execute(
-                    "SELECT 1 FROM session_v2 WHERE id = ?", ("ses_dual",)
+                    "SELECT 1 FROM session_v2 WHERE id = ?", ("ses_toolcalls",)
                 ).fetchone()
             )
         finally:
             conn.close()
+        sessions = oc.scan_sessions(limit=50)
+        self.assertIsNone(_scan_by_id(sessions, "ses_ok"))
+        self.assertIsNotNone(_scan_by_id(sessions, "ses_toolcalls"))
+
+    def test_delete_missing_id_and_missing_db_are_noops(self):
+        """不存在的 id 无操作不报错；库文件不存在不建空库，直接返回。"""
+        oc.delete_session(self.db_path, "ses_no_such_id")
+        sessions = oc.scan_sessions(limit=50)
+        self.assertIsNotNone(_scan_by_id(sessions, "ses_ok"))
+        missing = os.path.join(self.tmp.name, "no-such-opencode.db")
+        oc.delete_session(missing, "ses_ok")
+        self.assertFalse(os.path.exists(missing))
 
 
 class ErrorShapeTests(unittest.TestCase):
