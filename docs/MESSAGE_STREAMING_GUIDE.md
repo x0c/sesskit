@@ -5,6 +5,8 @@ six native parsers. SessKit observes; the application owns presentation, native
 transport, access control and execution. No agent is launched, resumed or interrupted.
 
 This API is in the current source checkout, not the published v0.2.24 release wheel.
+The [independent review findings](#known-issues-from-independent-review) below are
+confirmed, unfixed implementation exceptions, not changes to the intended contract.
 Install the checkout with `python -m pip install .` using the application's Python
 3.10+ environment. macOS and Linux are supported; no extra dependency is required.
 
@@ -161,6 +163,56 @@ that an arbitrary owned child-process pipe has harmless detach semantics.
 Native message/tool/error content may contain private code or credentials. Protect
 output and authorization in the consuming application. Nothing is uploaded or
 written to native history by this stream.
+
+## Known issues from independent review
+
+Reviewed on 2026-11-04 against code commit `70d3897` and documentation commit
+`a5f02ec`. Four independent read-only reviews were checked with coordinator-run
+synthetic reproductions and source inspection. Six P2 issues and one P3 issue were
+confirmed; no P0/P1 was confirmed. **None is fixed by this documentation update.**
+Existing passing regressions do not cover these failing scenarios. A review probe
+that exits zero after asserting a defect signature proves reproduction, not repair.
+
+| ID | Priority | Conditions and observed failure | Owning implementation |
+|---|---|---|---|
+| MS-01 | P2 | Claude SDK emits one final per content block with the same message ID. Re-enumerating each final from zero overwrites earlier text with a later tool block and leaves a stale partial tool row. | [Native block normalization](../src/sesskit/stream_native.py), `_blocks` / `_claude` |
+| MS-02 | P2 | A dense finite NDJSON file can overflow the descriptor reader's own admission queue before it drains. A 300-record fixture lost its final message; `consumer_overflow` and `gap` were reported. This is read-density dependent, not a global 256-record input limit. | [Descriptor input](../src/sesskit/stream_source.py), `NativeJSONSource.poll` |
+| MS-03 | P2 | If a Python caller drops its input-handle reference, the saved descriptor number can be recycled for an unrelated file and its valid native events can become live upserts. Demonstrated on Python 3.12.12/macOS. The CLI retains its input handle and was not reproduced as affected. Keep a strong caller reference and the handle open while observing; an explicit early close is also a caller-lifetime violation. | [Borrowed input lifetime](../src/sesskit/stream_source.py), `NativeJSONSource.__init__` |
+| MS-04 | P2 | Kimi legacy history becomes unavailable after one transient stat failure, then remains unavailable when the readable file's full fingerprint is unchanged. The no-change fast path never reloads it. | [Legacy history](../src/sesskit/streaming.py), `_read_legacy_history` |
+| MS-05 | P2 | Replacing Kimi's legacy history with identical conversation content at a new inode returns available without the promised observation `reset` or new generation. | [Legacy replacement](../src/sesskit/streaming.py), `_read_legacy_history` |
+| MS-06 | P2 | A malformed Kimi `items.remove` with string `ids` uses substring membership, so `ids="abc"` removes display turn `"b"` without a gap signal. No persisted data is deleted. | [Kimi operations](../src/sesskit/stream_native.py), `_kimi` |
+| MS-07 | P3 | An argparse-level error with options before the session reference emits `session="unknown"` even when the reference is present. JSONL error framing and exit 2 remain correct. | [CLI dispatch](../src/sesskit/cli.py), `dispatch` / `JSONArgumentParser.error` |
+
+MS-01's trigger is supported by the [Claude SDK message-flow contract](https://code.claude.com/docs/en/agent-sdk/streaming-output).
+The other proofs exercise internal public boundaries or malformed synthetic native
+input; none establishes a fresh provider run or native attachment handshake. Kimi
+legacy-state proofs mock its existing conversation loader, not real Kimi storage.
+Shared block-scope, borrowed-input and resource-review checks live in the
+[session integration guide](~/.config/agentsync/docs/AGENT_SESSION_INTEGRATION_GUIDE.md#native-block-identity-and-input-resource-boundaries).
+
+Other disclosed behaviors are not counted as these defects: baseline-less Claude
+fragments have unknown identity and can coexist with a later identified final until
+reconciliation; `gap` marks that ambiguity. Healthy connected-live mode retains its
+live projection rather than merging separately appended history until a source
+switch. Live tool-lifecycle coverage is partial for Cursor, Codex, OpenCode and
+Kimi; accepting their text events does not promise every exposed tool event.
+Reconciliation exposes only the corresponding public history projection, which
+remains conversation-only for Kimi.
+
+Hardening backlog, not new contract or confirmed-defect counts: the native event
+admission limit is checked after serialization, history events have separate size
+behavior, and the 4096-entry dedup cache is count-bounded rather than bounded by the
+input queue's byte budget. A bounded proof retained 1,048,832 ID bytes across a
+32,768-byte queue emptied after each event. Descriptor transport-error classification
+also needs separate consideration. Stale Kimi-reset ordering and arbitrary reader
+exception escape remain unconfirmed applicability hypotheses, not accepted defects.
+
+The lifetime reproduction deliberately drops a synthetic file handle and emits
+`ResourceWarning: unclosed file`; the complete warning is retained without
+suppression. It is an intentional probe diagnostic, not a clean production-path
+pass; no real user file or producer was involved. Reports, exact probes, official
+references and coordinator acceptance records are retained privately under
+`~/.config/sesskit/development/message-stream-review-20261103-6dda6090/`.
 
 ## Verification and limits
 
