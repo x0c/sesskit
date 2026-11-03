@@ -1,8 +1,24 @@
 # Agent output streaming knowledge base
 
 Research checked 2026-11-02–03. Scope: whether SessKit can read agent output as it
-is produced, including sessions launched elsewhere. This is a feasibility study,
-not a delivered streaming API, an implementation approval, or an evaluator.
+is produced, including sessions launched elsewhere. The historical study below
+is evidence, not an implementation claim.
+
+## Delivery requirement
+
+Owner requirement (2026-11-03): third-party programs must be able to display agent
+messages incrementally through SessKit. Implementation is now authorized, replacing
+the earlier research-only boundary for this outcome. SessKit owns normalized message
+observations; consumers own presentation and execution owners keep process control.
+
+Reuse native session/message identities and existing history interpretation. Expose
+real partial text when the selected source provides it; explicitly identify
+persisted-record delivery otherwise. Deliver machine-readable stream records with
+initial state, ordering, updates, completion/error and gap/reset semantics. A
+consumer must not double-append native final-message replays, mistake disconnect
+for successful completion, or abort the agent merely by closing its reader.
+Incremental token/cost accounting (U4) and new UI remain outside this change.
+Implementation and acceptance status will be recorded here after verification.
 
 ## Conclusion
 
