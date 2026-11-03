@@ -325,6 +325,9 @@ class _JsonlActivityReaderBase(ActivityReader):
         if not self._initialized:
             self._cold_open(stat)
             return
+        if self._state == "unavailable":
+            self._rebuild(stat, fresh_gen=self._gen + 1)
+            return
         if not self._materialized:
             self._resume_poll(stat)
             return
@@ -372,6 +375,8 @@ class _JsonlActivityReaderBase(ActivityReader):
                     or int(saved.get("ino", -1)) != stat.st_ino):
                 return False
         except (TypeError, ValueError):
+            return False
+        if saved.get("state") not in {"available", "empty"}:
             return False
         with open(self._path, "rb") as handle:
             if not self._verify_saved(handle, stat, saved):

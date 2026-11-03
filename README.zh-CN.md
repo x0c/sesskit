@@ -17,6 +17,13 @@
 从[接入指南和三个可运行示例](docs/INTEGRATION_GUIDE.md)开始。
 读取本地已有历史不需要模型账号或 API key。
 
+## 消息流（当前源码）
+
+三方程序可通过 `open_message_stream(session)` 或 `sesskit stream` 持续显示消息更新。
+宿主提供原生事件流时可逐段显示；实时来源不可用时会自动回退到已落盘历史。
+[消息流接入指南](docs/MESSAGE_STREAMING_GUIDE.md)说明了 Python 接入、JSONL 协议及观察预算。
+此能力需要安装当前源码，已发布的 v0.2.24 wheel 尚未包含。
+
 ## 安装
 
 SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装指定版本的 wheel。
@@ -47,7 +54,7 @@ sesskit verify --sample 30
 
 修改解析器或加载链路后，请运行 `sesskit verify`：它会交叉核对普通对话、v1 事件、类型化活动记录和增量读取，并报告各运行时的计数、结果、违反项和耗时——不输出内容或路径。检查失败时会以非零状态退出。
 
-命令均输出同一套 JSON 信封：
+快照命令均输出同一套 JSON 信封：
 
 ```json
 {"ok": true, "data": {...}, "error": null, "meta": {"version": 1}}

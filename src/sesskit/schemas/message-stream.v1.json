@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/x0c/sesskit/schemas/message-stream.v1.json",
+  "title": "SessKit message stream observation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "session",
+    "seq",
+    "generation",
+    "mode",
+    "type",
+    "state",
+    "history_state",
+    "key",
+    "event",
+    "complete",
+    "reason",
+    "gap",
+    "cursor",
+    "outcome",
+    "truncated",
+    "error"
+  ],
+  "properties": {
+    "schema": {
+      "const": "sesskit.message-stream/v1"
+    },
+    "session": {
+      "type": "string",
+      "minLength": 1
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "generation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "enum": [
+        "history",
+        "live"
+      ]
+    },
+    "type": {
+      "enum": [
+        "state",
+        "reset",
+        "upsert",
+        "remove",
+        "checkpoint",
+        "end"
+      ]
+    },
+    "state": {
+      "enum": [
+        "available",
+        "empty",
+        "unavailable",
+        "unsupported"
+      ]
+    },
+    "history_state": {
+      "enum": [
+        "available",
+        "empty",
+        "unavailable",
+        "unsupported"
+      ]
+    },
+    "key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "event": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Existing ActivityEvent fields; replaces the whole value at key, never append text."
+    },
+    "complete": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Per-event native completion only; null when unproven."
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "gap": {
+      "type": "boolean",
+      "description": "Intermediate native fragments are not guaranteed replayable."
+    },
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Opaque checkpoint; restarting explicitly reconciles/reset the bounded view."
+    },
+    "outcome": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Selected source's last evidenced historical turn, not process liveness."
+    },
+    "error": {
+      "type": ["object", "null"],
+      "description": "Observer/command failure on an end record; native agent errors remain in event/outcome."
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "The observation is a bounded tail, not the complete transcript."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "upsert"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "event": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "remove"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "checkpoint"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "minLength": 1
+          },
+          "outcome": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  ]
+}

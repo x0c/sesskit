@@ -2,7 +2,9 @@
 
 ## Envelope
 
-Every CLI command prints one JSON object to stdout:
+Snapshot CLI commands print one JSON object to stdout. The additive `stream`
+command instead emits the versioned JSONL event protocol below; existing commands
+and their envelopes are unchanged:
 
 ```json
 {"ok": true, "data": {}, "error": null, "meta": {"version": 1}}
@@ -21,10 +23,49 @@ Exit codes: `0` ok, `1` error, `2` usage, `3` not found, `5` ambiguous.
 | `schemas/transcript.v1.json` | Rich event in share (`schema` field = `sesskit.transcript/v1`) |
 | `schemas/usage.v1.json` | Reconciled native token/cost observations and scoped summaries |
 | `schemas/performance.v1.json` | Named timing intervals and explicitly paired historical rates |
+| `schemas/message-stream.v1.json` | Ordered message observations, mode/reset/upsert/checkpoint/end records |
 
 Root `schemas/` is the doc-facing copy; wheels also ship identical files under `src/sesskit/schemas/`. When changing a schema, update **both** locations in the same change.
 
 Legacy share payloads from a host may carry that host's own schema id (e.g. `corral.share/v1`). Neutral readers accept only `sesskit.transcript/v1` (`transcript.accepted_schema_ids()` with no arguments); a host that must still read its historical payloads supplies its legacy ids via the host extension (`legacy_schema_ids`) and accepts the union.
+
+## Message streaming
+
+`open_message_stream(session, live_source=None, cursor=None, max_events=200)`
+observes an existing session. `NativeEventSource` bridges a caller-owned native
+subscription; without usable native input, the stream automatically follows
+persisted history. It owns no process, server, authorization or UI.
+
+Records use `sesskit.message-stream/v1`. Apply `upsert` as whole-value replacement
+by local `key`, never text append; `reset` replaces the bounded display window on
+source/history change, and `remove` evicts a key. Existing `ActivityEvent` fields
+and actual native message/turn IDs are reused, not a second history parser or
+session hierarchy. Unknown native identity/completion stays null. Kimi uses public
+legacy conversation snapshots, positional evidence and unknown turn outcome.
+
+`mode` distinguishes `live` from `history`; `state`, `history_state`, `reason`,
+`gap` and `truncated` expose degradation and coverage. Unreadable history is never
+an empty success. A source switch reconciles from the selected source and may
+lose unpersisted fragments; no lossless volatile replay is promised. Checkpoint
+cursors are opaque, bound to session/window and applied after preceding records;
+restart rehydrates/reset-reconciles the current tail. `end` is observer lifecycle,
+not agent success. Native error/outcome evidence remains separate from observer
+`error` and process liveness. No U4 accounting is added.
+
+Loss of history readability invalidates cached availability. Restoring an
+identical file/database must rebuild a fresh reader generation, even when inode,
+size and timestamps match the cached source. A prior unavailable state must not
+survive a no-change fast path. This applies to the existing Pi, Claude/Codex,
+Cursor and OpenCode readers as well as the stream's degraded history view.
+
+`sesskit stream` emits one bare JSON record per line, including failure `end`
+records before startup. Default observation budgets are 60 s, 1000 total records
+and 256 KiB; `--unbounded` explicitly lifts them. Budget expiry is a truncated
+normal `end`, not agent completion; error ends retain structured code/message/
+hint/next_commands and nonzero exit. Native input framing is NDJSON or SSE,
+borrowed from its owner, never an implicit launch or competing writer. Callback
+bridge close sends no abort; a child pipe's own native shutdown behavior remains
+the transport owner's responsibility. See the [integration guide](MESSAGE_STREAMING_GUIDE.md).
 
 ## Public conversation load
 

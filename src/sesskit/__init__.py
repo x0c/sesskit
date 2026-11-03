@@ -134,16 +134,32 @@ _PERFORMANCE_EXPORTS = frozenset(
 )
 
 
+_STREAM_EXPORTS = frozenset({
+    "MESSAGE_STREAM_SCHEMA_ID", "MessageStream", "MessageStreamRecord",
+    "open_message_stream", "message_stream_record_to_dict",
+})
+_SOURCE_EXPORTS = frozenset({"NativeEventSource", "NativeJSONSource", "NativeBatch"})
+
+
 def __getattr__(name: str):
-    """Re-export performance on demand without taxing history-only imports."""
+    """Re-export optional datasets and streams without taxing history-only imports."""
     if name in _PERFORMANCE_EXPORTS:
         from sesskit import performance as _performance
 
         return getattr(_performance, name)
+    if name in _STREAM_EXPORTS:
+        from sesskit import streaming
+
+        return getattr(streaming, name)
+    if name in _SOURCE_EXPORTS:
+        from sesskit import stream_source
+
+        return getattr(stream_source, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
+    "MESSAGE_STREAM_SCHEMA_ID",
     "PERFORMANCE_SCHEMA_ID",
     "SCHEMA_ID",
     "USAGE_SCHEMA_ID",
@@ -177,8 +193,13 @@ __all__ = [
     "InvocationPairing",
     "LifecycleEvent",
     "MessageOrigin",
+    "MessageStream",
+    "MessageStreamRecord",
     "MetricSummary",
     "ModelSlice",
+    "NativeBatch",
+    "NativeEventSource",
+    "NativeJSONSource",
     "NormalizedUsage",
     "OperationKind",
     "PageResult",
@@ -237,10 +258,12 @@ __all__ = [
     "load_usage",
     "make_performance_record",
     "make_session_info",
+    "message_stream_record_to_dict",
     "metric_summary_to_dict",
     "native_http_status",
     "observation_to_dict",
     "open_activity_reader",
+    "open_message_stream",
     "pair_invocations",
     "performance_capabilities",
     "performance_record_to_dict",

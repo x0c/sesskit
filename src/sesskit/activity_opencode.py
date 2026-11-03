@@ -867,6 +867,9 @@ class OpenCodeActivityReader(ActivityReader):
         if not self._initialized:
             self._cold_open(file_state, wal_state)
             return
+        if self._state == "unavailable":
+            self._rebuild(file_state, wal_state)
+            return
         cached_file = self._file or (-1, -1, -1, -1)
         if file_state[0] != cached_file[0] or file_state[1] != cached_file[1]:
             self._rebuild(file_state, wal_state)

@@ -13,12 +13,21 @@ observations; consumers own presentation and execution owners keep process contr
 
 Reuse native session/message identities and existing history interpretation. Expose
 real partial text when the selected source provides it; explicitly identify
-persisted-record delivery otherwise. Deliver machine-readable stream records with
+persisted-record delivery otherwise. Automatic service degradation is required:
+when a live source is unavailable or disconnects, continue from persisted history
+where available instead of blocking the consumer or asking for fallback approval.
+Expose the current delivery mode, degradation reason and unrecoverable fragment
+gaps; reconcile completed messages without replaying duplicate text. Closing a
+consumer stops observation, not execution. Deliver machine-readable stream records with
 initial state, ordering, updates, completion/error and gap/reset semantics. A
 consumer must not double-append native final-message replays, mistake disconnect
 for successful completion, or abort the agent merely by closing its reader.
 Incremental token/cost accounting (U4) and new UI remain outside this change.
-Implementation and acceptance status will be recorded here after verification.
+The additive implementation is documented in the [message streaming guide](MESSAGE_STREAMING_GUIDE.md).
+It normalizes host-provided native events and automatically follows existing
+history; it does not create native transport/control infrastructure. Current source
+acceptance covers format fixtures and actual local-history consumption separately
+from the unperformed shared-server live attachment experiments below.
 
 ## Conclusion
 
@@ -65,7 +74,7 @@ records and synthetic fixtures are not fresh live-stream acceptance.
 | Claude Code 2.1.316; closed writer | CLI `-p --output-format stream-json --verbose --include-partial-messages` or Agent SDK partial-message feed | Documented paths observe their owned run. `agents --json`/recent logs are snapshots and interactive `attach` is not proof of a passive structured delta feed | Partial `stream_event` delivery documented. Existing JSONL rows/readers observed; fresh live emission, reasoning-delta forwarding, replay and backpressure unverified. [C1] [C2] |
 | Cursor Agent CLI 2026.10.22-27dcf5f; closed bundle | Print `stream-json` **plus** `--stream-partial-output`; ACP/SDK feeds where supported | Existing independent CLI observation not established. `persist attach`, ACP load and SDK resume need their own live-semantics checks; do not label them impossible from names/help alone | Without partial output, stdout aggregates complete messages. Partial output also emits duplicate flushes. Decoded JSON stores observed; binary payloads remain undecoded, so global counter/timing absence is not established. [R1] [R2] [R3] |
 
-### OpenCode: good first observation candidate, not yet a shipped feature
+### OpenCode: native attachment remains a separate host boundary
 
 The inspected bus distinguishes a volatile subscription from its durable log.
 SSE subscriber capacity is 4096; overflow fails/removes that subscriber. Its
@@ -146,7 +155,7 @@ and exact native locators are retained at
 Do not publish those native stores or conversation payloads. This knowledge base
 contains only sanitized findings.
 
-## Smallest proposed next checks
+## Future native transport checks
 
 1. **OpenCode existing-server observer:** bounded authenticated subscription during
    a legitimately running disposable turn; count native delta/lifecycle events,
@@ -160,9 +169,12 @@ contains only sanitized findings.
    SDK/extension events when the existing execution owner exposes them. Do not
    create another launcher/parser hierarchy in SessKit or retrofit a private
    running process by silently restarting it.
-4. Only after those checks, choose a small additive observation input over the
-   existing session/message/turn/evidence abstractions. No new command or capability
-   flag is authorized or advertised by this report.
+4. These transport experiments remain distinct from the subsequently authorized
+   host-provided observation API. The current message stream uses existing
+   session/message/turn/evidence abstractions and advertises no automatic passive
+   attachment to a private process. The earlier research report itself did not
+   authorize implementation; the later Delivery requirement above supersedes that
+   research-only boundary.
 
 A separate incidental Kimi finding remains to verify: native failed-turn markers
 can exist without assistant text while the legacy status path uses tail roles.

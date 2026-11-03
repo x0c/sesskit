@@ -2,7 +2,9 @@
 
 Build a local history search tool, an analysis script, or a session client without
 maintaining a parser for each coding agent. SessKit reads native history; your
-application owns indexing, presentation, transport, and actions.
+application owns indexing, presentation, transport, and actions. Host-supplied
+live events can also be normalized through the message stream; SessKit never
+takes execution ownership.
 
 ## Scope and integration requirements
 
@@ -12,6 +14,14 @@ and incremental consumption. They use public APIs only, do not launch agents or
 modify history, and introduce no telemetry, network service, or runtime dependency.
 The CLI envelope and existing schemas remain unchanged. Examples are application
 recipes, not additional stable CLI commands or a new typed JSON schema.
+
+## Stream messages (current source)
+
+Use the [message streaming guide](MESSAGE_STREAMING_GUIDE.md) for the additive
+Python `open_message_stream` API, caller-owned native feed bridge, and
+`sesskit stream` JSONL protocol. Missing or failed live inputs degrade to existing
+history automatically. This requires the current checkout, not the fixed-release
+wheel below; existing snapshot command envelopes and schemas remain unchanged.
 
 ## Install a fixed release
 

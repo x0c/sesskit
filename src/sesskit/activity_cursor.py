@@ -614,6 +614,9 @@ class CursorActivityReader(ActivityReader):
         if not self._initialized:
             self._cold_open(file_state, wal_state, prompt_stat)
             return
+        if self._state == "unavailable":
+            self._rebuild(file_state, wal_state, prompt_stat, reason="recovery")
+            return
         cached_file = self._file or (-1, -1, -1, -1)
         if file_state is not None and (
             file_state[0] != cached_file[0] or file_state[1] != cached_file[1]

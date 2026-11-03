@@ -17,6 +17,15 @@ This is a **Python library and JSON CLI** — not a TUI, not a session manager. 
 Start with the [integration guide and three runnable examples](docs/INTEGRATION_GUIDE.md).
 No model account or API key is needed to read existing local history.
 
+## Message streaming (current source)
+
+Third-party programs can use `open_message_stream(session)` or `sesskit stream`
+to display message updates. Host-provided native feeds deliver partial text;
+unavailable feeds automatically fall back to persisted history. See the
+[message streaming guide](docs/MESSAGE_STREAMING_GUIDE.md) for the Python bridge,
+JSONL protocol and observation budgets. This requires the current checkout, not
+the published v0.2.24 wheel.
+
 ## Install
 
 SessKit is not on PyPI yet. Install the fixed-release wheel in your project's virtual environment.
@@ -47,7 +56,7 @@ sesskit verify --sample 30
 
 After changing parsers or load wiring, run `sesskit verify`: it cross-checks conversation, v1 events, typed activity, and incremental readers, and reports per-runtime counts, outcomes, violations, and timings — never content or paths. A failing check exits non-zero.
 
-Every command prints one JSON envelope:
+Snapshot commands print one JSON envelope:
 
 ```json
 {"ok": true, "data": {...}, "error": null, "meta": {"version": 1}}

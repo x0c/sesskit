@@ -385,6 +385,9 @@ class PiActivityReader(ActivityReader):
         if not self._initialized:
             self._cold_open(stat)
             return
+        if self._state == "unavailable":
+            self._rebuild(stat, reason="recovery")
+            return
         if (
             self._dev is not None
             and (stat.st_dev != self._dev or stat.st_ino != self._ino)

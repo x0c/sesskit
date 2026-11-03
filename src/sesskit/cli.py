@@ -1,6 +1,7 @@
 """SessKit CLI: language-agnostic JSON interface for local agent sessions.
 
-Commands are read-only. Output is always a JSON envelope:
+Commands are read-only. Snapshot output is a JSON envelope; ``stream`` emits
+bare versioned JSONL message observations. Snapshot envelope:
 {"ok": true|false, "data": ..., "error": ..., "meta": {"version": 1}}
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 not found, 5 ambiguous.
@@ -32,6 +33,7 @@ from sesskit.models import format_message_time, session_key
 from sesskit.paths import assert_not_history_path, atomic_write_json
 from sesskit.performance_cli import cmd_performance
 from sesskit.registry import ConversationLoadError, ParserRegistry, default_registry
+from sesskit.streaming_cli import StreamCommand, cmd_stream, print_stream_error
 from sesskit.transcript import SCHEMA_ID, count_events, load_events
 
 STATUS_LABELS = {
@@ -80,6 +82,12 @@ def _resolve_title(session: dict) -> str:
 
 class JSONArgumentParser(argparse.ArgumentParser):
     def error(self, message):
+        if getattr(self, "_stream_errors", False) or self.prog.endswith(" stream"):
+            print_stream_error(ApiError(
+                "usage_error", message, EXIT_USAGE,
+                hint="run sesskit describe stream", next_commands=["sesskit describe stream"],
+            ), getattr(self, "_stream_ref", "unknown"))
+            raise SystemExit(EXIT_USAGE)
         print_envelope(
             {
                 "ok": False,
@@ -91,7 +99,8 @@ class JSONArgumentParser(argparse.ArgumentParser):
                     "next_commands": ["sesskit describe"],
                 },
                 "meta": {"version": 1},
-            }
+            },
+            compact=bool(getattr(self, "_stream_errors", False) or self.prog.endswith(" stream")),
         )
         raise SystemExit(EXIT_USAGE)
 
@@ -867,6 +876,30 @@ COMMANDS = [
         "returns": {"schema": SCHEMA_ID, "events": "event array"},
     },
     {
+        "name": "stream",
+        "help": "Read-only JSONL message events with automatic history degradation. Default budget: 60s/1000 records/256KiB; --unbounded follows continuously. Example: sesskit stream pi:ID --once",
+        "handler": cmd_stream,
+        "args": [
+            {"flags": ["session"], "kwargs": {"help": "existing runtime:id or unambiguous prefix"}},
+            {"flags": ["--input"], "kwargs": {"help": "borrowed native event feed file, or - for stdin; does not launch an agent"}},
+            {"flags": ["--input-format"], "kwargs": {"choices": ["ndjson", "sse"], "help": "native framing; requires --input"}},
+            {"flags": ["--once"], "kwargs": {"action": "store_true", "help": "one bounded poll"}},
+            {"flags": ["--unbounded"], "kwargs": {"action": "store_true", "help": "explicitly lift default time/record/byte budgets"}},
+            {"flags": ["--duration"], "kwargs": {"type": float, "help": "observation time budget in seconds (default 60)"}},
+            {"flags": ["--max-records"], "kwargs": {"type": int, "help": "total output record budget including end (default 1000)"}},
+            {"flags": ["--max-bytes"], "kwargs": {"type": int, "help": "total output byte budget including end (default 262144)"}},
+            {"flags": ["--polls"], "kwargs": {"type": int, "help": "bounded poll count; otherwise follow until interrupted"}},
+            {"flags": ["--interval"], "kwargs": {"type": float, "default": 0.25}},
+            {"flags": ["--max-events"], "kwargs": {"type": int, "default": 200, "help": "retained observation window, 1..200"}},
+            {"flags": ["--cursor"], "kwargs": {"help": "opaque checkpoint; source changes explicitly reset the window"}},
+            {"flags": ["--limit"], "kwargs": {"type": int, "default": _RESOLVE_SCAN_LIMIT}},
+            {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
+        ],
+        "returns": {"schema": "sesskit.message-stream/v1", "framing": "one JSON event per line, including error end events",
+                    "operations": ["state", "reset", "upsert", "remove", "checkpoint", "end"],
+                    "side_effects": "read-only observation; never launches or interrupts an agent"},
+    },
+    {
         "name": "verify",
         "help": "Run conformance + real-history parity checks over local sessions (counts/timings only)",
         "handler": cmd_verify,
@@ -939,9 +972,12 @@ def build_parser() -> JSONArgumentParser:
 
 
 def dispatch(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
+    parser._stream_errors = bool(argv and argv[0] == "stream")
+    parser._stream_ref = argv[1] if len(argv) > 1 and not argv[1].startswith("-") else "unknown"
     args = parser.parse_args(argv)
-    compact = bool(getattr(args, "compact", False) or getattr(args, "json", False))
+    compact = bool(getattr(args, "compact", False) or getattr(args, "json", False) or args.command == "stream")
     registry = default_registry()
     try:
         runtime_filter = getattr(args, "runtime", None)
@@ -955,6 +991,8 @@ def dispatch(argv: list[str] | None = None) -> int:
     try:
         handler = args._handler
         result = handler(args, registry)
+        if isinstance(result, StreamCommand):
+            return result.run()
         if isinstance(result, tuple):
             payload, code = result
         else:
@@ -962,9 +1000,19 @@ def dispatch(argv: list[str] | None = None) -> int:
         print_envelope(payload, compact=compact)
         return code
     except ApiError as exc:
-        print_envelope(err(exc), compact=compact)
+        if args.command == "stream":
+            print_stream_error(exc, args.session)
+        else:
+            print_envelope(err(exc), compact=compact)
         return exc.exit_code
     except Exception as exc:  # noqa: BLE001 — CLI top-level
+        if args.command == "stream":
+            print_stream_error(ApiError(
+                "error", f"stream observation failed ({type(exc).__name__})", EXIT_ERROR,
+                hint="check the selected history and native input; see sesskit describe stream",
+                next_commands=["sesskit describe stream"],
+            ), args.session)
+            return EXIT_ERROR
         print_envelope(
             err(ApiError("error", str(exc), EXIT_ERROR)),
             compact=compact,
