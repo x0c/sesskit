@@ -96,3 +96,21 @@ for collapsed duplicates; latest revision for folded cumulative counters).
   cache) and warm; report file count and bytes.
 - Platform coverage: macOS, Linux and Windows builds; Windows on real
   assistant histories (Corral design §10.5).
+
+## 6. History discovery per OS (researched 2026-11-04)
+
+Every runtime resolves its root from the user's home directory, which is
+`HOME` on macOS/Linux and `%USERPROFILE%` on Windows (Rust `dirs`/Node
+`os.homedir()`); separators are platform-native. Overrides, highest first:
+
+| Runtime | Default root | Overrides |
+|---|---|---|
+| Claude Code | `~/.claude/projects/<slug>/<id>.jsonl` | `CLAUDE_CONFIG_DIR` replaces `~/.claude` ([docs](https://code.claude.com/docs/en/env-vars)) |
+| Codex CLI | `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread>[_<rollout>].jsonl` | `CODEX_HOME` replaces `~/.codex` ([source](https://github.com/openai/codex/blob/d84c872464aca4821dc5cb548a651651aefd84fa/codex-rs/utils/home-dir/src/lib.rs#L5-L63)); after a revert the file name carries `_<rollout id>` after the thread id, which stays the session id ([source](https://github.com/openai/codex/blob/d84c872464aca4821dc5cb548a651651aefd84fa/codex-rs/rollout/src/rollout_file_name.rs#L62-L74)) |
+| OpenCode | `<data>/opencode/opencode.db`, `<data>` = `XDG_DATA_HOME` or `~/.local/share` on every OS | `OPENCODE_DB` (file name or path; `:memory:` means none); channel builds use `opencode-<channel>.db` beside it ([source](https://github.com/anomalyco/opencode/blob/fe046564650854594c4c5aa22270f46d9de6cace/packages/cli/src/database-path.ts#L4-L12)). `OPENCODE_DATA_DIR`, which the Python parser honors, does not exist in current OpenCode source |
+| Pi | `~/.pi/agent/sessions/<cwd-slug>/<ts>_<id>.jsonl` | `PI_CODING_AGENT_SESSION_DIR` (sessions), `PI_CODING_AGENT_DIR` (agent root) ([source](https://github.com/badlogic/pi-mono/blob/676af1d777ef6f04b6bc8daf4cf3b9b1799cff4d/packages/coding-agent/src/config.ts#L602-L611)) |
+
+The Python parsers currently hard-code the defaults (except OpenCode's
+`XDG_DATA_HOME`/`OPENCODE_DATA_DIR`); honoring these overrides there is an
+open SessKit improvement. The native engine honors them. Cursor's agent CLI
+store location is unverified and out of the engine's scope.
