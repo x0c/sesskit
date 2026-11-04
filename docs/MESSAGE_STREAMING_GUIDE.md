@@ -245,8 +245,7 @@ review artifacts and repair diagnostics/acceptance records are under
 
 - macOS Python 3.10–3.15: 1068 tests passed per interpreter after the repairs;
   one historical Claude incident fixture is absent. Linux Python 3.10:
-  1044 passed, 25 platform/local-history
-  checks skipped because that node has no agent stores or macOS process APIs.
+  1044 passed, 25 platform/local-history checks skipped because that node has no agent stores or macOS process APIs.
   Build and Ruff diagnostics contain no retained warnings.
 - The 66 focused stream/recovery regressions include all five reader families
   recovering an identical restored source and unavailable-cursor reopens. The
@@ -265,7 +264,23 @@ review artifacts and repair diagnostics/acceptance records are under
   native cancellation semantics are not accepted merely by testing event formats.
   No automatic cross-process attachment or raw terminal-byte support is claimed.
 
-Complete task evidence is retained privately under
-`~/.config/sesskit/development/message-stream-20261103-6dda6090/`; it includes the
-initial Linux failure, complete platform diagnostics and consumer/native receipts.
+The validated repair source is [commit `8dcdfed`](https://github.com/x0c/sesskit/commit/8dcdfed78fc35cda5d4a0d6303a98962dc6379f1).
+The installed source build still reports package version `0.2.24`; that version
+alone does not identify these repaired bytes or update the existing public release
+assets. The repair receipt records its wheel checksum, 60 installed package-file
+matches, all seven post-install behavior checks and the separate CLI consumer.
+Reusable identity checks live in [artifact handoff](~/.config/agentsync/docs/AGENT_WORKSPACE_ENVIRONMENT_GUIDE.md#hand-off-shared-dependencies).
+
+Evidence is partitioned by the artifact it actually checked:
+
+- `~/.config/sesskit/development/message-stream-20261103-6dda6090/`: original
+  implementation, initial Linux failure and original platform/consumer evidence.
+- `~/.config/sesskit/development/message-stream-review-20261103-6dda6090/`:
+  independent findings and coordinator reproductions of the original defects.
+- `~/.config/sesskit/development/message-stream-fix-20261104-6dda6090/`:
+  repaired-source matrix (1068/1044 passes), final build/Ruff/distribution logs,
+  installed consumer/native checks and `delivery-receipt.json`. Sealed review
+  artifacts remain in its `review-archive/` while original worker sessions
+  continued into repair; their mutable report pointers are not frozen evidence.
+
 Native conversations and credentials are not included in this repository.
