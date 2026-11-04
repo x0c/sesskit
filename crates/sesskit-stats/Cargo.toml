@@ -1,0 +1,26 @@
+[package]
+name = "sesskit-stats"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Multi-core windowed activity and usage projection over local coding-agent histories (SessKit native engine)"
+repository = "https://github.com/x0c/sesskit"
+rust-version = "1.80"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+memchr = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+time = { version = "0.3", features = ["parsing", "formatting", "local-offset"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[[bin]]
+name = "sesskit-stats"
+path = "src/bin/sesskit-stats.rs"
