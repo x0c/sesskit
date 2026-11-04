@@ -54,14 +54,24 @@ pub struct Sources {
     pub opencode: Vec<PathBuf>,
 }
 
+fn env_dir(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
 /// History files modified inside the window (directory listing + mtime only).
+/// Roots and overrides: `docs/NATIVE_STATS_ENGINE_DESIGN.md` §6.
 pub fn discover(home: &Path, window: &Window) -> Sources {
     let mut s = Sources::default();
     // Claude: top-level session files only (subagent transcripts live deeper).
-    jsonl_files(&home.join(".claude").join("projects"), 1, window.start, &mut s.claude);
-    s.claude.retain(|p| p.parent().and_then(Path::parent) == Some(&home.join(".claude").join("projects")));
-    jsonl_files(&home.join(".codex").join("sessions"), 4, window.start, &mut s.codex);
-    jsonl_files(&home.join(".pi").join("agent").join("sessions"), 2, window.start, &mut s.pi);
+    let projects = env_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.join(".claude")).join("projects");
+    jsonl_files(&projects, 1, window.start, &mut s.claude);
+    s.claude.retain(|p| p.parent().and_then(Path::parent) == Some(projects.as_path()));
+    let codex = env_dir("CODEX_HOME").unwrap_or_else(|| home.join(".codex")).join("sessions");
+    jsonl_files(&codex, 4, window.start, &mut s.codex);
+    let pi = env_dir("PI_CODING_AGENT_SESSION_DIR").unwrap_or_else(|| {
+        env_dir("PI_CODING_AGENT_DIR").unwrap_or_else(|| home.join(".pi").join("agent")).join("sessions")
+    });
+    jsonl_files(&pi, 2, window.start, &mut s.pi);
     s.opencode = opencode::db_paths(home);
     s
 }
@@ -90,5 +100,9 @@ pub fn collect(home: &Path, window: &Window) -> Vec<SessionStats> {
         || sources.opencode.iter().flat_map(|db| opencode::read(db, window)).collect(),
     );
     files.extend(dbs);
+    // The same session can surface twice (e.g. channel databases): keep the
+    // copy that examined the most history.
+    files.sort_by(|a, b| (a.runtime.id(), &a.id).cmp(&(b.runtime.id(), &b.id)).then(b.examined.cmp(&a.examined)));
+    files.dedup_by(|a, b| a.runtime == b.runtime && a.id == b.id);
     files
 }

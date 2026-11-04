@@ -1,7 +1,8 @@
 # Native stats engine design
 
 Status: adopted 2026-11-04 (owner decision, consumer requirement from the
-Corral `agentflex` card); implementation in progress under `crates/`.
+Corral `agentflex` card); implemented in `crates/sesskit-stats`, parity
+verified (§7).
 
 ## 1. Purpose and boundary
 
@@ -114,3 +115,38 @@ The Python parsers currently hard-code the defaults (except OpenCode's
 `XDG_DATA_HOME`/`OPENCODE_DATA_DIR`); honoring these overrides there is an
 open SessKit improvement. The native engine honors them. Cursor's agent CLI
 store location is unverified and out of the engine's scope.
+
+## 7. Listing rules, activity definition and parity results (2026-11-04)
+
+Session set (a session is excluded with an explicit reason, never silently):
+
+- `internal_agent`: Claude teammate/subagent files (head rules of
+  `_is_internal_claude_session`), Codex `thread_source = "subagent"`.
+- `missing_cwd` / `ephemeral_marker`: missing or deleted working directory, or
+  a `.sesskit-ignore` marker, for **every** runtime. The Python OpenCode and Pi
+  listings do not apply this drop yet (open SessKit gap; the AGENTS.md rule
+  says resume-style listings drop missing cwd).
+- `empty_history`: no real user prompt — Claude non-meta user text outside the
+  local-command wrappers (`_SKIP_PREFIXES`); Codex `event_msg.user_message` or a
+  `response_item` user message that is not injected context
+  (`user_message_text`); Pi a user message on the active branch
+  (`active_messages`: leaf = last id-bearing entry, walk `parentId`; top-level
+  fields are scanned without trusting the first `"id"` substring, because
+  custom rows nest other ids before the top-level one).
+- OpenCode: top-level (`parent_id IS NULL`), unarchived sessions; databases are
+  deduplicated by session id.
+
+Activity timestamps are **record rows** (Claude user/assistant rows, Codex
+`response_item` and user/agent `event_msg`, Pi active-branch
+user/assistant/toolResult rows, OpenCode message rows), not the typed activity
+events of `load_activity`; counts differ by design, times agree. Consumers use
+only the times (intervals, heatmaps), never the counts.
+
+Parity on the owner's real histories (7-day window, harness
+`crates/sesskit-stats/scripts/parity.py`, Python run against the committed
+snapshot): total tokens 373/373 sessions exact; pruned versus full reads
+0 differences over 379 sessions; session set identical except 27 sessions the
+Python OpenCode/Pi listings keep despite a deleted cwd. Sessions written during
+the run can differ transiently; frozen copies matched exactly. A 12-session
+independent spot check of finished sessions matched exactly. Timing: 0.28–0.47 s
+warm, about 1.1 s on the first cold run after new files appear.

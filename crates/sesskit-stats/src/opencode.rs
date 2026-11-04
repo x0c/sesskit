@@ -10,20 +10,45 @@ use serde_json::Value;
 use crate::session::{cwd_exclusion, Builder, Runtime, SessionStats, Window};
 use crate::usage::{cost_of, int_of, str_of, Counter, Normalized, Observation, Scope};
 
-/// `OPENCODE_DATA_DIR` (comma separated) → `XDG_DATA_HOME/opencode` → `~/.local/share/opencode`.
+/// `<data>/opencode/opencode.db` with `<data>` = `XDG_DATA_HOME` or
+/// `~/.local/share` on every OS, plus channel databases `opencode-<channel>.db`
+/// beside it. `OPENCODE_DB` names the file (relative to the data dir) or an
+/// absolute path; `:memory:` means no file. The legacy `OPENCODE_DATA_DIR`
+/// (comma separated directories) honored by the Python parser is kept.
 pub fn db_paths(home: &Path) -> Vec<PathBuf> {
-    let dirs: Vec<PathBuf> = match std::env::var("OPENCODE_DATA_DIR") {
-        Ok(v) if !v.trim().is_empty() => v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).collect(),
-        _ => {
-            let base = std::env::var("XDG_DATA_HOME")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".local").join("share"));
-            vec![base.join("opencode")]
+    let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local").join("share"));
+    let mut dirs = vec![base.join("opencode")];
+    if let Ok(v) = std::env::var("OPENCODE_DATA_DIR") {
+        dirs.extend(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    match std::env::var("OPENCODE_DB").ok().filter(|v| !v.trim().is_empty()) {
+        Some(v) if v == ":memory:" => {}
+        Some(v) => {
+            let p = PathBuf::from(&v);
+            out.push(if p.is_absolute() { p } else { dirs[0].join(p) });
         }
-    };
-    dirs.into_iter().map(|d| d.join("opencode.db")).filter(|p| p.is_file()).collect()
+        None => {
+            for dir in &dirs {
+                let Ok(entries) = std::fs::read_dir(dir) else { continue };
+                for e in entries.flatten() {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    if name == "opencode.db" || (name.starts_with("opencode-") && name.ends_with(".db")) {
+                        out.push(e.path());
+                    }
+                }
+            }
+        }
+    }
+    out.retain(|p| p.is_file());
+    out.sort();
+    out.dedup();
+    out
 }
 
 struct Row {

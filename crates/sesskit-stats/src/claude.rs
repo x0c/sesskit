@@ -9,6 +9,18 @@ use crate::session::{cwd_exclusion, Builder, Runtime, SessionStats, Window};
 use crate::usage::{int_of, str_of, Counter, Normalized, Observation, Scope};
 
 const TEAM_LEAD_PREFIX: &str = "<teammate-message teammate_id=\"team-lead\"";
+/// Local-command wrappers that are not a human prompt (`_SKIP_PREFIXES`).
+const SKIP_PREFIXES: [&str; 6] =
+    ["<local-command", "<command-name>", "<command-message>", "<bash-input>", "<bash-stdout>", "<bash-stderr>"];
+
+/// A real human prompt: non-meta user row with text outside local-command wrappers.
+fn is_user_prompt(entry: &Value) -> bool {
+    if entry.get("type").and_then(Value::as_str) != Some("user") || truthy(entry.get("isMeta")) {
+        return false;
+    }
+    let text = text_of(entry.get("message").and_then(|m| m.get("content")));
+    !text.is_empty() && !SKIP_PREFIXES.iter().any(|p| text.starts_with(p))
+}
 const HEAD_LINES: usize = 40;
 
 fn entry_time(entry: &Value) -> Option<f64> {
@@ -124,12 +136,14 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
     let bytes = std::fs::read(path).ok()?;
     let mut b = Builder::new(Runtime::Claude, own_id.clone());
 
+    let mut has_prompt = false;
     let mut head: Vec<Value> = Vec::new();
     for line in jsonl::lines(&bytes, 0).take(HEAD_LINES) {
         if let Some(v) = jsonl::parse(line) {
             if b.cwd.is_none() {
                 b.cwd = v.get("cwd").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string);
             }
+            has_prompt |= is_user_prompt(&v);
             head.push(v);
         }
     }
@@ -153,7 +167,19 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
                 b.activity.push(ts);
             }
         }
+        has_prompt |= is_user_prompt(&entry);
         observe(&entry, &mut b.observations);
+    }
+    if b.excluded.is_none() && !has_prompt && from > 0 {
+        // The first prompt may sit between the head and the window: check the
+        // skipped region's user rows only (rare path).
+        has_prompt = jsonl::lines(&bytes[..from], 0)
+            .filter(|l| memchr::memmem::find(l, b"\"type\":\"user\"").is_some())
+            .filter_map(jsonl::parse)
+            .any(|e| is_user_prompt(&e));
+    }
+    if b.excluded.is_none() && !has_prompt {
+        b.excluded = Some("empty_history");
     }
     Some(b.finish(window))
 }

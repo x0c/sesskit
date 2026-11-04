@@ -8,12 +8,22 @@ use crate::jsonl;
 use crate::session::{cwd_exclusion, Builder, Runtime, SessionStats, Window};
 use crate::usage::{int_of, trimmed, Counter, Normalized, Observation, Scope};
 
-/// Trailing UUID of `rollout-...-<uuid>.jsonl` (`_extract_uuid_from_filename`).
+/// Thread UUID of `rollout-<ts>-<thread>[_<rollout>].jsonl`: after a revert the
+/// file name gains `_<rollout id>`, while the thread id stays the session id.
 fn uuid_of(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
-    (stem.len() >= 36).then(|| stem[stem.len() - 36..].to_string()).filter(|u| {
-        u.chars().filter(|c| *c == '-').count() == 4 && u.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
-    })
+    let is_uuid = |u: &str| {
+        u.len() == 36 && u.chars().filter(|c| *c == '-').count() == 4 && u.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+    };
+    let tail = |s: &str| (s.len() >= 36).then(|| s[s.len() - 36..].to_string()).filter(|u| is_uuid(u));
+    if let Some((head, rollout)) = stem.rsplit_once('_') {
+        if is_uuid(rollout) {
+            if let Some(thread) = tail(head) {
+                return Some(thread);
+            }
+        }
+    }
+    tail(stem)
 }
 
 fn turn_id(payload: &Value) -> Option<String> {
@@ -129,11 +139,52 @@ fn is_activity(entry: &Value) -> bool {
     }
 }
 
+/// Real user input (`parsers/codex.py::user_message_text`): legacy
+/// `event_msg.user_message`, or a `response_item` user message whose text is not
+/// injected framework context.
+fn is_user_prompt(entry: &Value) -> bool {
+    let Some(payload) = entry.get("payload") else { return false };
+    match entry.get("type").and_then(Value::as_str) {
+        Some("event_msg") => {
+            payload.get("type").and_then(Value::as_str) == Some("user_message")
+                && payload.get("message").and_then(Value::as_str).is_some_and(|m| !m.trim().is_empty())
+        }
+        Some("response_item") => {
+            if payload.get("type").and_then(Value::as_str) != Some("message")
+                || payload.get("role").and_then(Value::as_str) != Some("user")
+            {
+                return false;
+            }
+            let Some(items) = payload.get("content").and_then(Value::as_array) else { return false };
+            let text = items
+                .iter()
+                .filter(|i| matches!(i.get("type").and_then(Value::as_str), Some("input_text" | "output_text")))
+                .filter_map(|i| i.get("text").and_then(Value::as_str).map(str::trim))
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            !text.is_empty() && !text.starts_with("# AGENTS.md instructions") && !text.starts_with("<environment_context>")
+        }
+        _ => false,
+    }
+}
+
+/// When pruning skipped the start of the file, look for the first prompt in the
+/// skipped region (user rows only).
+fn skipped_has_prompt(bytes: &[u8], from: usize) -> bool {
+    from > 0
+        && jsonl::lines(&bytes[..from], 0)
+            .filter(|l| memchr::memmem::find(l, b"\"user").is_some())
+            .filter_map(jsonl::parse)
+            .any(|e| is_user_prompt(&e))
+}
+
 pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
     let id = uuid_of(path)?;
     let bytes = std::fs::read(path).ok()?;
     let mut b = Builder::new(Runtime::Codex, id);
     let mut thread_source: Option<String> = None;
+    let mut has_prompt = false;
     for line in jsonl::lines(&bytes, 0).take(20) {
         let Some(entry) = jsonl::parse(line) else { continue };
         if entry.get("type").and_then(Value::as_str) == Some("session_meta") {
@@ -158,7 +209,11 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
                 b.activity.push(t);
             }
         }
+        has_prompt |= is_user_prompt(&entry);
         observe(&entry, ts, &mut b.observations);
+    }
+    if b.excluded.is_none() && !has_prompt && !skipped_has_prompt(&bytes, from) {
+        b.excluded = Some("empty_history");
     }
     Some(b.finish(window))
 }
