@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::jsonl;
+use crate::jsonl::{self, Raw};
 use crate::session::{cwd_exclusion, Builder, Runtime, SessionStats, Window};
 use crate::usage::{int_of, str_of, Counter, Normalized, Observation, Scope};
 
@@ -153,22 +153,45 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
     let from = if window.full { 0 } else { jsonl::window_offset(&bytes, window.start) };
     b.examined = (bytes.len() - from) as u64;
     for line in jsonl::lines(&bytes, from) {
-        // Cheap prefilter: every useful row has a timestamp or usage.
-        let Some(entry) = jsonl::parse(line) else { continue };
+        // Top-level fields only; full JSON decoding just for usage and prompt rows.
+        let [ty, ts, meta, side, msg, snap, cwd] = jsonl::top_level(
+            line,
+            [b"type", b"timestamp", b"isMeta", b"isSidechain", b"message", b"snapshot", b"cwd"],
+        );
         if b.cwd.is_none() {
-            b.cwd = entry.get("cwd").and_then(Value::as_str).map(str::to_string);
+            b.cwd = cwd.and_then(Raw::str).filter(|c| !c.is_empty()).map(str::to_string);
         }
-        let is_conv = matches!(entry.get("type").and_then(Value::as_str), Some("user" | "assistant"))
-            && entry.get("message").is_some_and(Value::is_object)
-            && !truthy(entry.get("isMeta"))
-            && !truthy(entry.get("isSidechain"));
-        if is_conv {
-            if let Some(ts) = entry_time(&entry) {
-                b.activity.push(ts);
+        let kind = ty.and_then(Raw::str);
+        let msg_obj = match msg {
+            Some(Raw::Obj(m)) => Some(m),
+            _ => None,
+        };
+        if matches!(kind, Some("user" | "assistant"))
+            && msg_obj.is_some()
+            && !meta.is_some_and(Raw::is_true)
+            && !side.is_some_and(Raw::is_true)
+        {
+            let snap_ts = || match snap {
+                Some(Raw::Obj(o)) => jsonl::raw_ts(jsonl::top_level(o, [b"timestamp"])[0]),
+                _ => None,
+            };
+            if let Some(t) = jsonl::raw_ts(ts).or_else(snap_ts) {
+                b.activity.push(t);
             }
         }
-        has_prompt |= is_user_prompt(&entry);
-        observe(&entry, &mut b.observations);
+        let needs_usage = kind == Some("cost-state")
+            || msg_obj.is_some_and(|m| jsonl::contains(m, b"\"usage\"") || jsonl::contains(m, b"\"model\""));
+        let needs_prompt = !has_prompt && kind == Some("user");
+        if needs_usage || needs_prompt {
+            if let Some(entry) = jsonl::parse(line) {
+                if needs_prompt {
+                    has_prompt |= is_user_prompt(&entry);
+                }
+                if needs_usage {
+                    observe(&entry, &mut b.observations);
+                }
+            }
+        }
     }
     if b.excluded.is_none() && !has_prompt && from > 0 {
         // The first prompt may sit between the head and the window: check the

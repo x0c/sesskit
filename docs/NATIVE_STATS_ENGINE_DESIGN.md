@@ -142,10 +142,27 @@ user/assistant/toolResult rows, OpenCode message rows), not the typed activity
 events of `load_activity`; counts differ by design, times agree. Consumers use
 only the times (intervals, heatmaps), never the counts.
 
+Performance design as built: a top-level JSON field scanner (SIMD string
+skipping, early exit) decides per row; full decoding happens only for rows
+that can carry usage (`"usage"`/`"model"` in the message, Codex usage records)
+and for user rows until the first prompt is found. OpenCode is read on
+parallel read-only connections with memory-mapped I/O, rows are fetched in
+index order (`session_id, time_created`) and ordered by `seq` in Rust, because
+sorting the large v2 rows by `seq` in SQL spilled about 0.9 GB into a temporary
+B-tree; only `tokens`, `cost`, `modelID`, `model.id` and ids are scanned per
+row. Measured warm on the owner's machine (load average 6–10): 7 days
+0.27–0.30 s, 30 days 1.4–1.6 s, all history about 4 s; repeat runs beyond 7
+days await the incremental cache (§4).
+
+Accepted listing difference: the Python Claude listing hides sessions whose
+only prompts are low-value titles (for example a lone greeting) as title noise;
+the engine counts them (they carry real prompts; typically zero tokens).
+
 Parity on the owner's real histories (7-day window, harness
 `crates/sesskit-stats/scripts/parity.py`, Python run against the committed
-snapshot): total tokens 373/373 sessions exact; pruned versus full reads
-0 differences over 379 sessions; session set identical except 27 sessions the
+snapshot): total tokens 373/373 sessions exact (after the performance rework:
+375/375 for 7 days and 1,073/1,073 for 30 days); pruned versus full reads
+0 differences over 379 sessions (1,090 for 30 days); session set identical except 27 sessions the
 Python OpenCode/Pi listings keep despite a deleted cwd. Sessions written during
 the run can differ transiently; frozen copies matched exactly. A 12-session
 independent spot check of finished sessions matched exactly. Timing: 0.28–0.47 s

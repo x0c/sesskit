@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::jsonl;
+use crate::jsonl::{self, Raw};
 use crate::session::{cwd_exclusion, Builder, Runtime, SessionStats, Window};
 use crate::usage::{int_of, trimmed, Counter, Normalized, Observation, Scope};
 
@@ -128,16 +128,6 @@ fn observe(entry: &Value, ts: Option<f64>, out: &mut Vec<Observation>) {
     }
 }
 
-fn is_activity(entry: &Value) -> bool {
-    match entry.get("type").and_then(Value::as_str) {
-        Some("response_item") => true,
-        Some("event_msg") => matches!(
-            entry.get("payload").and_then(|p| p.get("type")).and_then(Value::as_str),
-            Some("user_message" | "agent_message")
-        ),
-        _ => false,
-    }
-}
 
 /// Real user input (`parsers/codex.py::user_message_text`): legacy
 /// `event_msg.user_message`, or a `response_item` user message whose text is not
@@ -202,15 +192,36 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
     let from = if window.full { 0 } else { jsonl::window_offset(&bytes, window.start) };
     b.examined = (bytes.len() - from) as u64;
     for line in jsonl::lines(&bytes, from) {
-        let Some(entry) = jsonl::parse(line) else { continue };
-        let ts = jsonl::parse_ts(entry.get("timestamp"));
-        if is_activity(&entry) {
-            if let Some(t) = ts {
+        let [ty, ts, payload] = jsonl::top_level(line, [b"type", b"timestamp", b"payload"]);
+        let kind = ty.and_then(Raw::str);
+        let Some(Raw::Obj(p)) = payload else { continue };
+        let ptype = jsonl::top_level(p, [b"type"])[0].and_then(Raw::str);
+        let t = jsonl::raw_ts(ts);
+        let activity = match kind {
+            Some("response_item") => true,
+            Some("event_msg") => matches!(ptype, Some("user_message" | "agent_message")),
+            _ => false,
+        };
+        if activity {
+            if let Some(t) = t {
                 b.activity.push(t);
             }
         }
-        has_prompt |= is_user_prompt(&entry);
-        observe(&entry, ts, &mut b.observations);
+        let needs_usage = kind == Some("token_usage_record")
+            || (kind == Some("event_msg") && jsonl::contains(p, b"\"info\":{"));
+        let needs_prompt = !has_prompt
+            && ((kind == Some("event_msg") && ptype == Some("user_message"))
+                || (kind == Some("response_item") && jsonl::contains(p, b"\"role\":\"user\"")));
+        if needs_usage || needs_prompt {
+            if let Some(entry) = jsonl::parse(line) {
+                if needs_prompt {
+                    has_prompt |= is_user_prompt(&entry);
+                }
+                if needs_usage {
+                    observe(&entry, t, &mut b.observations);
+                }
+            }
+        }
     }
     if b.excluded.is_none() && !has_prompt && !skipped_has_prompt(&bytes, from) {
         b.excluded = Some("empty_history");

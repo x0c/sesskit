@@ -40,6 +40,42 @@ fn main() {
         "examined_bytes": examined,
         "threads": rayon::current_num_threads(),
     });
+    if args.iter().any(|a| a == "--timing") {
+        let mut per: std::collections::BTreeMap<&str, (usize, u64)> = Default::default();
+        for s in &sessions {
+            let e = per.entry(s.runtime.id()).or_default();
+            e.0 += 1;
+            e.1 += s.examined;
+        }
+        out["per_runtime"] = serde_json::to_value(&per).unwrap();
+        let t = Instant::now();
+        let src = sesskit_stats::discover(&home, &window);
+        out["discover_s"] = serde_json::json!(t.elapsed().as_secs_f64());
+        out["files"] = serde_json::json!({"claude": src.claude.len(), "codex": src.codex.len(), "pi": src.pi.len()});
+        for (name, files, f) in [
+            ("claude", &src.claude, sesskit_stats::claude::read as fn(&std::path::Path, &Window) -> Option<sesskit_stats::SessionStats>),
+            ("codex", &src.codex, sesskit_stats::codex::read),
+            ("pi", &src.pi, sesskit_stats::pi::read),
+        ] {
+            let t = Instant::now();
+            let mut slowest = (0.0f64, String::new(), 0u64);
+            for p in files.iter() {
+                let ft = Instant::now();
+                let _ = f(p, &window);
+                let d = ft.elapsed().as_secs_f64();
+                if d > slowest.0 {
+                    slowest = (d, p.display().to_string(), std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
+                }
+            }
+            out[format!("serial_{name}_s")] = serde_json::json!(t.elapsed().as_secs_f64());
+            out[format!("slowest_{name}")] = serde_json::json!([slowest.0, slowest.2, slowest.1]);
+        }
+        let t = Instant::now();
+        for db in &src.opencode {
+            let _ = sesskit_stats::opencode::read(db, &window);
+        }
+        out["opencode_s"] = serde_json::json!(t.elapsed().as_secs_f64());
+    }
     if args.iter().any(|a| a == "--sessions") {
         out["detail"] = serde_json::to_value(&sessions).unwrap();
     }

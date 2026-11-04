@@ -8,7 +8,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::session::{cwd_exclusion, Builder, Runtime, SessionStats, Window};
-use crate::usage::{cost_of, int_of, str_of, Counter, Normalized, Observation, Scope};
+use crate::jsonl::{self, Raw};
+use crate::usage::{int_of, Counter, Normalized, Observation, Scope};
 
 /// `<data>/opencode/opencode.db` with `<data>` = `XDG_DATA_HOME` or
 /// `~/.local/share` on every OS, plus channel databases `opencode-<channel>.db`
@@ -56,31 +57,65 @@ struct Row {
     id: String,
     time_created: Option<i64>,
     data: String,
+    /// v2 `seq` (ordering key of the reference); v1 rows use time order.
+    seq: Option<i64>,
 }
 
-fn observe(row: &Row, ts: Option<f64>, out: &mut Vec<Observation>) -> bool {
-    let Ok(Value::Object(mut data)) = serde_json::from_str::<Value>(&row.data) else { return false };
-    data.entry("id").or_insert_with(|| Value::String(row.id.clone()));
-    let data = Value::Object(data);
-    let tokens = data.get("tokens").filter(|t| t.is_object());
-    let cache = tokens.and_then(|t| t.get("cache")).filter(|c| c.is_object());
-    let input = tokens.and_then(|t| int_of(t.get("input")));
-    let output = tokens.and_then(|t| int_of(t.get("output")));
-    let reasoning = tokens.and_then(|t| int_of(t.get("reasoning")));
+/// `collect_opencode_observations` for one message row, reading only the
+/// top-level fields it needs (`tokens`, `cost`, `modelID`, `model.id`, ids).
+fn observe(row: &Row, ts: Option<f64>, out: &mut Vec<Observation>) {
+    let data = row.data.as_bytes();
+    let [tokens, cost, model_id, model, id, message_id, message_id2] =
+        jsonl::top_level(data, [b"tokens", b"cost", b"modelID", b"model", b"id", b"message_id", b"messageId"]);
+    if !data.starts_with(b"{") && !data.trim_ascii_start().starts_with(b"{") {
+        return; // not a JSON object row
+    }
+    let tokens: Option<Value> = match tokens {
+        Some(Raw::Obj(t)) => serde_json::from_slice(t).ok(),
+        _ => None,
+    };
+    let cache = tokens.as_ref().and_then(|t| t.get("cache")).filter(|c| c.is_object());
+    let input = tokens.as_ref().and_then(|t| int_of(t.get("input")));
+    let output = tokens.as_ref().and_then(|t| int_of(t.get("output")));
+    let reasoning = tokens.as_ref().and_then(|t| int_of(t.get("reasoning")));
     let cache_read = cache.and_then(|c| int_of(c.get("read")));
     let cache_write = cache.and_then(|c| int_of(c.get("write")));
-    let cost = cost_of(data.get("cost"));
-    let mut model = data.get("modelID").and_then(Value::as_str).map(str::to_string);
-    if let Some(nested) = data.get("model").and_then(|m| m.get("id")).and_then(Value::as_str) {
-        if !nested.trim().is_empty() {
-            model = Some(nested.trim().to_string());
+    // Python: bools are not costs; non-negative numbers are.
+    let cost = match cost {
+        Some(Raw::Lit(l)) if l != b"true" && l != b"false" && l != b"null" => {
+            std::str::from_utf8(l).ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v >= 0.0)
+        }
+        _ => None,
+    };
+    let mut model_name = model_id.and_then(Raw::str).map(str::to_string);
+    if let Some(Raw::Obj(m)) = model {
+        if let Some(nested) = jsonl::top_level(m, [b"id"])[0].and_then(Raw::str) {
+            if !nested.trim().is_empty() {
+                model_name = Some(nested.trim().to_string());
+            }
         }
     }
-    let model = model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
-    if [input, output, cache_read, cache_write, reasoning].iter().all(Option::is_none) && cost.is_none() && model.is_none() {
-        return true;
+    let model_name = model_name.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+    if [input, output, cache_read, cache_write, reasoning].iter().all(Option::is_none)
+        && cost.is_none()
+        && model_name.is_none()
+    {
+        return;
     }
-    let mid = str_of(data.get("id")).or_else(|| str_of(data.get("message_id"))).or_else(|| str_of(data.get("messageId")));
+    // data.setdefault("id", row_id); then id or message_id or messageId (truthy).
+    let pick = |raw: Option<Raw>| -> Option<Option<String>> {
+        match raw {
+            None => None,
+            Some(Raw::Str(b"")) => None,
+            Some(Raw::Str(v)) => Some(std::str::from_utf8(v).ok().map(str::to_string)),
+            Some(Raw::Lit(b"null" | b"false" | b"0")) => None,
+            Some(_) => Some(None), // truthy non-string: unknown record
+        }
+    };
+    let mid: Option<String> = match id {
+        None => Some(row.id.clone()),
+        some => pick(some).or_else(|| pick(message_id)).or_else(|| pick(message_id2)).flatten(),
+    };
     let in_parts: Vec<i64> = [input, cache_read, cache_write].iter().flatten().copied().collect();
     let out_parts: Vec<i64> = [output, reasoning].iter().flatten().copied().collect();
     let input_total = (!in_parts.is_empty()).then(|| in_parts.iter().sum());
@@ -98,7 +133,7 @@ fn observe(row: &Row, ts: Option<f64>, out: &mut Vec<Observation>) -> bool {
         message_id: mid.clone(),
         scope_id: mid,
         counter_name: None,
-        model,
+        model: model_name,
         normalized: Normalized {
             input_total,
             input_uncached: input,
@@ -112,7 +147,6 @@ fn observe(row: &Row, ts: Option<f64>, out: &mut Vec<Observation>) -> bool {
         },
         ts,
     });
-    true
 }
 
 fn table_set(conn: &Connection) -> rusqlite::Result<Vec<String>> {
@@ -160,47 +194,70 @@ pub fn read(db: &Path, window: &Window) -> Vec<SessionStats> {
         }
     }
 
-    let since = if window.full { i64::MIN } else { start_ms };
-    let mut rows: Vec<Row> = Vec::new();
-    let fetch = |sql: &str, ids: &[&String], rows: &mut Vec<Row>| {
-        if ids.is_empty() {
-            return;
-        }
-        let marks = vec!["?"; ids.len()].join(",");
-        let sql = sql.replace("{ids}", &marks);
-        let Ok(mut stmt) = conn.prepare(&sql) else { return };
-        let mut params: Vec<rusqlite::types::Value> =
-            ids.iter().map(|s| rusqlite::types::Value::Text((*s).clone())).collect();
-        params.push(rusqlite::types::Value::Integer(since));
-        let mapped = stmt.query_map(rusqlite::params_from_iter(params), |r| {
-            Ok(Row { session: r.get(0)?, id: r.get(1)?, time_created: r.get(2)?, data: r.get(3)? })
-        });
-        if let Ok(it) = mapped {
-            rows.extend(it.flatten());
-        }
-    };
-    let v1: Vec<&String> = sessions.iter().filter(|s| !s.2).map(|s| &s.0).collect();
-    let v2: Vec<&String> = sessions.iter().filter(|s| s.2).map(|s| &s.0).collect();
-    fetch(
-        "SELECT session_id, id, time_created, data FROM message WHERE session_id IN ({ids}) AND time_created >= ? \
-         ORDER BY session_id, time_created ASC, id ASC",
-        &v1,
-        &mut rows,
-    );
-    fetch(
-        "SELECT session_id, id, time_created, data FROM session_message WHERE session_id IN ({ids}) AND time_created >= ? \
-         ORDER BY session_id, seq ASC, id ASC",
-        &v2,
-        &mut rows,
-    );
     drop(tx);
+    let since = if window.full { i64::MIN } else { start_ms };
+    let threads = rayon::current_num_threads().max(1);
+    let chunk = sessions.len().div_ceil(threads * 2).max(1);
+    let db = db.to_path_buf();
+    sessions
+        .par_chunks(chunk)
+        .flat_map_iter(|part| read_chunk(&db, part, since, window))
+        .collect()
+}
 
+/// Rows of one group of sessions on its own read-only connection.
+fn read_chunk(db: &Path, sessions: &[(String, Option<String>, bool)], since: i64, window: &Window) -> Vec<SessionStats> {
+    let mut rows: Vec<Row> = Vec::new();
+    if let Ok(conn) = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX) {
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
+        // Memory-map the database: large message rows live on overflow pages,
+        // which plain reads copy page by page through system calls.
+        let _ = conn.execute_batch("PRAGMA mmap_size = 4294967296;");
+        let fetch = |sql: &str, ids: &[&String], rows: &mut Vec<Row>| {
+            if ids.is_empty() {
+                return;
+            }
+            let marks = vec!["?"; ids.len()].join(",");
+            let sql = sql.replace("{ids}", &marks);
+            let Ok(mut stmt) = conn.prepare(&sql) else { return };
+            let mut params: Vec<rusqlite::types::Value> =
+                ids.iter().map(|s| rusqlite::types::Value::Text((*s).clone())).collect();
+            params.push(rusqlite::types::Value::Integer(since));
+            let mapped = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                Ok(Row { session: r.get(0)?, id: r.get(1)?, time_created: r.get(2)?, data: r.get(3)?, seq: r.get(4)? })
+            });
+            if let Ok(it) = mapped {
+                rows.extend(it.flatten());
+            }
+        };
+        let v1: Vec<&String> = sessions.iter().filter(|s| !s.2).map(|s| &s.0).collect();
+        let v2: Vec<&String> = sessions.iter().filter(|s| s.2).map(|s| &s.0).collect();
+        fetch(
+            "SELECT session_id, id, time_created, data, NULL FROM message WHERE session_id IN ({ids}) AND time_created >= ? \
+             ORDER BY session_id, time_created ASC, id ASC",
+            &v1,
+            &mut rows,
+        );
+        fetch(
+            // Index order (session, time): sorting the large rows by `seq` in SQL
+            // spills them into a temporary B-tree; order by `seq` below instead.
+            "SELECT session_id, id, time_created, data, seq FROM session_message WHERE session_id IN ({ids}) \
+             AND time_created >= ? ORDER BY session_id, time_created ASC, id ASC",
+            &v2,
+            &mut rows,
+        );
+    }
     let mut by_session: HashMap<&str, Vec<&Row>> = HashMap::new();
     for r in &rows {
         by_session.entry(r.session.as_str()).or_default().push(r);
     }
+    for list in by_session.values_mut() {
+        if list.iter().any(|r| r.seq.is_some()) {
+            list.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.id.cmp(&b.id)));
+        }
+    }
     sessions
-        .par_iter()
+        .iter()
         .map(|(id, dir, _)| {
             let mut b = Builder::new(Runtime::Opencode, id.clone());
             b.cwd = dir.clone().filter(|d| !d.is_empty());

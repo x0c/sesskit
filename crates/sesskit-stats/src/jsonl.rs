@@ -111,3 +111,172 @@ pub fn window_offset(bytes: &[u8], start: f64) -> usize {
     }
     bytes.len()
 }
+
+/// A top-level JSON value located without decoding it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Raw<'a> {
+    /// String contents between the quotes (escapes left as written).
+    Str(&'a [u8]),
+    /// Object or array text including its brackets.
+    Obj(&'a [u8]),
+    Arr(&'a [u8]),
+    /// `true`, `false`, `null` or a number.
+    Lit(&'a [u8]),
+}
+
+impl<'a> Raw<'a> {
+    pub fn str(self) -> Option<&'a str> {
+        match self {
+            Raw::Str(s) => std::str::from_utf8(s).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn is_true(self) -> bool {
+        // Python truthiness for the flags used here (bool or non-empty string).
+        match self {
+            Raw::Lit(l) => l == b"true" || (l != b"false" && l != b"null" && l != b"0"),
+            Raw::Str(s) => !s.is_empty(),
+            Raw::Obj(o) | Raw::Arr(o) => o.len() > 2,
+        }
+    }
+}
+
+/// End (exclusive) of the string starting at `i` (on its opening quote);
+/// jumps between quotes and backslashes with SIMD search.
+fn string_end(line: &[u8], mut i: usize) -> Option<usize> {
+    i += 1;
+    while i < line.len() {
+        let at = i + memchr::memchr2(b'"', b'\\', &line[i..])?;
+        if line[at] == b'"' {
+            return Some(at + 1);
+        }
+        i = at + 2;
+    }
+    None
+}
+
+/// Values of the requested top-level keys of one JSON object (first wins),
+/// skipping every other value without decoding it.
+pub fn top_level<'a, const N: usize>(line: &'a [u8], keys: [&[u8]; N]) -> [Option<Raw<'a>>; N] {
+    let mut out = [None; N];
+    let n = line.len();
+    let ws = |i: &mut usize| {
+        while *i < n && line[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    let mut i = 0;
+    ws(&mut i);
+    if i >= n || line[i] != b'{' {
+        return out;
+    }
+    i += 1;
+    loop {
+        ws(&mut i);
+        if i >= n || line[i] != b'"' {
+            return out;
+        }
+        let Some(kend) = string_end(line, i) else { return out };
+        let key = &line[i + 1..kend - 1];
+        i = kend;
+        ws(&mut i);
+        if i >= n || line[i] != b':' {
+            return out;
+        }
+        i += 1;
+        ws(&mut i);
+        if i >= n {
+            return out;
+        }
+        let start = i;
+        let value = match line[i] {
+            b'"' => {
+                let Some(e) = string_end(line, i) else { return out };
+                i = e;
+                Raw::Str(&line[start + 1..e - 1])
+            }
+            b'{' | b'[' => {
+                let mut depth = 0i32;
+                while i < n {
+                    // Skip plain bytes up to the next quote or bracket.
+                    if !matches!(line[i], b'"' | b'{' | b'[' | b'}' | b']') {
+                        match line[i..].iter().position(|b| matches!(b, b'"' | b'{' | b'[' | b'}' | b']')) {
+                            Some(off) => i += off,
+                            None => break,
+                        }
+                    }
+                    match line[i] {
+                        b'"' => {
+                            let Some(e) = string_end(line, i) else { return out };
+                            i = e;
+                            continue;
+                        }
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if line[start] == b'{' {
+                    Raw::Obj(&line[start..i])
+                } else {
+                    Raw::Arr(&line[start..i])
+                }
+            }
+            _ => {
+                while i < n && line[i] != b',' && line[i] != b'}' && !line[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                Raw::Lit(&line[start..i])
+            }
+        };
+        if let Some(k) = keys.iter().position(|k| *k == key) {
+            if out[k].is_none() {
+                out[k] = Some(value);
+                if out.iter().all(Option::is_some) {
+                    return out;
+                }
+            }
+        }
+        ws(&mut i);
+        if i < n && line[i] == b',' {
+            i += 1;
+        } else {
+            return out;
+        }
+    }
+}
+
+/// RFC 3339 timestamp from a raw string value.
+pub fn raw_ts(raw: Option<Raw>) -> Option<f64> {
+    let text = raw?.str()?.trim();
+    OffsetDateTime::parse(text, &Rfc3339).ok().map(|t| t.unix_timestamp_nanos() as f64 / 1e9)
+}
+
+pub fn contains(line: &[u8], needle: &[u8]) -> bool {
+    memchr::memmem::find(line, needle).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_level_skips_nested_values() {
+        let line = br#"{"type":"x","details":{"id":"nested","a":[{"id":"deep"}],"s":"q\"}"},"id":"top","n":12,"flag":true,"parentId":null}"#;
+        let [t, id, n, flag, parent, missing] = top_level(line, [b"type", b"id", b"n", b"flag", b"parentId", b"nope"]);
+        assert_eq!(t, Some(Raw::Str(b"x")));
+        assert_eq!(id, Some(Raw::Str(b"top")));
+        assert_eq!(n, Some(Raw::Lit(b"12")));
+        assert!(flag.unwrap().is_true());
+        assert_eq!(parent, Some(Raw::Lit(b"null")));
+        assert_eq!(missing, None);
+    }
+}

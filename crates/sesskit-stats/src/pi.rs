@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::jsonl;
+use crate::jsonl::{self, Raw};
 use crate::session::{cwd_exclusion, Builder, Runtime, SessionStats, Window};
 use crate::usage::{cost_of, int_of, str_of, Counter, Normalized, Observation, Scope};
 
@@ -50,95 +50,10 @@ fn observe(item: &Value, ts: Option<f64>, out: &mut Vec<Observation>) {
     });
 }
 
-/// Top-level string fields `type`, `id`, `parentId` of one JSON object line,
-/// skipping nested values without decoding them (strings, objects, arrays).
-fn top_fields(line: &[u8]) -> [Option<&[u8]>; 3] {
-    let mut out = [None, None, None];
-    let n = line.len();
-    let mut i = match line.iter().position(|b| *b == b'{') {
-        Some(p) => p + 1,
-        None => return out,
-    };
-    let skip_ws = |i: &mut usize| {
-        while *i < n && line[*i].is_ascii_whitespace() {
-            *i += 1;
-        }
-    };
-    // Returns the end index (exclusive) of a string starting at `i` (on the quote).
-    let string_end = |mut i: usize| -> Option<usize> {
-        i += 1;
-        while i < n {
-            match line[i] {
-                b'\\' => i += 2,
-                b'"' => return Some(i + 1),
-                _ => i += 1,
-            }
-        }
-        None
-    };
-    loop {
-        skip_ws(&mut i);
-        if i >= n || line[i] != b'"' {
-            return out;
-        }
-        let Some(kend) = string_end(i) else { return out };
-        let key = &line[i + 1..kend - 1];
-        i = kend;
-        skip_ws(&mut i);
-        if i >= n || line[i] != b':' {
-            return out;
-        }
-        i += 1;
-        skip_ws(&mut i);
-        if i >= n {
-            return out;
-        }
-        let slot = match key {
-            b"type" => Some(0),
-            b"id" => Some(1),
-            b"parentId" => Some(2),
-            _ => None,
-        };
-        if line[i] == b'"' {
-            let Some(vend) = string_end(i) else { return out };
-            if let Some(k) = slot {
-                out[k] = Some(&line[i + 1..vend - 1]);
-            }
-            i = vend;
-        } else if line[i] == b'{' || line[i] == b'[' {
-            let mut depth = 0i32;
-            while i < n {
-                match line[i] {
-                    b'"' => match string_end(i) {
-                        Some(e) => {
-                            i = e;
-                            continue;
-                        }
-                        None => return out,
-                    },
-                    b'{' | b'[' => depth += 1,
-                    b'}' | b']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            i += 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
-        } else {
-            while i < n && line[i] != b',' && line[i] != b'}' {
-                i += 1;
-            }
-        }
-        skip_ws(&mut i);
-        if i < n && line[i] == b',' {
-            i += 1;
-        } else {
-            return out;
-        }
+fn raw_bytes<'a>(raw: Raw<'a>) -> Option<&'a [u8]> {
+    match raw {
+        Raw::Str(v) => Some(v),
+        _ => None,
     }
 }
 
@@ -151,7 +66,12 @@ fn active_branch(bytes: &[u8]) -> Option<(HashSet<Vec<u8>>, bool)> {
     let mut users: HashSet<&[u8]> = HashSet::new();
     let mut last: Option<&[u8]> = None;
     for line in jsonl::lines(bytes, 0) {
-        let [kind, id, parent_id] = top_fields(line);
+        let [kind, id, parent_id] = jsonl::top_level(line, [b"type", b"id", b"parentId"]);
+        let (kind, id, parent_id) = (
+            kind.and_then(raw_bytes),
+            id.and_then(raw_bytes),
+            parent_id.and_then(raw_bytes),
+        );
         let is_message = kind == Some(b"message".as_slice());
         let Some(id) = id else {
             if is_message {
@@ -205,34 +125,27 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
     let from = if window.full { 0 } else { jsonl::window_offset(&bytes, window.start) };
     b.examined = (bytes.len() - from) as u64;
     for line in jsonl::lines(&bytes, from) {
-        let Some(item) = jsonl::parse(line) else { continue };
-        let message = item.get("message").filter(|m| m.is_object());
-        let ts = jsonl::parse_ts(item.get("timestamp"))
-            .or_else(|| jsonl::parse_ts(message.and_then(|m| m.get("timestamp"))));
-        if let (Some(t), Some(m)) = (ts, message) {
-            let on_branch = match (&branch, item.get("id").and_then(Value::as_str)) {
+        let [ty, id, ts, msg] = jsonl::top_level(line, [b"type", b"id", b"timestamp", b"message"]);
+        let Some(Raw::Obj(m)) = msg else { continue };
+        let [role, mts] = jsonl::top_level(m, [b"role", b"timestamp"]);
+        let t = jsonl::raw_ts(ts).or_else(|| jsonl::raw_ts(mts));
+        if let Some(t) = t {
+            let on_branch = match (&branch, id.and_then(Raw::str)) {
                 (Some((ids, _)), Some(id)) => ids.contains(id.as_bytes()),
                 (Some(_), None) => false,
                 (None, _) => true,
             };
-            if on_branch && matches!(m.get("role").and_then(Value::as_str), Some("user" | "assistant" | "toolResult")) {
+            if on_branch && matches!(role.and_then(Raw::str), Some("user" | "assistant" | "toolResult")) {
                 b.activity.push(t);
             }
         }
-        observe(&item, ts, &mut b.observations);
+        if ty.and_then(Raw::str) == Some("message")
+            && (jsonl::contains(m, b"\"usage\"") || jsonl::contains(m, b"\"model\""))
+        {
+            if let Some(item) = jsonl::parse(line) {
+                observe(&item, t, &mut b.observations);
+            }
+        }
     }
     Some(b.finish(window))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::top_fields;
-
-    #[test]
-    fn top_level_fields_skip_nested_ids() {
-        let line = br#"{"type":"custom_message","details":{"id":"nested","x":[{"id":"deep"}]},"content":"say \"id\":\"no\"","id":"top","parentId":"p1"}"#;
-        assert_eq!(top_fields(line), [Some(&b"custom_message"[..]), Some(&b"top"[..]), Some(&b"p1"[..])]);
-        let null_parent = br#"{"type":"model_change","id":"a","parentId":null,"n":3}"#;
-        assert_eq!(top_fields(null_parent), [Some(&b"model_change"[..]), Some(&b"a"[..]), None]);
-    }
 }
