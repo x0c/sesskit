@@ -12,16 +12,16 @@ External developers must be able to adopt SessKit without any downstream host.
 First-use examples cover search ingestion, native usage and outcome inspection,
 and incremental consumption. They use public APIs only, do not launch agents or
 modify history, and introduce no telemetry, network service, or runtime dependency.
-The CLI envelope and existing schemas remain unchanged. Examples are application
+The snapshot CLI envelope and existing schemas remain unchanged. Examples are application
 recipes, not additional stable CLI commands or a new typed JSON schema.
 
-## Stream messages (current source)
+## Stream messages
 
 Use the [message streaming guide](MESSAGE_STREAMING_GUIDE.md) for the additive
 Python `open_message_stream` API, caller-owned native feed bridge, and
 `sesskit stream` JSONL protocol. Missing or failed live inputs degrade to existing
-history automatically. This requires the current checkout, not the fixed-release
-wheel below; existing snapshot command envelopes and schemas remain unchanged.
+history automatically. The v0.2.25 wheel below includes this surface; existing
+snapshot command envelopes and schemas remain unchanged.
 
 ## Install a fixed release
 
@@ -30,7 +30,7 @@ project's virtual environment and install the published wheel. If you need a new
 environment, run `python3 -m venv .venv && . .venv/bin/activate` first.
 
 ```bash
-python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.23/sesskit-0.2.23-py3-none-any.whl"
+python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.25/sesskit-0.2.25-py3-none-any.whl"
 python -m sesskit describe
 ```
 
@@ -40,11 +40,9 @@ URL. Windows is not a supported platform.
 
 The example files live in the repository's `examples/` directory and source
 archives; wheels install only the library and CLI. The original search,
-activity-usage and follow recipes work with the fixed release. The newer usage
-calibration and historical-performance additions below require the current
-source checkout until included in a tagged release: run `python -m pip install .`
-from that checkout with your application's interpreter. No `PYTHONPATH` override
-is needed. Review output locally: export and follow output may
+activity-usage and follow recipes, usage calibration, and historical-performance
+additions below work with the fixed v0.2.25 release. No `PYTHONPATH` override is
+needed. Review output locally: export and follow output may
 contain private prompts, code, tool output, or credentials from native history.
 Nothing is uploaded automatically. Do not redirect output onto native history.
 

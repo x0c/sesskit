@@ -17,12 +17,12 @@
 从[接入指南和三个可运行示例](docs/INTEGRATION_GUIDE.md)开始。
 读取本地已有历史不需要模型账号或 API key。
 
-## 消息流（当前源码）
+## 消息流
 
 三方程序可通过 `open_message_stream(session)` 或 `sesskit stream` 持续显示消息更新。
 宿主提供原生事件流时可逐段显示；实时来源不可用时会自动回退到已落盘历史。
 [消息流接入指南](docs/MESSAGE_STREAMING_GUIDE.md)说明了 Python 接入、JSONL 协议及观察预算。
-此能力需要安装当前源码，已发布的 v0.2.24 wheel 尚未包含。
+v0.2.25 及后续版本已包含此能力。
 
 ## 安装
 
@@ -31,7 +31,7 @@ SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装指定版本的 
 需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。暂不支持 Windows。
 
 ```bash
-python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.23/sesskit-0.2.23-py3-none-any.whl"
+python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.25/sesskit-0.2.25-py3-none-any.whl"
 python -m sesskit describe
 ```
 
@@ -96,11 +96,9 @@ for runtime_id, items in sessions.items():
 
 会真实启动助手会话的自动化（测试、评测、探针）可以在工作区根目录放一个空的 `.sesskit-ignore` 文件，即可将其排除在列表之外；见 [`docs/CONTRACT.md`](docs/CONTRACT.md)。
 
-## 原生指标（当前源码）
+## 原生指标
 
-当前源码提供去重对账后的 Token／费用数据，以及历史耗时和生成速度。
-请在源码仓库中运行 `python -m pip install .`；上面的固定发布版 wheel
-不包含后续的全部对账修正和测速功能。
+发布版提供去重对账后的 Token／费用数据，以及历史耗时和生成速度。
 
 ```bash
 sesskit usage pi:SESSION_ID

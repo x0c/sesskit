@@ -4,12 +4,13 @@ Use SessKit to display an existing agent session incrementally without maintaini
 six native parsers. SessKit observes; the application owns presentation, native
 transport, access control and execution. No agent is launched, resumed or interrupted.
 
-This API is in the current source checkout, not the published v0.2.24 release wheel.
+This API requires v0.2.25 or later, including all seven reviewed repairs. The
+older v0.2.24 release wheel does not contain this API.
 The [independent review findings](#known-issues-from-independent-review) below
 record seven repaired implementation defects and their regression coverage, not
 changes to the intended contract.
-Install the checkout with `python -m pip install .` using the application's Python
-3.10+ environment. macOS and Linux are supported; no extra dependency is required.
+Install the [fixed-release wheel](../README.md#install) using the application's
+Python 3.10+ environment. macOS and Linux are supported; no extra dependency is required.
 
 ## Python
 
@@ -265,9 +266,9 @@ review artifacts and repair diagnostics/acceptance records are under
   No automatic cross-process attachment or raw terminal-byte support is claimed.
 
 The validated repair source is [commit `8dcdfed`](https://github.com/x0c/sesskit/commit/8dcdfed78fc35cda5d4a0d6303a98962dc6379f1).
-The installed source build still reports package version `0.2.24`; that version
-alone does not identify these repaired bytes or update the existing public release
-assets. The repair receipt records its wheel checksum, 60 installed package-file
+Before v0.2.25, the locally installed repaired source build reported package
+version `0.2.24`; that version alone did not identify those repaired bytes or
+update the public v0.2.24 release assets. The repair receipt records its wheel checksum, 60 installed package-file
 matches, all seven post-install behavior checks and the separate CLI consumer.
 Reusable identity checks live in [artifact handoff](~/.config/agentsync/docs/AGENT_WORKSPACE_ENVIRONMENT_GUIDE.md#hand-off-shared-dependencies).
 

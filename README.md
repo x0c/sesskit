@@ -17,14 +17,13 @@ This is a **Python library and JSON CLI** — not a TUI, not a session manager. 
 Start with the [integration guide and three runnable examples](docs/INTEGRATION_GUIDE.md).
 No model account or API key is needed to read existing local history.
 
-## Message streaming (current source)
+## Message streaming
 
 Third-party programs can use `open_message_stream(session)` or `sesskit stream`
 to display message updates. Host-provided native feeds deliver partial text;
 unavailable feeds automatically fall back to persisted history. See the
 [message streaming guide](docs/MESSAGE_STREAMING_GUIDE.md) for the Python bridge,
-JSONL protocol and observation budgets. This requires the current checkout, not
-the published v0.2.24 wheel.
+JSONL protocol and observation budgets. Available in v0.2.25 and later.
 
 ## Install
 
@@ -33,7 +32,7 @@ SessKit is not on PyPI yet. Install the fixed-release wheel in your project's vi
 Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not supported on Windows.
 
 ```bash
-python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.23/sesskit-0.2.23-py3-none-any.whl"
+python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.25/sesskit-0.2.25-py3-none-any.whl"
 python -m sesskit describe
 ```
 
@@ -79,11 +78,9 @@ for runtime_id, items in sessions.items():
         fresh = refresh_session(session)
 ```
 
-## Native metrics (current source)
+## Native metrics
 
-The current source adds reconciled token/cost data and historical timing/rates.
-Install that checkout with `python -m pip install .`; the fixed wheel above does
-not include every later calibration or performance addition.
+The release includes reconciled token/cost data and historical timing/rates.
 
 ```bash
 sesskit usage pi:SESSION_ID
