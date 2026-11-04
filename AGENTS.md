@@ -20,6 +20,7 @@ Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`
 - `docs/RUNTIME_THROUGHPUT_KNOWLEDGE_BASE.md`: Historical tokens/s and latency evidence, implemented performance API/CLI, interval semantics, native timing/counter pairing hazards, snapshot consistency and read-only verification.
 - `docs/STREAMING_OUTPUT_KNOWLEDGE_BASE.md`: Six-runtime live-output research, native source pins and attachment limits, plus the adopted third-party streaming and automatic-degradation requirements.
 - `docs/MESSAGE_STREAMING_GUIDE.md`: Python/JSONL message-stream integration, host-supplied native feed formats, automatic history degradation, upsert/reset/cursor semantics, budgets, detach/privacy limits and source-release availability.
+- `docs/NATIVE_STATS_ENGINE_DESIGN.md`: Multi-core Rust activity/usage projection over a time window (sub-second target), record-time attribution, parity rules against the Python reference, performance design and verification.
 - `docs/LISTING_CLI_EXPORT_KNOWLEDGE_BASE.md`: Snapshot CLI/export surface and the separate JSONL stream route: output contracts, reference resolution, excerpt rules, stream entry points and atomic write safety.
 
 ## Hard constraints (agent)
