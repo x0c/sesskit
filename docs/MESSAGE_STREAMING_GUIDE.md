@@ -5,8 +5,9 @@ six native parsers. SessKit observes; the application owns presentation, native
 transport, access control and execution. No agent is launched, resumed or interrupted.
 
 This API is in the current source checkout, not the published v0.2.24 release wheel.
-The [independent review findings](#known-issues-from-independent-review) below are
-confirmed, unfixed implementation exceptions, not changes to the intended contract.
+The [independent review findings](#known-issues-from-independent-review) below
+record seven repaired implementation defects and their regression coverage, not
+changes to the intended contract.
 Install the checkout with `python -m pip install .` using the application's Python
 3.10+ environment. macOS and Linux are supported; no extra dependency is required.
 
@@ -164,14 +165,38 @@ Native message/tool/error content may contain private code or credentials. Prote
 output and authorization in the consuming application. Nothing is uploaded or
 written to native history by this stream.
 
+## Repair acceptance targets
+
+Owner-approved repairs of MS-01–MS-07 are implemented in the current source
+(2026-11-04). Keep the existing
+API/schema, observer-only ownership, automatic degradation and CLI budgets; do
+not add transports, controls, dependencies or an overall-memory contract.
+Acceptance requires: Claude per-block finals retain message-global block identity
+without changing Pi cumulative snapshots; dense descriptor inputs preserve unread
+valid frames through bounded backpressure and retain the caller's handle without
+closing or duplicating it; an observably closed input fails rather than reading a
+recycled descriptor. Caller concurrent-close remains outside the lifetime contract.
+Kimi legacy recovery must successfully reload after unavailable even at unchanged
+stamps, and source identity replacement must reset the observation even when
+conversation values match and no unavailable poll intervenes. Malformed Kimi
+removal IDs must fail before mutating display rows. Pre-start CLI session attribution
+must respect known option arity and keep `unknown` when ambiguous. Add regressions
+for each failure; an old probe that asserts the bug is expected to stop passing.
+
 ## Known issues from independent review
 
 Reviewed on 2026-11-04 against code commit `70d3897` and documentation commit
 `a5f02ec`. Four independent read-only reviews were checked with coordinator-run
 synthetic reproductions and source inspection. Six P2 issues and one P3 issue were
-confirmed; no P0/P1 was confirmed. **None is fixed by this documentation update.**
-Existing passing regressions do not cover these failing scenarios. A review probe
-that exits zero after asserting a defect signature proves reproduction, not repair.
+confirmed; no P0/P1 was confirmed. **All seven are repaired in the current source.**
+The table retains the original failure conditions for traceability. Four focused
+regression modules add 47 required-behavior tests: `test_stream_native_review.py`
+(15), `test_stream_source_review.py` (11), `test_stream_legacy_review.py` (8), and
+`test_stream_cli_review.py` (13). They cover per-block finals, bounded file/SSE
+admission and EOF reconciliation, borrowed-handle lifetime, successful legacy
+reload/reset and canonical-option error attribution. No public release is implied.
+A review probe that exits zero after asserting an old defect signature proves
+reproduction, not repair; use the required-behavior regressions for acceptance.
 
 | ID | Priority | Conditions and observed failure | Owning implementation |
 |---|---|---|---|
@@ -207,17 +232,20 @@ input queue's byte budget. A bounded proof retained 1,048,832 ID bytes across a
 also needs separate consideration. Stale Kimi-reset ordering and arbitrary reader
 exception escape remain unconfirmed applicability hypotheses, not accepted defects.
 
-The lifetime reproduction deliberately drops a synthetic file handle and emits
-`ResourceWarning: unclosed file`; the complete warning is retained without
-suppression. It is an intentional probe diagnostic, not a clean production-path
-pass; no real user file or producer was involved. Reports, exact probes, official
-references and coordinator acceptance records are retained privately under
-`~/.config/sesskit/development/message-stream-review-20261103-6dda6090/`.
+The original lifetime reproduction deliberately dropped a synthetic file handle
+and emitted `ResourceWarning: unclosed file`; its complete warning remains retained
+without suppression. The repaired regressions pass with `ResourceWarning` treated
+as an error; no real user file or producer was involved. Original review evidence
+is retained under
+`~/.config/sesskit/development/message-stream-review-20261103-6dda6090/`; sealed
+review artifacts and repair diagnostics/acceptance records are under
+`~/.config/sesskit/development/message-stream-fix-20261104-6dda6090/`.
 
 ## Verification and limits
 
-- macOS Python 3.10–3.15: 1021 tests passed per interpreter; one historical Claude
-  incident fixture is absent. Linux Python 3.10: 997 passed, 25 platform/local-history
+- macOS Python 3.10–3.15: 1068 tests passed per interpreter after the repairs;
+  one historical Claude incident fixture is absent. Linux Python 3.10:
+  1044 passed, 25 platform/local-history
   checks skipped because that node has no agent stores or macOS process APIs.
   Build and Ruff diagnostics contain no retained warnings.
 - The 66 focused stream/recovery regressions include all five reader families

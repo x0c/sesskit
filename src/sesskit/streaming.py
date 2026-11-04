@@ -190,7 +190,18 @@ class MessageStream(AbstractContextManager["MessageStream"]):
         stat = os.stat(path)
         version = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
         if version == self._legacy_version:
-            return
+            if self._history_state != "unavailable":
+                return
+            # Prior poll left history unavailable at this exact fingerprint.
+            # A bare stat match is not availability evidence; reload below.
+            prior_unavailable = True
+            identity_changed = False
+        else:
+            prior_unavailable = self._history_state == "unavailable"
+            identity_changed = (
+                self._legacy_version is not None
+                and (version[0], version[1]) != (self._legacy_version[0], self._legacy_version[1])
+            )
         messages = load_session_conversation(self.session)
         # A racing writer invalidates this version again on the next poll.
         values = {}
@@ -202,7 +213,12 @@ class MessageStream(AbstractContextManager["MessageStream"]):
                 text=message.text, ts=message.timestamp,
             )
             values[f"history:{index}"] = asdict(event)
-        self._history_reset = values != self._history or self._legacy_version is None
+        self._history_reset = (
+            values != self._history
+            or self._legacy_version is None
+            or prior_unavailable
+            or identity_changed
+        )
         self._history, self._legacy_version = values, version
         self._history_state = "available" if values else "empty"
         self._truncated = offset > 0

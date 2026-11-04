@@ -48,6 +48,7 @@ class NativeEventNormalizer:
         self._pi_can_complete = False
         self._opencode_roles: OrderedDict[str, str] = OrderedDict()
         self._opencode_parts: OrderedDict[str, str] = OrderedDict()
+        self._claude_blocks: OrderedDict[str, int] = OrderedDict()
         self.outcome = SessionOutcome("unknown", Evidence("unknown"))
 
     def _next_message(self, native: object = None) -> str:
@@ -118,7 +119,8 @@ class NativeEventNormalizer:
                 self._seen.popitem(last=False)
         return getattr(self, f"_{self.runtime}")(event)
 
-    def _blocks(self, message: dict, *, complete: bool, pi: bool = False) -> list[NativeUpdate]:
+    def _blocks(self, message: dict, *, complete: bool, pi: bool = False,
+                start: int = 0) -> list[NativeUpdate]:
         mid = _text(message.get("id"))
         identity = mid or self._message or self._next_message()
         content = message.get("content", [])
@@ -134,7 +136,8 @@ class NativeEventNormalizer:
                               call_id=_text(message.get("toolCallId")) or None,
                               raw_output=content, complete=complete)
         updates = []
-        for index, block in enumerate(content):
+        for offset, block in enumerate(content):
+            index = start + offset
             block = _obj(block)
             typ = block.get("type")
             kind = "user_message" if role == "user" else "assistant_message"
@@ -164,6 +167,14 @@ class NativeEventNormalizer:
             if typ == "user":
                 message.setdefault("id", raw.get("uuid"))
                 self._next_message(message.get("id"))
+                return self._blocks(message, complete=True)
+            content = message.get("content", [])
+            is_single = isinstance(content, str) or (isinstance(content, list) and len(content) == 1)
+            if is_single:
+                candidate = _text(message.get("id")) or self._message
+                if candidate and candidate in self._claude_blocks:
+                    return self._blocks(message, complete=True,
+                                        start=self._claude_blocks[candidate])
             return self._blocks(message, complete=True)
         if typ == "result":
             error = "; ".join(e for e in raw.get("errors", []) if isinstance(e, str))
@@ -175,13 +186,21 @@ class NativeEventNormalizer:
         event = _obj(raw.get("event"))
         typ = event.get("type")
         if typ == "message_start":
+            mid = _text(_obj(event.get("message")).get("id"))
             self._next_message(_obj(event.get("message")).get("id"))
+            if mid and mid in self._claude_blocks:
+                del self._claude_blocks[mid]
             return []
         identity = self._message or self._next_message()
         index = event.get("index", 0)
         key = f"{identity}:{index}"
         mid = None if identity.startswith("local:") else identity
         if typ == "content_block_start":
+            if type(index) is int and 0 <= index < 1000:
+                self._claude_blocks[identity] = index
+                self._claude_blocks.move_to_end(identity)
+                while len(self._claude_blocks) > self.limit:
+                    self._claude_blocks.popitem(last=False)
             block = _obj(event.get("content_block"))
             if block.get("type") == "tool_use":
                 return self._emit(key, "tool_call", message_id=mid, call_id=_text(block.get("id")) or None,
@@ -379,6 +398,8 @@ class NativeEventNormalizer:
                 updates += self._kimi_reset(agent, _obj(op.get("snapshot")))
             elif op.get("op") == "items.remove":
                 removed = op.get("ids", [])
+                if not isinstance(removed, list) or any(not isinstance(item, str) for item in removed):
+                    raise ValueError("Kimi items.remove has invalid ids")
                 for key, value in list(self._values.items()):
                     if key.startswith(f"kimi:{agent}:") and value.event and value.event.turn_id in removed:
                         self._values.pop(key)

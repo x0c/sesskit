@@ -15,6 +15,7 @@ MAX_EVENT_BYTES = 1 << 20
 
 def json_event(value: object, *, max_bytes: int | None = MAX_EVENT_BYTES) -> tuple[dict, int]:
     """Copy a strict JSON object, refusing lossy keys, non-finite values and cycles."""
+
     def check(item: object, depth: int = 0) -> None:
         if depth > 80:
             raise ValueError("native event nesting exceeds limit")
@@ -30,6 +31,7 @@ def json_event(value: object, *, max_bytes: int | None = MAX_EVENT_BYTES) -> tup
                 check(child, depth + 1)
         else:
             raise ValueError("native event must contain plain JSON values")
+
     if type(value) is not dict:
         raise ValueError("native event must be an object")
     check(value)
@@ -132,62 +134,204 @@ class NativeJSONSource(NativeEventSource):
         super().__init__()
         if format not in {"ndjson", "sse"}:
             raise ValueError("input format must be ndjson or sse")
+        # Retain the caller's handle without closing or duplicating it: keeping
+        # a strong reference stops the descriptor number from being recycled
+        # while this source still reads from it. The caller still owns and
+        # closes the input; close() below never touches it.
+        self._handle = handle
         self._fd = handle.fileno()
         self._format = format
         self._pending = bytearray()
         self._data: list[bytes] = []
         self._data_size = 0
+        # An SSE frame completed while the admission queue was full. Its data
+        # lines are already consumed from _pending, so the frame waits here
+        # instead of being dropped or merged with the next frame.
+        self._frame_ready = False
+        self._admitted = 0
+        self._poll_limit = 256
         self._ended = False
+        try:
+            identity = os.fstat(self._fd)
+        except OSError:
+            self._identity: tuple[int, int] | None = None
+        else:
+            self._identity = (identity.st_ino, identity.st_dev)
 
-    def _line(self, raw: bytes) -> None:
+    def _handle_failed(self) -> bool:
+        """Fail closed when the caller-owned handle is observably unusable.
+
+        Returns True without reading when the retained handle is closed,
+        detached, or no longer the same open file as at construction (explicit
+        owner close followed by descriptor reuse). This check races a caller
+        thread that closes concurrently with poll(); such concurrent close
+        remains prohibited and is not claimed to be proven safe.
+        """
+        handle = self._handle
+        try:
+            if handle.closed:
+                return True
+            current = handle.fileno()
+        except (AttributeError, OSError, ValueError):
+            return True
+        if current != self._fd:
+            return True
+        if self._identity is not None:
+            try:
+                fresh = os.fstat(self._fd)
+            except OSError:
+                return True
+            if (fresh.st_ino, fresh.st_dev) != self._identity:
+                return True
+        return False
+
+    def _admit_dict(self, event: dict) -> str:
+        """Admit one decoded event: "admitted", "backpressure", or "ended".
+
+        Backpressure (per-poll budget exhausted, or the event fits only after
+        the consumer drains) preserves the caller-visible input for a later
+        poll and leaves the bridge state untouched. Genuine overflow — an event
+        that cannot fit even an empty queue — and invalid input end the reader
+        with the same reasons feed() reports, preserving the accepted prefix.
+        """
+        if self._admitted >= self._poll_limit:
+            return "backpressure"
+        try:
+            value, size = json_event(event)
+        except (ValueError, TypeError, RecursionError, OverflowError):
+            with self._lock:
+                self._connected, self._reason, self._gap = False, "invalid_event", True
+            self._ended = True
+            return "ended"
+        with self._lock:
+            if not self._connected:
+                self._ended = True
+                return "ended"
+            if len(self._queue) < self._capacity and self._bytes + size <= self._max_bytes:
+                self._queue.append((value, size))
+                self._bytes += size
+                self._admitted += 1
+                return "admitted"
+        if size <= self._max_bytes:
+            return "backpressure"
+        with self._lock:
+            self._connected, self._reason, self._gap = False, "consumer_overflow", True
+        self._ended = True
+        return "ended"
+
+    def _admit_raw(self, raw: bytes) -> str:
+        return self._admit_dict(json.loads(raw.decode("utf-8")))
+
+    def _line(self, raw: bytes) -> str:
+        """Consume one newline-terminated line: "consumed", "backpressure", or "ended".
+
+        Backpressure leaves the input unit intact for a later poll: the raw
+        line stays in _pending (restored by the caller) or, for a completed
+        SSE frame, the data lines stay in _data with _frame_ready set.
+        Malformed input raises for the poll handler to report.
+        """
         if self._format == "sse":
             if not raw:
                 if not self._data:
-                    return
-                raw = b"\n".join(self._data)
+                    return "consumed"
+                outcome = self._admit_raw(b"\n".join(self._data))
+                if outcome == "backpressure":
+                    self._frame_ready = True
+                    return "backpressure"
                 self._data, self._data_size = [], 0
+                return "consumed" if outcome == "admitted" else "ended"
             elif raw.startswith(b"data:"):
                 value = raw[5:].removeprefix(b" ")
                 self._data.append(value)
                 self._data_size += len(value)
                 if self._data_size > MAX_EVENT_BYTES:
                     raise ValueError("SSE frame exceeds byte limit")
-                return
+                return "consumed"
             else:
+                return "consumed"
+        if not raw.strip():
+            return "consumed"
+        outcome = self._admit_raw(raw)
+        return "consumed" if outcome == "admitted" else outcome
+
+    def _admit_ready(self) -> None:
+        """Admit complete buffered units within the per-poll budget.
+
+        A backpressured SSE frame goes first to preserve order; then complete
+        newline-terminated lines. A backpressured NDJSON line is restored byte
+        for byte to the front of _pending. A fatal unit clears _pending.
+        """
+        if self._frame_ready:
+            outcome = self._admit_raw(b"\n".join(self._data))
+            if outcome == "backpressure":
                 return
-        if raw.strip() and not self.feed(json.loads(raw.decode("utf-8"))):
-            self._ended = True
+            self._data, self._data_size = [], 0
+            self._frame_ready = False
+            if outcome == "ended":
+                self._pending.clear()
+                return
+        while b"\n" in self._pending and not self._ended:
+            raw, _, rest = self._pending.partition(b"\n")
+            self._pending = bytearray(rest)
+            if len(raw) > MAX_EVENT_BYTES:
+                raise ValueError("native line exceeds byte limit")
+            outcome = self._line(bytes(raw).removesuffix(b"\r"))
+            if outcome == "backpressure":
+                self._pending = bytearray(bytes(raw) + b"\n") + self._pending
+                return
+            if outcome == "ended":
+                self._pending.clear()
+                return
+
+    def _finish_eof(self) -> None:
+        """End at EOF only when no complete unit still awaits admission."""
+        if self._format == "ndjson" and self._pending and b"\n" not in self._pending:
+            tail = bytes(self._pending)
+            self._pending.clear()
+            if tail.strip() and self._admit_raw(tail) == "backpressure":
+                self._pending = bytearray(tail)
+                return
+        elif self._frame_ready or (self._pending and b"\n" in self._pending):
+            return
+        if self._ended:
+            return
+        # EOF is not a completed agent turn, nor a complete SSE
+        # frame. A final non-newline NDJSON object is valid.
+        self._pending.clear()
+        self._data.clear()
+        self._data_size = 0
+        self._ended = True
+        self.disconnect("source_eof", gap=True)
 
     def poll(self, limit: int = 256) -> NativeBatch:
+        if type(limit) is not int or limit < 1:
+            raise ValueError("poll limit must be a positive integer")
         if not self._ended:
             try:
-                # One bounded read per poll; existing Python-buffered reads must
-                # not be mixed with this descriptor reader by the caller.
-                readable, _, _ = select.select([self._fd], [], [], 0)
-                if readable:
-                    chunk = os.read(self._fd, 65536)
-                    if chunk:
-                        self._pending.extend(chunk)
-                        while b"\n" in self._pending:
-                            raw, _, rest = self._pending.partition(b"\n")
-                            self._pending = bytearray(rest)
-                            if len(raw) > MAX_EVENT_BYTES:
-                                raise ValueError("native line exceeds byte limit")
-                            self._line(bytes(raw).removesuffix(b"\r"))
-                            if self._ended:
-                                self._pending.clear()
-                                break
-                        if len(self._pending) > MAX_EVENT_BYTES:
-                            raise ValueError("native line exceeds byte limit")
-                    else:
-                        # EOF is not a completed agent turn, nor a complete SSE
-                        # frame. A final non-newline NDJSON object is valid.
-                        if self._pending and self._format == "ndjson":
-                            self._line(bytes(self._pending))
-                        self._pending.clear()
-                        self._ended = True
-                        self.disconnect("source_eof", gap=True)
-            except (OSError, ValueError, TypeError, RecursionError):
+                if self._handle_failed():
+                    self._ended = True
+                    self.disconnect("source_failed", gap=True)
+                else:
+                    self._poll_limit = limit
+                    self._admitted = 0
+                    eof = False
+                    if b"\n" not in self._pending and not self._frame_ready:
+                        # One bounded read per poll; existing Python-buffered reads must
+                        # not be mixed with this descriptor reader by the caller.
+                        readable, _, _ = select.select([self._fd], [], [], 0)
+                        if readable:
+                            chunk = os.read(self._fd, 65536)
+                            if chunk:
+                                self._pending.extend(chunk)
+                            else:
+                                eof = True
+                    if not self._ended:
+                        self._admit_ready()
+                    if eof and not self._ended:
+                        self._finish_eof()
+                    if not self._ended and b"\n" not in self._pending and len(self._pending) > MAX_EVENT_BYTES:
+                        raise ValueError("native line exceeds byte limit")
+            except (OSError, ValueError, TypeError, RecursionError, OverflowError):
                 self._ended = True
                 self.disconnect("invalid_event", gap=True)
         return super().poll(limit)
@@ -196,4 +340,6 @@ class NativeJSONSource(NativeEventSource):
         self._ended = True
         self._pending.clear()
         self._data.clear()
+        self._data_size = 0
+        self._frame_ready = False
         super().close()

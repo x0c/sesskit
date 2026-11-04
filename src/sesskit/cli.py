@@ -955,6 +955,77 @@ def _describe_command(spec: dict, full: bool) -> dict:
 COMMANDS[-1]["handler"] = cmd_describe
 
 
+def _recover_stream_session_ref(argv: list[str], stream_parser) -> str:
+    """Recover the session positional for pre-start stream errors.
+
+    Scans ``argv`` (full dispatch argv starting with ``"stream"``) using the
+    live stream subparser's registered option arity, so ``--max-events 10``,
+    ``--input`` paths and opaque ``--cursor`` JSON are never mistaken for the
+    session ref. Returns ``"unknown"`` when genuinely ambiguous.
+    """
+    if not argv or argv[0] != "stream":
+        return "unknown"
+    opt_arity: dict[str, int] = {}
+    actions = getattr(stream_parser, "_actions", None) if stream_parser is not None else None
+    if actions is None:
+        return "unknown"
+    for action in actions:
+        option_strings = getattr(action, "option_strings", None) or []
+        if not option_strings:
+            continue
+        nargs = getattr(action, "nargs", None)
+        if nargs == 0:
+            arity = 0
+        elif nargs is None:
+            arity = 1
+        else:  # Variadic/unknown arity: refuse to guess.
+            return "unknown"
+        for opt in option_strings:
+            opt_arity[opt] = arity
+    candidates: list[str] = []
+    uncertain = False
+    tokens = list(argv[1:])
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":
+            candidates.extend(tokens[i + 1:])
+            break
+        if tok.startswith("-") and tok != "-":
+            if "=" in tok:
+                # --option=value: value can never be the session ref.
+                i += 1
+                continue
+            arity = opt_arity.get(tok)
+            if arity is None:
+                # Unknown option: skip a following non-flag token, which may
+                # be its value, so it is never mistaken for the session ref.
+                i += 1
+                if i < len(tokens) and (tokens[i] == "-" or not tokens[i].startswith("-")):
+                    i += 1
+                    uncertain = True
+                continue
+            if arity == 0:
+                i += 1
+                continue
+            # Known single-value option: consume its value unconditionally;
+            # option values are never session candidates.
+            i += 1
+            if i < len(tokens):
+                i += 1
+            continue
+        candidates.append(tok)
+        i += 1
+    if len(candidates) != 1:
+        return "unknown"
+    cand = candidates[0]
+    if not cand or cand == "-" or cand.startswith("-"):
+        return "unknown"
+    if uncertain:
+        return "unknown"
+    return cand
+
+
 def build_parser() -> JSONArgumentParser:
     parser = JSONArgumentParser(prog="sesskit", description="Read/parse/export local coding-agent sessions")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -975,7 +1046,18 @@ def dispatch(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     parser._stream_errors = bool(argv and argv[0] == "stream")
-    parser._stream_ref = argv[1] if len(argv) > 1 and not argv[1].startswith("-") else "unknown"
+    _stream_subparser = None
+    for _action in parser._actions:
+        if isinstance(_action, argparse._SubParsersAction):
+            _stream_subparser = _action.choices.get("stream")
+            break
+    if argv and argv[0] == "stream":
+        _stream_ref = _recover_stream_session_ref(argv, _stream_subparser)
+    else:
+        _stream_ref = "unknown"
+    parser._stream_ref = _stream_ref
+    if _stream_subparser is not None:
+        _stream_subparser._stream_ref = _stream_ref
     args = parser.parse_args(argv)
     compact = bool(getattr(args, "compact", False) or getattr(args, "json", False) or args.command == "stream")
     registry = default_registry()
