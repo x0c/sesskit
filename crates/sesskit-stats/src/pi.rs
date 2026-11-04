@@ -82,8 +82,10 @@ fn active_branch(bytes: &[u8]) -> Option<(HashSet<Vec<u8>>, bool)> {
         parent.insert(id, parent_id);
         if is_message {
             messages.insert(id);
-            if memchr::memmem::find(line, b"\"role\":\"user\"").is_some() {
-                users.insert(id);
+            if let Some(Raw::Obj(m)) = jsonl::top_level(line, [b"message"])[0] {
+                if jsonl::top_level(m, [b"role"])[0].and_then(Raw::str) == Some("user") {
+                    users.insert(id);
+                }
             }
         }
         last = Some(id);
@@ -116,7 +118,10 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
     if b.excluded.is_none() {
         let has_user = match &branch {
             Some((_, has_user)) => *has_user,
-            None => memchr::memmem::find(&bytes, b"\"role\":\"user\"").is_some(),
+            None => jsonl::lines(&bytes, 0).any(|l| match jsonl::top_level(l, [b"message"])[0] {
+                Some(Raw::Obj(m)) => jsonl::top_level(m, [b"role"])[0].and_then(Raw::str) == Some("user"),
+                _ => false,
+            }),
         };
         if !has_user {
             b.excluded = Some("empty_history");

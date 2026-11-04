@@ -164,7 +164,7 @@ fn is_user_prompt(entry: &Value) -> bool {
 fn skipped_has_prompt(bytes: &[u8], from: usize) -> bool {
     from > 0
         && jsonl::lines(&bytes[..from], 0)
-            .filter(|l| memchr::memmem::find(l, b"\"user").is_some())
+            .filter(|l| jsonl::contains(l, b"user"))
             .filter_map(jsonl::parse)
             .any(|e| is_user_prompt(&e))
 }
@@ -208,10 +208,11 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
             }
         }
         let needs_usage = kind == Some("token_usage_record")
-            || (kind == Some("event_msg") && jsonl::contains(p, b"\"info\":{"));
+            || (kind == Some("event_msg") && matches!(jsonl::top_level(p, [b"info"])[0], Some(Raw::Obj(_))));
         let needs_prompt = !has_prompt
             && ((kind == Some("event_msg") && ptype == Some("user_message"))
-                || (kind == Some("response_item") && jsonl::contains(p, b"\"role\":\"user\"")));
+                || (kind == Some("response_item")
+                    && jsonl::top_level(p, [b"role"])[0].and_then(Raw::str) == Some("user")));
         if needs_usage || needs_prompt {
             if let Some(entry) = jsonl::parse(line) {
                 if needs_prompt {

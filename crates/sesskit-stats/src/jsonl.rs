@@ -36,12 +36,27 @@ pub fn parse_ts(value: Option<&Value>) -> Option<f64> {
     Some(parsed.unix_timestamp_nanos() as f64 / 1e9)
 }
 
-/// Cheap timestamp probe for window pruning: the first `"timestamp":"..."`
-/// value on a line, without decoding the whole record.
+/// Cheap timestamp probe for window pruning: the first `"timestamp"` string
+/// value on a line (whitespace around the colon allowed), without decoding
+/// the whole record.
 pub fn probe_ts(line: &[u8]) -> Option<f64> {
-    const KEY: &[u8] = b"\"timestamp\":\"";
-    let at = memchr::memmem::find(line, KEY)? + KEY.len();
-    let rest = &line[at..];
+    const KEY: &[u8] = b"\"timestamp\"";
+    let mut at = memchr::memmem::find(line, KEY)? + KEY.len();
+    let skip = |at: &mut usize| {
+        while *at < line.len() && line[*at].is_ascii_whitespace() {
+            *at += 1;
+        }
+    };
+    skip(&mut at);
+    if line.get(at) != Some(&b':') {
+        return None;
+    }
+    at += 1;
+    skip(&mut at);
+    if line.get(at) != Some(&b'"') {
+        return None;
+    }
+    let rest = &line[at + 1..];
     let close = memchr::memchr(b'"', rest)?;
     let text = std::str::from_utf8(&rest[..close]).ok()?;
     OffsetDateTime::parse(text, &Rfc3339).ok().map(|t| t.unix_timestamp_nanos() as f64 / 1e9)
@@ -78,7 +93,9 @@ pub fn window_offset(bytes: &[u8], start: f64) -> usize {
     };
     match line_at(0) {
         Some((_, _, Some(ts))) if ts >= start => return 0,
-        None => return 0,
+        // No probe-able timestamp near the head: read everything rather than
+        // risk skipping a history whose timestamps the probe cannot see.
+        Some((_, _, None)) | None => return 0,
         _ => {}
     }
     let (mut lo, mut hi) = (0usize, bytes.len());
@@ -100,11 +117,15 @@ pub fn window_offset(bytes: &[u8], start: f64) -> usize {
     // Linear finish inside the last small span; back up to a line start.
     let begin = memchr::memrchr(b'\n', &bytes[..lo]).map(|i| i + 1).unwrap_or(0);
     let mut cur = begin;
+    let mut last_untimed: Option<usize> = None;
     while cur < bytes.len() {
         let stop = memchr::memchr(b'\n', &bytes[cur..]).map(|i| cur + i).unwrap_or(bytes.len());
-        if let Some(ts) = probe_ts(&bytes[cur..stop]) {
-            if ts >= start {
-                return cur;
+        match probe_ts(&bytes[cur..stop]) {
+            Some(ts) if ts >= start => return last_untimed.unwrap_or(cur),
+            Some(_) => last_untimed = None,
+            // Untimed rows right before the first in-window row belong to it.
+            None => {
+                last_untimed.get_or_insert(cur);
             }
         }
         cur = stop + 1;
@@ -267,6 +288,19 @@ pub fn contains(line: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_and_pruning_tolerate_spaced_json() {
+        assert!(probe_ts(br#"{"type": "user", "timestamp" : "2026-11-02T12:00:00Z"}"#).is_some());
+        let body = br#"{"type": "x", "timestamp": "2026-11-02T12:00:00Z"}
+{"type": "x", "timestamp": "2026-11-03T12:00:00Z"}
+"#;
+        let start = probe_ts(br#""timestamp":"2026-11-03T00:00:00Z""#).unwrap();
+        let off = window_offset(body, start);
+        assert!(off > 0 && off < body.len());
+        // No probe-able timestamps at all: read the whole file.
+        assert_eq!(window_offset(b"{\"a\":1}\n{\"b\":2}\n", start), 0);
+    }
 
     #[test]
     fn top_level_skips_nested_values() {

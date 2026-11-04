@@ -197,7 +197,7 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
         // The first prompt may sit between the head and the window: check the
         // skipped region's user rows only (rare path).
         has_prompt = jsonl::lines(&bytes[..from], 0)
-            .filter(|l| memchr::memmem::find(l, b"\"type\":\"user\"").is_some())
+            .filter(|l| jsonl::top_level(l, [b"type"])[0].and_then(Raw::str) == Some("user"))
             .filter_map(jsonl::parse)
             .any(|e| is_user_prompt(&e));
     }
