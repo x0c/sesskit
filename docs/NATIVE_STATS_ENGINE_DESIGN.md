@@ -155,8 +155,13 @@ row. Measured warm on the owner's machine (load average 6–10): 7 days
 days await the incremental cache (§4).
 
 Accepted listing difference: the Python Claude listing hides sessions whose
-only prompts are low-value titles (for example a lone greeting) as title noise;
-the engine counts them (they carry real prompts; typically zero tokens).
+only prompt is a low-value title (for example a lone greeting) as title noise;
+the engine keeps them because they hold a real prompt. The three such sessions
+found on 2026-11-04 report zero tokens because Claude Code never called the
+model: their only assistant rows are local `<synthetic>` errors ("Login
+expired", "You've hit your weekly limit") with all-zero usage. A greeting that
+reaches the model always consumes input (system prompt, context, the message)
+and output tokens; zero is evidence of no model call, not of a cheap one.
 
 Parity on the owner's real histories (7-day window, harness
 `crates/sesskit-stats/scripts/parity.py`, Python run against the committed
