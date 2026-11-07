@@ -52,6 +52,7 @@ sesskit = "sesskit.cli:main"
 manifest-path = "Cargo.toml"
 python-source = "src"
 module-name = "sesskit._native"
+exclude = ["TASKBOARD.md", "build/**"]
 include = [
   { path = "AGENTS.md", format = "sdist" },
   { path = "README.zh-CN.md", format = "sdist" },

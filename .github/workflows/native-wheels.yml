@@ -40,7 +40,7 @@ jobs:
       - name: Prepare declared build and test tools
         run: |
           python -m pip install 'maturin==1.16.0' 'pytest==9.1.1' 'ruff==0.16.1' 'setuptools>=77' wheel
-          rustup toolchain install 1.95.0 --profile minimal
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
           rustup default 1.95.0
           if [ "${RUNNER_OS}" = Linux ]; then python -m pip install 'ziglang==0.15.2'; fi
       - name: Build native wheel and complete source distribution

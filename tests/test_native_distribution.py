@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -36,6 +37,25 @@ def test_cargo_and_python_versions_match():
     cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
     assert f'version = "{sesskit.__version__}"' in cargo
     assert '"abi3-py310"' in cargo
+
+
+def test_source_archive_rejects_internal_coordination_and_build_copies(tmp_path):
+    source = tmp_path / "sesskit-0.3.0.tar.gz"
+    required = ("pyproject.toml", "Cargo.toml", "Cargo.lock",
+                "crates/sesskit-python/src/lib.rs", "crates/sesskit-stats/src/projection.rs")
+    with tarfile.open(source, "w:gz") as archive:
+        for name in (*required, "TASKBOARD.md", "build/lib/sesskit/cli.py"):
+            member = tarfile.TarInfo(f"sesskit-0.3.0/{name}")
+            member.size = 0
+            archive.addfile(member)
+    with pytest.raises(RuntimeError, match="internal/build"):
+        builder.check_sdist(source, "0.3.0")
+    with tarfile.open(source, "w:gz") as archive:
+        for name in required:
+            member = tarfile.TarInfo(f"sesskit-0.3.0/{name}")
+            member.size = 0
+            archive.addfile(member)
+    builder.check_sdist(source, "0.3.0")
 
 
 @pytest.mark.parametrize("fault", [None, "missing", "tag", "pure"])

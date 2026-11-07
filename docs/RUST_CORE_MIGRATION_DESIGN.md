@@ -105,6 +105,9 @@ substitute.
   implicitly produced a spurious missing-root-manifest diagnostic during sdist
   creation; selecting it explicitly lost the root Python project. Source
   distribution rebuild is an acceptance gate, not just archive membership.
+  Internal `TASKBOARD.md` and local `build/` copies are excluded explicitly and
+  rejected by the release builder. The CI toolchain installs Clippy explicitly;
+  a minimal Rust profile alone does not provide that required diagnostic.
 - Native/source backend: Maturin. `scripts/build_release.py --out <directory>
   --pure --sdist` builds the local native wheel, an explicit setuptools-built
   compatibility wheel and the source distribution. Build release artifacts

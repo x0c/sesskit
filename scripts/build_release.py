@@ -12,6 +12,7 @@ import argparse
 import html
 import subprocess
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -28,6 +29,20 @@ def version() -> str:
 
 def run(*command: str, env: dict | None = None) -> None:
     subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def check_sdist(path: Path, release_version: str) -> None:
+    """Reject build copies or internal coordination files in published source."""
+    with tarfile.open(path, "r:gz") as archive:
+        names = archive.getnames()
+    required = ("pyproject.toml", "Cargo.toml", "Cargo.lock",
+                "crates/sesskit-python/src/lib.rs", "crates/sesskit-stats/src/projection.rs")
+    for name in required:
+        if f"sesskit-{release_version}/{name}" not in names:
+            raise RuntimeError(f"source distribution is missing {name}")
+    forbidden = [name for name in names if "/build/" in name or name.endswith("/TASKBOARD.md")]
+    if forbidden:
+        raise RuntimeError(f"source distribution contains internal/build files: {forbidden[:3]}")
 
 
 def write_index(out: Path, release_version: str) -> Path:
@@ -76,6 +91,7 @@ def main() -> None:
                     raise RuntimeError("compatibility wheel unexpectedly contains native code")
         if args.sdist:
             run(sys.executable, "-m", "maturin", "sdist", "--out", str(out))
+            check_sdist(out / f"sesskit-{release_version}.tar.gz", release_version)
     index = write_index(out, release_version)
     print(f"built/indexed sesskit {release_version}: {index}")
 
