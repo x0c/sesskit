@@ -117,10 +117,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build sdist and wheel from tag source
+      - name: Build sdist and wheels from tag source
         run: |
-          python -m pip install --upgrade build
-          python -m build --outdir dist source
+          python -m pip install 'maturin==1.16.0' 'setuptools>=77' wheel 'ziglang==0.15.2'
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          cd source
+          python scripts/build_release.py --out ../dist --zig --pure --sdist
 
       - name: Gate on local artifact check (trusted helper)
         run: |

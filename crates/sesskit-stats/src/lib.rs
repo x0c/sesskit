@@ -8,6 +8,7 @@ pub mod codex;
 pub mod jsonl;
 pub mod opencode;
 pub mod pi;
+pub mod projection;
 pub mod session;
 pub mod usage;
 

@@ -10,3 +10,6 @@ build/
 venv/
 .DS_Store
 crates/*/target/
+/target/
+src/sesskit/*.so
+src/sesskit/*.pyd

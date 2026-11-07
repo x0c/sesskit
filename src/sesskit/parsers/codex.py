@@ -292,7 +292,7 @@ def _read_session_head(path: str, max_lines: int = 128) -> list[dict]:
     return entries
 
 
-def _read_session_tail(path: str, max_bytes: int = 8192) -> list[dict]:
+def _read_session_tail(path: str, max_bytes: int = 8192, *, excerpt: bool = False) -> list[dict]:
     """读取文件尾部若干字节，解析 JSONL 条目。"""
     entries: list[dict] = []
     try:
@@ -304,6 +304,10 @@ def _read_session_tail(path: str, max_bytes: int = 8192) -> list[dict]:
         lines = data.splitlines()
         if offset > 0:
             lines = lines[1:]  # 第一行可能截断，跳过
+        if excerpt:
+            from sesskit.native_projection import project_records
+
+            lines = project_records(lines, "codex_excerpt")
         for line in lines:
             line = line.strip()
             if not line:
@@ -324,7 +328,7 @@ def _backfill_activity_time(path: str) -> float | None:
     """Recover a clock evicted by metadata; never widen terminal evidence."""
     size = os.path.getsize(path)
     for window in _BACKFILL_WINDOWS:
-        for entry in reversed(_read_session_tail(path, max_bytes=window)):
+        for entry in reversed(_read_session_tail(path, max_bytes=window, excerpt=True)):
             stamp = _activity_time(entry)
             if stamp is not None:
                 return stamp
@@ -339,7 +343,7 @@ def _backfill_excerpts(path: str) -> tuple[str | None, str | None]:
     size = os.path.getsize(path)
     for window in _BACKFILL_WINDOWS:
         user = agent = None
-        for entry in reversed(_read_session_tail(path, max_bytes=window)):
+        for entry in reversed(_read_session_tail(path, max_bytes=window, excerpt=True)):
             user = user or _user_message_text(entry) or None
             agent = agent or _assistant_message_text(entry) or None
             if user and agent:

@@ -1,0 +1,22 @@
+[package]
+name = "sesskit-python"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Python bindings for the shared SessKit Rust core"
+repository = "https://github.com/x0c/sesskit"
+
+[lib]
+name = "_native"
+path = "crates/sesskit-python/src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.30.1", features = ["abi3-py310", "extension-module"] }
+sesskit-stats = { path = "crates/sesskit-stats" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

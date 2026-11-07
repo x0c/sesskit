@@ -764,13 +764,16 @@ def _build_session_info_v2(
     """
     session_id = str(row["id"])
     msg_rows = conn.execute(_V2_MESSAGES_SQL, (session_id,)).fetchall()
+    from sesskit.native_projection import project_records
+
+    projected = project_records([item["data"] for item in msg_rows], "opencode_list")
     typed_rows: list[tuple[str, dict]] = []
     user_texts: list[str] = []
     goal_texts: list[str] = []
     assistant_datas: list[dict] = []
     last_anchor = ""
-    for msg_row in msg_rows:
-        data = _v2_json_dict(msg_row["data"])
+    for msg_row, raw in zip(msg_rows, projected, strict=True):
+        data = _v2_json_dict(raw)
         row_type = str(msg_row["type"] or "")
         typed_rows.append((row_type, data))
         if row_type == "user":

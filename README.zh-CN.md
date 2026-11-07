@@ -31,14 +31,17 @@ SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装指定版本的 
 需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。暂不支持 Windows。
 
 ```bash
-python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.25/sesskit-0.2.25-py3-none-any.whl"
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/download/v0.3.0/wheels.html" "sesskit==0.3.0"
 python -m sesskit describe
 ```
 
 macOS 和 Linux 使用相同命令，无需 Git 或本地构建工具。
 尚无虚拟环境时，先运行 `python3 -m venv .venv && . .venv/bin/activate`。
-只使用 CLI 时，可将同一个 wheel URL 交给 `pipx install`。参与源码开发时，
-克隆仓库后运行 `python -m pip install -e .`。
+安装器会优先选择适配 macOS/Linux、Apple Silicon、Intel/AMD 或 ARM64 的
+Rust 加速 wheel；没有适配产物时使用纯 Python 兼容 wheel。现有 Python API
+与 JSON 输出保持不变。设置 `SESSKIT_NATIVE=0` 可使用 Python 路径。
+源码构建需要 Rust 1.88+，安装预编译 wheel 则不需要。
+参与源码开发时，克隆仓库后运行 `python -m pip install -e .`。
 
 ## 快速开始
 

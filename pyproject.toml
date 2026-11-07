@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
 
 [project]
 name = "sesskit"
-version = "0.2.25"
+version = "0.3.0"
 description = "Parse and export local Claude Code, Codex CLI, and Cursor agent session files from disk. Python transcript parser library and JSON CLI — not a TUI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -48,6 +48,24 @@ Issues = "https://github.com/x0c/sesskit/issues"
 [project.scripts]
 sesskit = "sesskit.cli:main"
 
+[tool.maturin]
+manifest-path = "Cargo.toml"
+python-source = "src"
+module-name = "sesskit._native"
+include = [
+  { path = "AGENTS.md", format = "sdist" },
+  { path = "README.zh-CN.md", format = "sdist" },
+  { path = "MANIFEST.in", format = "sdist" },
+  { path = "uv.lock", format = "sdist" },
+  { path = "docs/**/*.md", format = "sdist" },
+  { path = "examples/*.py", format = "sdist" },
+  { path = "scripts/*.py", format = "sdist" },
+  { path = "tests/*.py", format = "sdist" },
+  { path = "schemas/*.json", format = "sdist" },
+  { path = ".github/**/*.yml", format = "sdist" },
+]
+
+# Used only to build the explicit pure-Python compatibility wheel.
 [tool.setuptools]
 package-dir = {"" = "src"}
 

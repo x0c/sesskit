@@ -32,14 +32,17 @@ SessKit is not on PyPI yet. Install the fixed-release wheel in your project's vi
 Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not supported on Windows.
 
 ```bash
-python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.25/sesskit-0.2.25-py3-none-any.whl"
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/download/v0.3.0/wheels.html" "sesskit==0.3.0"
 python -m sesskit describe
 ```
 
 The same command works on macOS and Linux; no Git or local build tools are needed.
 Need a virtual environment first? Run `python3 -m venv .venv && . .venv/bin/activate`.
-For a standalone CLI, use `pipx install` with the same wheel URL. For source
-contributions, clone the repository and run `python -m pip install -e .`.
+The installer selects a prebuilt Rust-accelerated wheel for macOS/Linux on
+Apple Silicon, Intel/AMD or ARM64 where available, or a pure-Python compatibility
+wheel. Existing Python APIs and JSON output are unchanged. Set `SESSKIT_NATIVE=0`
+to use the Python path. Source builds require Rust 1.88+; wheel installs do not.
+For source contributions, clone the repository and run `python -m pip install -e .`.
 
 ## Quick start
 

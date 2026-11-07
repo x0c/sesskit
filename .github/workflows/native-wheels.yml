@@ -1,0 +1,95 @@
+name: native-wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Exact committed source ref to build and verify"
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-wheels-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6, node24
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6, node24
+        with:
+          python-version: "3.10"
+      - name: Prepare declared build and test tools
+        run: |
+          python -m pip install 'maturin==1.16.0' 'pytest==9.1.1' 'ruff==0.16.1' 'setuptools>=77' wheel
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          if [ "${RUNNER_OS}" = Linux ]; then python -m pip install 'ziglang==0.15.2'; fi
+      - name: Build native wheel and complete source distribution
+        shell: bash
+        run: |
+          if [ "${RUNNER_OS}" = Linux ]; then
+            python scripts/build_release.py --out dist --target '${{ matrix.target }}' --zig --pure --sdist
+          else
+            python scripts/build_release.py --out dist --target '${{ matrix.target }}' --pure --sdist
+          fi
+          VERSION=$(python -c 'import re; print(re.search(r"^version = \"([^\"]+)\"", open("pyproject.toml").read(), re.M)[1])')
+          for WHEEL in dist/*.whl; do
+            python scripts/publish.py check-dist --version "$VERSION" --dist dist --wheel "$(basename "$WHEEL")"
+          done
+          python -m maturin build --release --locked --sdist --interpreter python --out /tmp/sesskit-sdist
+      - name: Verify compatibility wheel outside the checkout
+        run: |
+          python -m venv /tmp/sesskit-pure
+          /tmp/sesskit-pure/bin/python -m pip install --no-index dist/*-py3-none-any.whl
+          cd /tmp
+          /tmp/sesskit-pure/bin/python -c 'from sesskit.native_projection import native_available; assert not native_available()'
+      - name: Lint and native Rust tests
+        run: |
+          python -m ruff check src tests scripts/build_release.py
+          cargo test --locked --manifest-path crates/sesskit-stats/Cargo.toml
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Install native wheel and run Python 3.10 tests
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall dist/*-cp310-abi3-*.whl
+          python -c 'from sesskit.native_projection import native_available; assert native_available()'
+          python -m pytest -q --override-ini=pythonpath=
+          SESSKIT_NATIVE=0 python -m pytest -q --override-ini=pythonpath=
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6, node24
+        with:
+          python-version: "3.15"
+      - name: Install native wheel and run Python 3.15 tests
+        shell: bash
+        run: |
+          python -m pip install 'pytest==9.1.1' dist/*-cp310-abi3-*.whl
+          python -c 'from sesskit.native_projection import native_available; assert native_available()'
+          python -m pytest -q --override-ini=pythonpath=
+      - name: Preserve versioned artifacts and exact source identity
+        shell: bash
+        run: |
+          git rev-parse HEAD > dist/source-commit.txt
+          python -c 'import hashlib,pathlib; p=pathlib.Path("dist"); fs=sorted(f for f in p.iterdir() if f.suffix in (".whl", ".gz")); (p/"SHA256SUMS").write_text("".join(hashlib.sha256(f.read_bytes()).hexdigest()+"  "+f.name+"\n" for f in fs))'
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6, node24
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error

@@ -21,6 +21,7 @@ Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`
 - `docs/STREAMING_OUTPUT_KNOWLEDGE_BASE.md`: Six-runtime live-output research, native source pins and attachment limits, plus the adopted third-party streaming and automatic-degradation requirements.
 - `docs/MESSAGE_STREAMING_GUIDE.md`: Python/JSONL message-stream integration, host-supplied native feed formats, automatic history degradation, upsert/reset/cursor semantics, budgets, detach/privacy limits and source-release availability.
 - `docs/NATIVE_STATS_ENGINE_DESIGN.md`: Multi-core Rust activity/usage projection over a time window (sub-second target), record-time attribution, parity rules against the Python reference, performance design and verification.
+- `docs/RUST_CORE_MIGRATION_DESIGN.md`: Gradual Rust-core replacement, Python compatibility, measured first-release scope, differential verification and installed-release acceptance.
 - `docs/LISTING_CLI_EXPORT_KNOWLEDGE_BASE.md`: Snapshot CLI/export surface and the separate JSONL stream route: output contracts, reference resolution, excerpt rules, stream entry points and atomic write safety.
 
 ## Hard constraints (agent)
@@ -41,7 +42,7 @@ Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`
 | Runtime session parsing | src/sesskit/parsers/ |
 | Unified abstraction layer | src/sesskit/models.py, src/sesskit/registry.py, src/sesskit/transcript.py, src/sesskit/activity.py |
 | Listing, CLI and export surface | src/sesskit/cli.py, src/sesskit/registry.py, schemas/ |
-| Distribution and versioning | pyproject.toml, schemas/ |
+| Distribution and versioning | pyproject.toml, Cargo.toml, scripts/build_release.py, schemas/ |
 
 ## 待补充知识库（doc-init backlog）
 

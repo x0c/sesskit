@@ -20,7 +20,7 @@ recipes, not additional stable CLI commands or a new typed JSON schema.
 Use the [message streaming guide](MESSAGE_STREAMING_GUIDE.md) for the additive
 Python `open_message_stream` API, caller-owned native feed bridge, and
 `sesskit stream` JSONL protocol. Missing or failed live inputs degrade to existing
-history automatically. The v0.2.25 wheel below includes this surface; existing
+history automatically. The v0.3.0 release below includes this surface; existing
 snapshot command envelopes and schemas remain unchanged.
 
 ## Install a fixed release
@@ -30,18 +30,19 @@ project's virtual environment and install the published wheel. If you need a new
 environment, run `python3 -m venv .venv && . .venv/bin/activate` first.
 
 ```bash
-python -m pip install "https://github.com/x0c/sesskit/releases/download/v0.2.25/sesskit-0.2.25-py3-none-any.whl"
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/download/v0.3.0/wheels.html" "sesskit==0.3.0"
 python -m sesskit describe
 ```
 
 This avoids Git and local build tools. Use the same interpreter for installation
-and your application. For a standalone CLI, `pipx install` accepts the same wheel
-URL. Windows is not a supported platform.
+and your application. The index selects a compatible prebuilt Rust wheel or the
+pure-Python fallback. Set `SESSKIT_NATIVE=0` to disable native projection; public
+API and JSON contracts are unchanged. Windows is not a supported platform.
 
 The example files live in the repository's `examples/` directory and source
 archives; wheels install only the library and CLI. The original search,
 activity-usage and follow recipes, usage calibration, and historical-performance
-additions below work with the fixed v0.2.25 release. No `PYTHONPATH` override is
+additions below work with the fixed v0.3.0 release. No `PYTHONPATH` override is
 needed. Review output locally: export and follow output may
 contain private prompts, code, tool output, or credentials from native history.
 Nothing is uploaded automatically. Do not redirect output onto native history.

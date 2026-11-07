@@ -102,7 +102,7 @@ def _read_head(path: str, max_lines: int = 300) -> list[dict]:
     return entries
 
 
-def _read_tail(path: str, max_bytes: int = 65536) -> list[dict]:
+def _read_tail(path: str, max_bytes: int = 65536, *, excerpt: bool = False) -> list[dict]:
     """读取文件尾部若干字节，解析 JSONL 条目（用于判末轮角色 + 补抓晚出现的 ai-title）。"""
     entries: list[dict] = []
     try:
@@ -114,6 +114,10 @@ def _read_tail(path: str, max_bytes: int = 65536) -> list[dict]:
         lines = data.splitlines()
         if offset > 0:
             lines = lines[1:]  # 第一行可能截断，跳过
+        if excerpt:
+            from sesskit.native_projection import project_records
+
+            lines = project_records(lines, "claude_excerpt")
         for line in lines:
             line = line.strip()
             if not line:
@@ -160,7 +164,7 @@ def _backfill_excerpts(fpath: str) -> tuple[str | None, str | None]:
     user = agent = None
     size = os.path.getsize(fpath)
     for window in _BACKFILL_WINDOWS:
-        user, agent = _last_texts(_read_tail(fpath, max_bytes=window))
+        user, agent = _last_texts(_read_tail(fpath, max_bytes=window, excerpt=True))
         if agent or window >= size:
             break
     return user, agent

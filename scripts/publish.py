@@ -41,6 +41,7 @@ import tempfile
 import urllib.request
 import zipfile
 from email.parser import Parser
+from itertools import product
 from pathlib import Path
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
@@ -202,14 +203,38 @@ def check_metadata(name: str, version: str, want_version: str, label: str) -> No
         raise PublishError(f"{label}: embedded version is {version!r}, want {want_version!r}")
 
 
+def check_native_wheel(wheel_path: Path) -> None:
+    """Require native contents and WHEEL tags matching the advertised filename."""
+    parts = wheel_path.name.removesuffix(".whl").split("-")
+    expected_tags = {"-".join(tag) for tag in product(*(part.split(".") for part in parts[-3:]))}
+    try:
+        with zipfile.ZipFile(wheel_path) as archive:
+            names = archive.namelist()
+            metadata = [name for name in names if name.endswith(".dist-info/WHEEL")]
+            if len(metadata) != 1:
+                raise PublishError(f"{wheel_path.name}: want exactly one WHEEL metadata file")
+            fields = Parser().parsestr(archive.read(metadata[0]).decode("utf-8"))
+            if fields.get("Root-Is-Purelib", "").lower() != "false":
+                raise PublishError(f"{wheel_path.name}: native wheel is mislabeled as pure Python")
+            if not expected_tags.issubset(set(fields.get_all("Tag", []))):
+                raise PublishError(f"{wheel_path.name}: filename and WHEEL tags disagree")
+            if not any(name.startswith("sesskit/_native") and name.endswith((".so", ".pyd")) for name in names):
+                raise PublishError(f"{wheel_path.name}: native extension is missing")
+    except (OSError, zipfile.BadZipFile, UnicodeDecodeError) as exc:
+        raise PublishError(f"{wheel_path.name}: cannot inspect native wheel: {exc}") from exc
+
+
 def check_dist_files(wheel_path: Path, sdist_path: Path, version: str) -> dict[str, str]:
     """Validate a local wheel+sdist pair. No network, no side effects."""
-    if wheel_path.name != WHEEL_NAME.format(version=version):
+    wheel_pattern = rf"sesskit-{re.escape(version)}-(?:[0-9][A-Za-z0-9_]*-)?[A-Za-z0-9_.]+-[A-Za-z0-9_.]+-[A-Za-z0-9_.]+\.whl"
+    if re.fullmatch(wheel_pattern, wheel_path.name) is None:
         raise PublishError(f"wheel filename {wheel_path.name!r} does not match version {version}")
     if sdist_path.name != SDIST_NAME.format(version=version):
         raise PublishError(f"sdist filename {sdist_path.name!r} does not match version {version}")
     wheel_name, wheel_version = wheel_metadata_version(wheel_path)
     check_metadata(wheel_name, wheel_version, version, f"wheel {wheel_path.name}")
+    if wheel_path.name != WHEEL_NAME.format(version=version):
+        check_native_wheel(wheel_path)
     sdist_name, sdist_version, top_dir = sdist_metadata_version(sdist_path, version)
     check_metadata(sdist_name, sdist_version, version, f"sdist {sdist_path.name}")
     want_top = f"sesskit-{version}"
@@ -244,10 +269,13 @@ def clean_install_smoke(wheel_path: Path, version: str, work_dir: Path) -> None:
     proc = subprocess.run(install_cmd, capture_output=True, check=False, text=True, timeout=SUBPROCESS_TIMEOUT)
     if proc.returncode != 0:
         raise PublishError(f"clean install failed: {proc.stderr.strip()[-2000:]}")
+    native = wheel_path.name != WHEEL_NAME.format(version=version)
     check = (
         "import sesskit; "
+        "from sesskit.native_projection import native_available; "
         f"assert sesskit.__version__ == {version!r}, sesskit.__version__; "
-        "print('smoke-ok', sesskit.__version__)"
+        f"assert native_available() is {native!r}, native_available(); "
+        "print('smoke-ok', sesskit.__version__, 'native', native_available())"
     )
     proc = subprocess.run(
         [str(venv_python), "-c", check], capture_output=True, check=False, text=True, timeout=SUBPROCESS_TIMEOUT
