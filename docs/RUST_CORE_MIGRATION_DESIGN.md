@@ -151,11 +151,20 @@ New workflow action pins were checked at their exact commits for `node24`.
   their exact persisted success/abnormal histories passed instead.
 - [x] Measured improvement on the actual replaced public path, as recorded
   above with frozen sources and identical normalized outputs.
+- [x] Migration source isolated, committed and pushed on `main` as `1e0a5ce`;
+  unrelated working-tree changes were left outside the commit.
 - [ ] Supported-platform artifacts and source distribution verified. Local
   ARM64 native and compatibility wheels install and execute, Python 3.10/3.15
   both load the extension, and the source archive rebuilds and installs its
-  native wheel. Native-runner ARM64/x86_64 verification is still required.
-- [ ] Source committed/pushed; downloaded release installed and exercised.
+  native wheel. The first four-runner `native-wheels` run (`42356384029`)
+  built the native/compatibility wheels and source distribution and passed
+  Ruff plus Rust tests on every runner, but all four jobs stopped before the
+  installed-wheel Python tests because the minimal Rust toolchain lacked
+  `cargo-clippy`. A working-tree follow-up adds `--component clippy`; at this
+  update it is neither part of `1e0a5ce` nor rerun. No four-platform artifact
+  pass is claimed.
+- [ ] `v0.3.0` tag and GitHub release published; downloaded release installed
+  and exercised. No `v0.3.0` release exists at this update.
 
 Native statistics interpretation and existing parity evidence remain owned by
 [NATIVE_STATS_ENGINE_DESIGN.md](NATIVE_STATS_ENGINE_DESIGN.md); session compatibility
