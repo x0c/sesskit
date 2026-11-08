@@ -45,6 +45,7 @@ fn observe(item: &Value, ts: Option<f64>, out: &mut Vec<Observation>) {
         scope_id: id,
         counter_name: None,
         model: model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
+        context_model: None,
         normalized: Normalized::inclusive(input, cache_read, cache_write, output, reasoning, total, cost),
         ts,
     });

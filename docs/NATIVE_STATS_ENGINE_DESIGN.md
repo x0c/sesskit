@@ -53,6 +53,23 @@ its own copy):
 - **Weekday × hour histogram:** interval seconds split at local hour
   boundaries for a caller-supplied UTC offset, indexed Monday = 0, hour 0–23.
 
+### Per-model window tokens (`SessionStats.window_models`, 2026-11-08)
+
+Each time-attributed contribution to `window_tokens` keeps the model of the
+reconciled record it came from (a folded cumulative counter uses its latest
+revision's model; an interval residual uses the interval record's model), so
+`window_models` sums exactly to `window_tokens`. Records without a model are
+reported under `None`; zero-token models (Claude `<synthetic>` local errors)
+are omitted. Model strings are native and verbatim; display shortening belongs
+to consumers.
+
+Codex `token_count` rows carry no model, so they are attributed to the model
+of the latest preceding `turn_context` (`payload.model`, falling back to
+`collaboration_mode.settings.model`), searching the pruned prefix backwards
+when the window skipped it. This attribution never enters reconcile keys, so
+deduplication and `window_tokens` are unchanged. Reasoning effort is not
+projected (owner decision: too sparse across runtimes).
+
 ### Why records carry timestamps
 
 The Python usage snapshot carries no time per record. Selecting in-window

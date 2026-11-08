@@ -49,6 +49,9 @@ pub struct SessionStats {
     pub activity: Vec<f64>,
     /// In-window token total attributed by native record time.
     pub window_tokens: i64,
+    /// `window_tokens` split by native model (`None` = no model recorded),
+    /// largest first; sums exactly to `window_tokens`, zero-token models omitted.
+    pub window_models: Vec<(Option<String>, i64)>,
     /// Tokens whose record carries no usable time (not attributed to any window).
     pub untimed_tokens: i64,
     /// `known_total` over every record read (the whole session in full mode).
@@ -77,9 +80,16 @@ impl Builder {
         let refs: Vec<&usage::Record> = records.iter().collect();
         let (known, parts) = usage::known_total(&refs);
         let (mut window_tokens, mut untimed) = (0i64, 0i64);
-        for Contribution { tokens, ts } in parts {
+        let mut models: Vec<(Option<String>, i64)> = Vec::new();
+        for Contribution { tokens, ts, model } in parts {
             match ts {
-                Some(t) if window.contains(t) => window_tokens += tokens,
+                Some(t) if window.contains(t) => {
+                    window_tokens += tokens;
+                    match models.iter_mut().find(|m| m.0 == model) {
+                        Some(m) => m.1 += tokens,
+                        None => models.push((model, tokens)),
+                    }
+                }
                 Some(_) => {}
                 None => untimed += tokens,
             }
@@ -93,6 +103,11 @@ impl Builder {
             excluded: self.excluded,
             activity: self.activity,
             window_tokens,
+            window_models: {
+                models.retain(|m| m.1 != 0);
+                models.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                models
+            },
             untimed_tokens: untimed,
             known_total: known,
             examined: self.examined,

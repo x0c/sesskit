@@ -134,6 +134,7 @@ fn observe(row: &Row, ts: Option<f64>, out: &mut Vec<Observation>) {
         scope_id: mid,
         counter_name: None,
         model: model_name,
+        context_model: None,
         normalized: Normalized {
             input_total,
             input_uncached: input,

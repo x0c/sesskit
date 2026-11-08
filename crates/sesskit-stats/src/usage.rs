@@ -85,6 +85,9 @@ pub struct Observation {
     pub scope_id: Option<String>,
     pub counter_name: Option<String>,
     pub model: Option<String>,
+    /// Model inferred from surrounding context (Codex `turn_context`) for
+    /// per-model attribution only; never part of reconcile keys.
+    pub context_model: Option<String>,
     pub normalized: Normalized,
     /// Native record time (epoch seconds) of the row carrying this usage.
     pub ts: Option<f64>,
@@ -105,6 +108,8 @@ pub struct Record {
     pub turn_id: Option<String>,
     pub counter_name: Option<String>,
     pub normalized: Normalized,
+    /// Native model, else the context model, for per-model attribution.
+    pub model: Option<String>,
     pub ts: Option<f64>,
     /// Stable position, used where the reference keys groups by usage id.
     pub index: usize,
@@ -143,6 +148,10 @@ fn record_key(obs: &Observation, position: usize) -> Key {
     Key::Record(position)
 }
 
+fn attributed_model(obs: &Observation) -> Option<String> {
+    obs.model.clone().or_else(|| obs.context_model.clone())
+}
+
 /// Collapse proven duplicates, fold cumulative revisions, keep the rest.
 pub fn reconcile(observations: &[Observation]) -> Vec<Record> {
     let mut order: Vec<Key> = Vec::new();
@@ -159,7 +168,7 @@ pub fn reconcile(observations: &[Observation]) -> Vec<Record> {
     for key in order {
         let members = &groups[&key];
         let first = members[0];
-        let push = |records: &mut Vec<Record>, standing, src: &Observation, normalized: Normalized, ts| {
+        let push = |records: &mut Vec<Record>, standing, src: &Observation, normalized: Normalized, model, ts| {
             let index = records.len();
             records.push(Record {
                 standing,
@@ -168,19 +177,20 @@ pub fn reconcile(observations: &[Observation]) -> Vec<Record> {
                 turn_id: src.turn_id.clone(),
                 counter_name: first.counter_name.clone(),
                 normalized,
+                model,
                 ts,
                 index,
             });
         };
         if members.len() == 1 {
             let standing = if matches!(key, Key::Record(_)) { Standing::Ambiguous } else { Standing::Firm };
-            push(&mut records, standing, first, first.normalized.clone(), first.ts);
+            push(&mut records, standing, first, first.normalized.clone(), attributed_model(first), first.ts);
         } else if members.iter().skip(1).all(|m| m.normalized == first.normalized) {
-            push(&mut records, Standing::Firm, first, first.normalized.clone(), first.ts);
+            push(&mut records, Standing::Firm, first, first.normalized.clone(), attributed_model(first), first.ts);
         } else if matches!(key, Key::Counter(..) | Key::SessionCounter(..)) {
             let latest = members[members.len() - 1];
             // Turn id of a folded counter is the group's first member's.
-            push(&mut records, Standing::Firm, first, latest.normalized.clone(), latest.ts);
+            push(&mut records, Standing::Firm, first, latest.normalized.clone(), attributed_model(latest), latest.ts);
         } else {
             for member in members {
                 let index = records.len();
@@ -191,6 +201,7 @@ pub fn reconcile(observations: &[Observation]) -> Vec<Record> {
                     turn_id: member.turn_id.clone(),
                     counter_name: first.counter_name.clone(),
                     normalized: member.normalized.clone(),
+                    model: attributed_model(member),
                     ts: member.ts,
                     index,
                 });
@@ -206,11 +217,12 @@ struct GroupView<'a> {
     unresolved: bool,
 }
 
-/// One contributing amount with the native time it is attributed to.
-#[derive(Clone, Copy, Debug)]
+/// One contributing amount with the native time and model it is attributed to.
+#[derive(Clone, Debug)]
 pub struct Contribution {
     pub tokens: i64,
     pub ts: Option<f64>,
+    pub model: Option<String>,
 }
 
 /// `known_total` of total tokens over `records`, plus its time-attributed parts.
@@ -284,17 +296,19 @@ pub fn known_total(records: &[&Record]) -> (Option<i64>, Vec<Contribution>) {
         if view.unresolved {
             continue;
         }
-        let detail_vals: Vec<(i64, Option<f64>)> = view
+        let detail_vals: Vec<(i64, Option<f64>, &Option<String>)> = view
             .details
             .iter()
-            .filter_map(|r| r.normalized.effective_total().map(|v| (v, r.ts)))
+            .filter_map(|r| r.normalized.effective_total().map(|v| (v, r.ts, &r.model)))
             .collect();
         let group_detail: Option<i64> =
-            if detail_vals.is_empty() { None } else { Some(detail_vals.iter().map(|(v, _)| v).sum()) };
+            if detail_vals.is_empty() { None } else { Some(detail_vals.iter().map(|(v, _, _)| v).sum()) };
         let add_details = |detail_total: &mut Option<i64>, parts: &mut Vec<Contribution>| {
             if let Some(g) = group_detail {
                 *detail_total = Some(detail_total.unwrap_or(0) + g);
-                parts.extend(detail_vals.iter().map(|(v, ts)| Contribution { tokens: *v, ts: *ts }));
+                parts.extend(
+                    detail_vals.iter().map(|(v, ts, model)| Contribution { tokens: *v, ts: *ts, model: (*model).clone() }),
+                );
             }
         };
         let Some(interval) = view.interval else {
@@ -312,7 +326,7 @@ pub fn known_total(records: &[&Record]) -> (Option<i64>, Vec<Contribution>) {
         }
         let residual = group_interval - group_detail.unwrap_or(0);
         interval_total = Some(interval_total.unwrap_or(0) + residual);
-        parts.push(Contribution { tokens: residual, ts: interval.ts });
+        parts.push(Contribution { tokens: residual, ts: interval.ts, model: interval.model.clone() });
         if group_detail.is_some() {
             add_details(&mut detail_total, &mut parts);
         }
