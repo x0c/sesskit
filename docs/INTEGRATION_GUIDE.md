@@ -30,7 +30,7 @@ project's virtual environment and install the published wheel. If you need a new
 environment, run `python3 -m venv .venv && . .venv/bin/activate` first.
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/download/v0.3.0/wheels.html" "sesskit==0.3.0"
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.0" "sesskit==0.3.0"
 python -m sesskit describe
 ```
 

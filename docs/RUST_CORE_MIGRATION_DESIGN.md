@@ -118,11 +118,15 @@ substitute.
   on native macOS/Linux ARM64 and x86_64 runners, at Python 3.10 and 3.15.
   The manual ref is checked out exactly; artifacts include source identity and
   checksums. This is a verification/build helper, not a hidden auto-publisher.
-- The published `wheels.html` is a pip `--find-links` page, not a package index
-  registration. `--no-index` keeps installation on the exact GitHub release;
-  pip chooses a compatible native wheel, with a universal Python fallback.
-  Existing consumers can still use the fixed `py3-none-any` wheel directly,
-  without native acceleration. PyPI availability is unchanged.
+- Use the release's `expanded_assets/v<version>` page for pip `--find-links`,
+  not the generated `wheels.html` asset. GitHub returned that asset as
+  `application/octet-stream` even after an explicit `text/html` upload, while
+  `expanded_assets` returned HTML and pip selected the expected native wheel.
+  The generated HTML remains a human-readable asset index. `--no-index` keeps
+  installation on the exact GitHub release; pip chooses a compatible native
+  wheel, with a universal Python fallback. Existing consumers can still use
+  the fixed `py3-none-any` wheel directly, without native acceleration.
+  PyPI availability is unchanged.
 
 Reference implementation inspected before coding: Serde's
 [`IgnoredAny` visitor](https://github.com/serde-rs/serde/blob/master/serde_core/src/de/ignored_any.rs)
@@ -138,9 +142,10 @@ New workflow action pins were checked at their exact commits for `node24`.
 
 - [x] Bounded implementation scope and baseline recorded.
 - [x] Native/Python differential tests and complete diagnostics inspected:
-  final candidate 1,108 tests + 42 subtests passed native-enabled, 1,077 tests
-  + 42 subtests passed with native disabled (32 native-specific skips and one
-  existing environment skip); Ruff and native Clippy/tests are clean.
+  the exact installed release candidate passed 1,109 tests + 42 subtests
+  native-enabled and 1,078 tests + 42 subtests with native disabled (32
+  native-specific skips and one existing environment skip); Ruff and native
+  Clippy/tests are clean.
 - [x] Real-history public wiring checked: installed-artifact `sesskit verify
   --sample 30` passed 153/153 session loads and 150 applicable event/reader
   comparisons (three expected unsupported Kimi typed-activity projections).
@@ -156,18 +161,21 @@ New workflow action pins were checked at their exact commits for `node24`.
   above with frozen sources and identical normalized outputs.
 - [x] Migration source isolated, committed and pushed on `main` as `1e0a5ce`;
   unrelated working-tree changes were left outside the commit.
-- [ ] Supported-platform artifacts and source distribution verified. Local
-  ARM64 native and compatibility wheels install and execute, Python 3.10/3.15
-  both load the extension, and the source archive rebuilds and installs its
-  native wheel. The first four-runner `native-wheels` run (`42356384029`)
-  built the native/compatibility wheels and source distribution and passed
-  Ruff plus Rust tests on every runner, but all four jobs stopped before the
-  installed-wheel Python tests because the minimal Rust toolchain lacked
-  `cargo-clippy`. A working-tree follow-up adds `--component clippy`; at this
-  update it is neither part of `1e0a5ce` nor rerun. No four-platform artifact
-  pass is claimed.
-- [ ] `v0.3.0` tag and GitHub release published; downloaded release installed
-  and exercised. No `v0.3.0` release exists at this update.
+- [x] Supported-platform artifacts and source distribution verified. The
+  four-runner `native-wheels` run `42383574777` passed on macOS/Linux ARM64
+  and x86_64, including installed-wheel Python 3.10/3.15 tests. Local exact-
+  source native/compatibility installs and an sdist rebuild/install passed;
+  downloaded CI artifacts matched their source identity and SHA-256 records.
+- [x] `v0.3.0` tag and GitHub release published from `c2cca43`. The published
+  pure wheel and sdist passed digest/metadata checks and clean installation.
+  A fresh environment installed the native macOS wheel through the public
+  `expanded_assets` route, then passed `describe`, 153 real-history loads and
+  150 applicable consistency checks with no failures.
+
+PyPI remains unpublished: tag run `42448604453` built successfully but its
+optional publish job stopped at the external Trusted Publisher prerequisite
+(`invalid-publisher`); no files reached PyPI. This does not alter the verified
+GitHub release installation route.
 
 Native statistics interpretation and existing parity evidence remain owned by
 [NATIVE_STATS_ENGINE_DESIGN.md](NATIVE_STATS_ENGINE_DESIGN.md); session compatibility
