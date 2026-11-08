@@ -3,6 +3,7 @@
 //! Design: `docs/NATIVE_STATS_ENGINE_DESIGN.md`. Interpretation rules mirror
 //! the Python reference in `src/sesskit/usage.py` for the total-token metric.
 
+pub mod aggregate;
 pub mod claude;
 pub mod codex;
 pub mod jsonl;

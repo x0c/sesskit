@@ -34,6 +34,25 @@ Aggregates derived from it (sessions per runtime, in-window token total,
 active intervals, hour-by-weekday histogram) are pure functions over this
 projection.
 
+### Shared time aggregates (`sesskit_stats::aggregate`, 2026-11-08)
+
+The time-derived aggregates live in the crate so every consumer (AgentFlex,
+Corral, future cards) gets the same numbers; consumers call them instead of
+re-implementing the rules (owner request 2026-11-08, after AgentFlex carried
+its own copy):
+
+- **Active intervals:** a session's ascending activity timestamps merge into
+  one interval while consecutive records are at most 300 s apart (Corral
+  policy constant). Each interval then extends 60 s past its last record, so
+  a lone record still occupies time and two sessions answering at the same
+  moment overlap. The first-to-last span is wrong: sessions left open for
+  days inflated an early peak to 20.
+- **Peak concurrency:** the maximum number of intervals, across all sessions,
+  open at one instant, plus the first instant it is reached. Intervals that
+  only touch (one ends exactly when another starts) are not concurrent.
+- **Weekday × hour histogram:** interval seconds split at local hour
+  boundaries for a caller-supplied UTC offset, indexed Monday = 0, hour 0–23.
+
 ### Why records carry timestamps
 
 The Python usage snapshot carries no time per record. Selecting in-window
