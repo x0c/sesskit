@@ -97,7 +97,7 @@ Python strings while holding strong references across interpreter detachment.
 Synthetic throughput is supplementary evidence, not a real-history acceptance
 substitute.
 
-## Second replacement (v0.3.1 candidate)
+## Second replacement (delivered in v0.3.1)
 
 Profiling the published v0.3.0 native path on 100 sessions per runtime took
 10.34 s versus 13.09 s with native disabled. OpenCode remained the largest
@@ -222,14 +222,21 @@ GitHub release installation route.
 - [x] Exact live OpenCode success and quota-abnormal sessions preserved full
   list records, `status_tag`, `last_agent_msg`, events and conversation in both
   modes. The abnormal path retained its error-bearing assistant event.
-- [x] Paired measurement on the actual replaced path: native batch projection
-  took 1.9–2.3 s versus 3.9–4.8 s for Python rebuilding in the alternating
-  breakdown. Independent cold-process timings varied; no fixed whole-scan
-  speedup is claimed.
-- [ ] Exact committed-source native/fallback suites, four-platform CI, sdist
-  rebuild and native `dlopen` acceptance.
-- [ ] `v0.3.1` GitHub release, verified downloads and installed real-history
-  behavior.
+- [x] Paired measurement on the exact installed artifact: alternating complete
+  1,000-session scans took 1.63–1.64 s native versus 3.83–4.09 s with native
+  disabled, with byte-identical public records. Independent cold-process
+  timings varied under local build load; no fixed cold-start speedup is claimed.
+- [x] Exact committed-source native/fallback suites, four-platform CI, sdist
+  rebuild and native `dlopen` acceptance. Local exact-artifact gates passed:
+  1,111 native and 1,078 fallback tests + 42 subtests each, an isolated warning-
+  free native rerun, sdist rebuild/install, Python 3.10/3.15 imports, and 153
+  real-history loads in each mode. CI run `42452147599` passed all four runners;
+  its complete log and downloaded artifact hashes were inspected.
+- [x] `v0.3.1` GitHub release published from `10c4742`. All downloaded assets
+  matched `SHA256SUMS`; the pure wheel passed clean installation, and a fresh
+  environment selected the native macOS wheel through `expanded_assets`, then
+  passed `describe`, 153 real-history loads and 150 applicable consistency
+  checks with no failures or inconclusive reads.
 
 Native statistics interpretation and existing parity evidence remain owned by
 [NATIVE_STATS_ENGINE_DESIGN.md](NATIVE_STATS_ENGINE_DESIGN.md); session compatibility
