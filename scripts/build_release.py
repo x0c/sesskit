@@ -36,7 +36,8 @@ def check_sdist(path: Path, release_version: str) -> None:
     with tarfile.open(path, "r:gz") as archive:
         names = archive.getnames()
     required = ("pyproject.toml", "Cargo.toml", "Cargo.lock",
-                "crates/sesskit-python/src/lib.rs", "crates/sesskit-stats/src/projection.rs")
+                "crates/sesskit-python/src/lib.rs", "crates/sesskit-stats/src/projection.rs",
+                "crates/sesskit-stats/src/opencode_list.rs")
     for name in required:
         if f"sesskit-{release_version}/{name}" not in names:
             raise RuntimeError(f"source distribution is missing {name}")

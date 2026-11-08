@@ -42,7 +42,8 @@ def test_cargo_and_python_versions_match():
 def test_source_archive_rejects_internal_coordination_and_build_copies(tmp_path):
     source = tmp_path / "sesskit-0.3.0.tar.gz"
     required = ("pyproject.toml", "Cargo.toml", "Cargo.lock",
-                "crates/sesskit-python/src/lib.rs", "crates/sesskit-stats/src/projection.rs")
+                "crates/sesskit-python/src/lib.rs", "crates/sesskit-stats/src/projection.rs",
+                "crates/sesskit-stats/src/opencode_list.rs")
     with tarfile.open(source, "w:gz") as archive:
         for name in (*required, "TASKBOARD.md", "build/lib/sesskit/cli.py"):
             member = tarfile.TarInfo(f"sesskit-0.3.0/{name}")

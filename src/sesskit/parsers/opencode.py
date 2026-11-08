@@ -722,60 +722,83 @@ def _v2_session_versions(
     return versions
 
 
+def _v2_list_version(
+    row: sqlite3.Row,
+    host: HostExtension | None,
+    versions: dict[str, tuple],
+) -> tuple:
+    return (tuple(row), versions.get(str(row["id"])), ListRecordMemo.host_key(host))
+
+
 def _memoized_session_info_v2(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     db_path: str,
     host: HostExtension | None,
     versions: dict[str, tuple] | None,
+    native_facts: dict | None = None,
 ) -> dict | None:
     """``_build_session_info_v2`` reused while the session row and its message
     version match. Versions are read before the build, so a racing write only
     makes the next scan rebuild."""
     if versions is None:
-        return _build_session_info_v2(conn, row, db_path, host)
+        return _build_session_info_v2(conn, row, db_path, host, facts=native_facts)
     session_id = str(row["id"])
-    version = (tuple(row), versions.get(session_id), ListRecordMemo.host_key(host))
+    version = _v2_list_version(row, host, versions)
     key = (db_path, session_id)
     cached = _V2_LIST_MEMO.get(key, version)
     if cached is not MEMO_MISS:
         return cached  # type: ignore[return-value]
-    info = _build_session_info_v2(conn, row, db_path, host)
+    info = _build_session_info_v2(conn, row, db_path, host, facts=native_facts)
     _V2_LIST_MEMO.put(key, version, info)
     return info
 
 
-def _build_session_info_v2(
-    conn: sqlite3.Connection,
-    row: sqlite3.Row,
-    db_path: str,
-    host: HostExtension | None = None,
-) -> dict | None:
-    """v2 单会话列表项：预览/状态/大小全部从 session_message 现算。
+def _v2_status_fact(row_type: str, data: dict) -> dict:
+    """Keep only values consumed by ``_status_and_error_v2``."""
+    if row_type == "assistant":
+        result = {"finish": data.get("finish") if isinstance(data.get("finish"), str) else None}
+        if data.get("error"):
+            result["error"] = data["error"]
+        return result
+    if row_type == "idle":
+        return {"outcome": data.get("outcome") if isinstance(data.get("outcome"), str) else None}
+    return {}
 
-    first/last_user_msg 取 type='user' 按 seq 首/尾行的 data.text；无 user
-    行的目标驱动会话（goal synthetic）取首个初始目标的 objective；
-    last_agent_msg 取尾部最后一条非空 assistant 文本（与 v1 取最后 text
-    part 的口径对齐，0 文本但有 error 时填 error 文本）；size 取
-    SUM(LENGTH(session_message.data))——v1 的 part 源在此表没有对应物，
-    沿用它会恒为 0 并让 completion_id 尾哈希退化；fallback_title 取首条
-    user 正文首行 60 字；title 为空是正常态，只有“无标题 + 无用户正文”
-    才丢弃（与 v1 相同的空会话规则）。
-    """
-    session_id = str(row["id"])
-    msg_rows = conn.execute(_V2_MESSAGES_SQL, (session_id,)).fetchall()
+
+def _v2_goal_fact(data: dict) -> dict:
+    return {
+        "description": data.get("description") if isinstance(data.get("description"), str) else None,
+        "text": data.get("text") if isinstance(data.get("text"), str) else None,
+        "metadata": {"source": "goal"},
+    }
+
+
+def _v2_text_content_fact(data: dict) -> dict:
+    content = data.get("content")
+    if not isinstance(content, list):
+        return {}
+    return {"content": [
+        {"type": "text", "text": item["text"]}
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+    ]}
+
+
+def _v2_list_facts(msg_rows: list[sqlite3.Row]) -> dict:
+    """Reduce Python SQL rows to the compact facts shared with the Rust path."""
     from sesskit.native_projection import project_records
 
     projected = project_records([item["data"] for item in msg_rows], "opencode_list")
     typed_rows: list[tuple[str, dict]] = []
     user_texts: list[str] = []
-    goal_texts: list[str] = []
+    goal_rows: list[dict] = []
     assistant_datas: list[dict] = []
     last_anchor = ""
     for msg_row, raw in zip(msg_rows, projected, strict=True):
         data = _v2_json_dict(raw)
         row_type = str(msg_row["type"] or "")
-        typed_rows.append((row_type, data))
+        typed_rows.append((row_type, _v2_status_fact(row_type, data)))
         if row_type == "user":
             user_texts.append(_v2_user_text(data))
         elif row_type == "assistant":
@@ -783,25 +806,55 @@ def _build_session_info_v2(
             # 原生轮次锚点：同文本不同轮次靠消息 id/seq 区分。
             last_anchor = f"{msg_row['id']}:{msg_row['seq']}"
         elif row_type == "synthetic":
-            goal_text = _synthetic_goal_text(data)
-            if goal_text:
-                goal_texts.append(goal_text)
-    if user_texts:
-        first_user = user_texts[0]
-        last_user = user_texts[-1]
+            metadata = data.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("source") == "goal":
+                goal_rows.append(_v2_goal_fact(data))
+
+    last_agent_message: dict = {}
+    for assistant_data in reversed(assistant_datas):
+        if _v2_assistant_text(assistant_data).strip():
+            last_agent_message = _v2_text_content_fact(assistant_data)
+            break
+    status_start = 0
+    for index in range(len(typed_rows) - 1, -1, -1):
+        if typed_rows[index][0] not in _V2_SKIP_TYPES:
+            status_start = index
+            break
+    return {
+        "has_user": bool(user_texts),
+        "first_user": user_texts[0] if user_texts else "",
+        "last_user": user_texts[-1] if user_texts else "",
+        "goal_rows": goal_rows,
+        "last_agent_message": last_agent_message,
+        "status_rows": typed_rows[status_start:],
+        "assistant_errors": [{"error": data["error"]} for data in assistant_datas if data.get("error")],
+        "last_anchor": last_anchor,
+    }
+
+
+def _session_info_from_v2_facts(
+    row: sqlite3.Row,
+    db_path: str,
+    host: HostExtension | None,
+    facts: dict,
+) -> dict | None:
+    """Build the public list record with existing Python interpretation."""
+    goal_texts = []
+    for goal_row in facts["goal_rows"]:
+        goal_text = _synthetic_goal_text(goal_row)
+        if goal_text:
+            goal_texts.append(goal_text)
+    if facts["has_user"]:
+        first_user = facts["first_user"]
+        last_user = facts["last_user"]
     elif goal_texts:
         first_user = goal_texts[0]
         last_user = goal_texts[-1]
     else:
         first_user = ""
         last_user = ""
-    last_agent_text = ""
-    for assistant_data in reversed(assistant_datas):
-        candidate = _v2_assistant_text(assistant_data)
-        if candidate.strip():
-            last_agent_text = candidate
-            break
-    status, error_data = _status_and_error_v2(typed_rows)
+    last_agent_text = _v2_assistant_text(facts["last_agent_message"])
+    status, error_data = _status_and_error_v2(facts["status_rows"])
     terminal_error: dict[str, object] = {}
     if status == titles.STATUS_ABORTED:
         terminal_error = terminal_error_evidence(
@@ -809,8 +862,8 @@ def _build_session_info_v2(
             code=_error_code_from_msg(error_data),
             message=error_text_from_msg(error_data),
         )
-    if not last_agent_text and status == titles.STATUS_ABORTED and assistant_datas:
-        for assistant_data in reversed(assistant_datas):
+    if not last_agent_text and status == titles.STATUS_ABORTED:
+        for assistant_data in reversed(facts["assistant_errors"]):
             candidate = error_text_from_msg(assistant_data)
             if candidate.strip():
                 last_agent_text = candidate
@@ -826,9 +879,8 @@ def _build_session_info_v2(
     if not native_title and fallback == "(无消息)":
         return None  # 既无原生标题也无用户正文的空会话，无展示价值
 
+    session_id = str(row["id"])
     mtime = row["time_updated"] / 1000
-    size_row = conn.execute(_V2_SIZE_SQL, (session_id,)).fetchone()
-    size_bytes = int(size_row[0] or 0) if size_row else 0
     from sesskit.models import completion_id_for
 
     tail_text = f"{last_user[:120]}\n{last_agent_text[:120]}"
@@ -841,7 +893,7 @@ def _build_session_info_v2(
         time_source="db_time_updated",
         event_time=mtime,
         file_mtime=mtime,
-        size_bytes=size_bytes,
+        size_bytes=int(facts["size_bytes"]),
         native_title=native_title,
         fallback_title=fallback,
         status_tag=status,
@@ -851,11 +903,29 @@ def _build_session_info_v2(
         last_agent_msg=preprocess_excerpt(last_agent_text, host),
         completion_id=completion_id_for(
             status_tag=status,
-            anchor=last_anchor,
+            anchor=facts["last_anchor"],
             tail_text=tail_text,
         ),
         **terminal_error,
     )
+
+
+def _build_session_info_v2(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    db_path: str,
+    host: HostExtension | None = None,
+    *,
+    facts: dict | None = None,
+) -> dict | None:
+    """Build one v2 list item from native facts or the Python SQL fallback."""
+    if facts is None:
+        session_id = str(row["id"])
+        msg_rows = conn.execute(_V2_MESSAGES_SQL, (session_id,)).fetchall()
+        facts = _v2_list_facts(msg_rows)
+        size_row = conn.execute(_V2_SIZE_SQL, (session_id,)).fetchone()
+        facts["size_bytes"] = int(size_row[0] or 0) if size_row else 0
+    return _session_info_from_v2_facts(row, db_path, host, facts)
 
 
 # The list fingerprint hashes every list-driving v1/v2 row in stable key order.
@@ -1118,9 +1188,24 @@ def scan_sessions(
         successful_queries += 1
         try:
             versions = _v2_session_versions(conn, [str(row["id"]) for row in v2_rows])
+            pending_ids = []
+            for row in v2_rows:
+                if versions is None:
+                    pending_ids.append(str(row["id"]))
+                    continue
+                key = (db_path, str(row["id"]))
+                version = _v2_list_version(row, host, versions)
+                if _V2_LIST_MEMO.get(key, version) is MEMO_MISS:
+                    pending_ids.append(str(row["id"]))
+            from sesskit.native_projection import project_opencode_sessions
+
+            native_records = project_opencode_sessions(db_path, pending_ids) or {}
             for row in v2_rows:
                 try:
-                    info = _memoized_session_info_v2(conn, row, db_path, host, versions)
+                    info = _memoized_session_info_v2(
+                        conn, row, db_path, host, versions,
+                        native_facts=native_records.get(str(row["id"])),
+                    )
                 except sqlite3.Error:
                     continue  # 单会话预览失败只跳过该会话，不连累同库其它 v2 行
                 if info is None:

@@ -97,9 +97,43 @@ Python strings while holding strong references across interpreter detachment.
 Synthetic throughput is supplementary evidence, not a real-history acceptance
 substitute.
 
+## Second replacement (v0.3.1 candidate)
+
+Profiling the published v0.3.0 native path on 100 sessions per runtime took
+10.34 s versus 13.09 s with native disabled. OpenCode remained the largest
+path: SQLite row transfer and about 82,000 small Python JSON decodes remained
+after the first projection. These are cProfile observations on the live sample,
+not a promised whole-scan speedup.
+
+The second bounded replacement moves OpenCode v2 batch listing reads into the
+existing Rust core:
+
+- Reuse the statistics engine's read-only SQLite connection and mmap setup,
+  not its time-window pruning or usage accounting. A prepared per-session
+  query reuses the session/seq index; a measured giant `IN (...)` query sorted
+  large message bodies into a temporary B-tree and was rejected.
+- Reduce each session inside Rust to first/last user text, goal candidates,
+  the last non-empty assistant text content, the terminal status tail, error-
+  bearing assistant rows, the last assistant anchor and native byte size.
+  Tool inputs, tool outputs and encrypted reasoning are not returned to Python.
+- Feed that compact record into the existing Python status, error, goal,
+  excerpt and public-model helpers. Memo versions and the forced-Python path
+  remain in place. A native open/query/encoding failure falls back to the
+  existing Python SQL path; it is never an empty successful scan.
+- Acceptance requires exact native/Python normalized-record parity on frozen
+  real databases, targeted malformed/Unicode/error/status fixtures, concurrent-
+  write behavior, unchanged single-session loading, native and fallback suites,
+  and a measured comparison on the same installed artifact. No second-release
+  claim is made until those gates and downloaded-install acceptance finish.
+
 ## Build and installation
 
 - Python 3.10+, Rust 1.88+ for source builds; prebuilt wheels require no compiler.
+  Keep both Cargo and Maturin `strip = false`: rustc 1.95's LLVM objcopy produced
+  a misaligned Mach-O string pool on macOS 27, and Maturin 1.14's `strip=true`
+  delegates to the same rustc option. Larger working wheels are preferable to
+  stripped binaries that cannot be loaded; installed `dlopen` is the acceptance
+  gate ([rust-lang/rust#157750](https://github.com/rust-lang/rust/issues/157750)).
 - Keep the Python binding manifest at repository-root `Cargo.toml`, with its
   Rust source under `crates/sesskit-python/src/`. A nested manifest selected
   implicitly produced a spurious missing-root-manifest diagnostic during sdist
@@ -176,6 +210,26 @@ PyPI remains unpublished: tag run `42448604453` built successfully but its
 optional publish job stopped at the external Trusted Publisher prerequisite
 (`invalid-publisher`); no files reached PyPI. This does not alter the verified
 GitHub release installation route.
+
+## Second-release acceptance
+
+- [x] Frozen-source parity: 796 candidate sessions had identical compact facts;
+  a separate 1,000-session public scan produced byte-identical normalized
+  records in native and forced-Python modes.
+- [x] Working-tree native/fallback suites: 1,127 passed + 1 skipped and 1,094
+  passed + 34 skipped, each with 50 subtests. Rust has 12 passing tests and
+  clean Clippy; targeted scan/memo/refresh/native integration has 93 passes.
+- [x] Exact live OpenCode success and quota-abnormal sessions preserved full
+  list records, `status_tag`, `last_agent_msg`, events and conversation in both
+  modes. The abnormal path retained its error-bearing assistant event.
+- [x] Paired measurement on the actual replaced path: native batch projection
+  took 1.9–2.3 s versus 3.9–4.8 s for Python rebuilding in the alternating
+  breakdown. Independent cold-process timings varied; no fixed whole-scan
+  speedup is claimed.
+- [ ] Exact committed-source native/fallback suites, four-platform CI, sdist
+  rebuild and native `dlopen` acceptance.
+- [ ] `v0.3.1` GitHub release, verified downloads and installed real-history
+  behavior.
 
 Native statistics interpretation and existing parity evidence remain owned by
 [NATIVE_STATS_ENGINE_DESIGN.md](NATIVE_STATS_ENGINE_DESIGN.md); session compatibility

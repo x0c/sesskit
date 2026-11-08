@@ -31,7 +31,7 @@ SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装指定版本的 
 需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。暂不支持 Windows。
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.0" "sesskit==0.3.0"
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" "sesskit==0.3.1"
 python -m sesskit describe
 ```
 

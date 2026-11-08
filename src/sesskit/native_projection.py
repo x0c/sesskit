@@ -1,12 +1,13 @@
-"""Optional Rust field projection; Python owns decoding and runtime semantics.
+"""Optional Rust compact projections; Python owns public interpretation.
 
-Only compact listing paths use this bridge. Full conversations, transcripts,
-usage records and native history bytes are never changed by it.
+Only listing paths use this bridge. Full conversations, transcripts, usage
+records and native history bytes are never changed by it.
 """
 
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from types import ModuleType
 
@@ -46,3 +47,17 @@ def project_records(records: list, profile: str) -> list:
         # Python JSON accepts lone surrogates that cannot cross UTF-8 FFI.
         return records
     return [raw if value is None else value for raw, value in zip(records, projected, strict=True)]
+
+
+def project_opencode_sessions(db_path: str, session_ids: list[str]) -> dict | None:
+    """Return compact v2 listing facts, or None to use the Python SQL path."""
+    if not session_ids:
+        return {}
+    backend = _backend()
+    if backend is None:
+        return None
+    try:
+        result = json.loads(backend.project_opencode_sessions(db_path, session_ids))
+    except (AttributeError, RuntimeError, UnicodeError, TypeError, ValueError):
+        return None
+    return result if isinstance(result, dict) else None

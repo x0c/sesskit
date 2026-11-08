@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sesskit"
-version = "0.3.0"
+version = "0.3.1"
 description = "Parse and export local Claude Code, Codex CLI, and Cursor agent session files from disk. Python transcript parser library and JSON CLI — not a TUI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -52,6 +52,7 @@ sesskit = "sesskit.cli:main"
 manifest-path = "Cargo.toml"
 python-source = "src"
 module-name = "sesskit._native"
+strip = false
 exclude = ["TASKBOARD.md", "build/**"]
 include = [
   { path = "AGENTS.md", format = "sdist" },

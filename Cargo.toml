@@ -1,6 +1,6 @@
 [package]
 name = "sesskit-python"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -19,4 +19,6 @@ sesskit-stats = { path = "crates/sesskit-stats" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = true
+# Maturin applies the platform strip tool. rustc's LLVM objcopy on older
+# toolchains can misalign Mach-O LINKEDIT (rust-lang/rust#157750).
+strip = false

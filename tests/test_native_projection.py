@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -125,6 +126,106 @@ def test_small_bytes_and_unusual_inputs_use_original_decoder(monkeypatch):
     monkeypatch.setattr(bridge, "_backend", lambda: pytest.fail("unnecessary backend call"))
     for records in ([], ["{}"], [b"{}"], [None], [{"text": "already decoded"}]):
         assert bridge.project_records(records, "opencode_list") is records
+
+
+def _no_live_processes(*_args):
+    return []
+
+
+def _python_opencode_facts(conn, session_id):
+    rows = conn.execute(opencode._V2_MESSAGES_SQL, (session_id,)).fetchall()
+    facts = opencode._v2_list_facts(rows)
+    size = conn.execute(opencode._V2_SIZE_SQL, (session_id,)).fetchone()
+    facts["size_bytes"] = int(size[0] or 0) if size else 0
+    return json.loads(json.dumps(facts))
+
+
+def test_opencode_batch_facts_and_scan_match_python(tmp_path, monkeypatch):
+    native()
+    path = tmp_path / "opencode.db"
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE session (id TEXT PRIMARY KEY);
+        CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER,
+            time_updated INTEGER, parent_id TEXT, time_archived INTEGER);
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+            time_created INTEGER, time_updated INTEGER, data TEXT);
+    """)
+    rows = [
+        ("ok", "user", 1, {"text": "first"}),
+        ("ok", "user", 2, {"text": "last"}),
+        ("ok", "assistant", 3, {
+            "content": [
+                {"type": "reasoning", "reasoningEncryptedContent": "encrypted-private"},
+                {"type": "text", "text": " answer \u001c"},
+                {"type": "tool", "state": {"input": "tool-private" * 1000}},
+            ], "finish": "stop"}),
+        ("ok", "idle", 4, {"outcome": "ok"}),
+        ("error", "user", 1, {"text": "request"}),
+        ("error", "assistant", 2, {
+            "content": [{"type": "tool", "state": {"output": "tool-private"}}],
+            "error": {"message": "quota", "status": 429, "large": 10**40}}),
+        ("error", "idle", 3, {"outcome": "failed"}),
+        ("goal", "synthetic", 1, {
+            "metadata": {"source": "goal"}, "description": "Goal: inspect"}),
+        ("goal", "assistant", 2, {"content": [], "finish": "stop"}),
+    ]
+    for session_id, kind, seq, data in rows:
+        conn.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                     (f"{session_id}-{seq}", session_id, kind, seq, seq, seq, json.dumps(data)))
+    for index, session_id in enumerate(("ok", "error", "goal"), 1):
+        conn.execute("INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?)",
+                     (session_id, str(tmp_path), None, index, index, None, None))
+    conn.commit()
+
+    session_ids = ["ok", "error", "goal"]
+    expected = {session_id: _python_opencode_facts(conn, session_id) for session_id in session_ids}
+    actual = bridge.project_opencode_sessions(str(path), session_ids)
+    assert actual == expected
+    compact = json.dumps(actual)
+    assert "tool-private" not in compact
+    assert "encrypted-private" not in compact
+    assert actual["error"]["assistant_errors"][0]["error"]["large"] == 10**40
+
+    monkeypatch.setenv("OPENCODE_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.setattr(opencode, "live_processes", _no_live_processes)
+    monkeypatch.delenv("SESSKIT_NATIVE", raising=False)
+    try:
+        opencode._V2_LIST_MEMO.clear()
+        native_scan = opencode.scan_sessions(limit=10)
+        monkeypatch.setenv("SESSKIT_NATIVE", "0")
+        opencode._V2_LIST_MEMO.clear()
+        fallback_scan = opencode.scan_sessions(limit=10)
+        assert json.loads(json.dumps(native_scan)) == json.loads(json.dumps(fallback_scan))
+        assert {item["id"]: item["status_tag"] for item in native_scan} == {
+            "ok": opencode.titles.STATUS_DONE,
+            "error": opencode.titles.STATUS_ABORTED,
+            "goal": opencode.titles.STATUS_DONE,
+        }
+    finally:
+        opencode._V2_LIST_MEMO.clear()
+        conn.close()
+
+
+def test_opencode_batch_rejects_nonstandard_json_for_python_fallback(tmp_path):
+    native()
+    path = tmp_path / "opencode.db"
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE session_message (
+        id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+        time_created INTEGER, time_updated INTEGER, data TEXT)""")
+    conn.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                 ("m", "s", "user", 1, 1, 1, '{"text":NaN}'))
+    conn.commit()
+    assert bridge.project_opencode_sessions(str(path), ["s"]) is None
+    conn.execute("UPDATE session_message SET data = '{' WHERE id = 'm'")
+    conn.commit()
+    assert bridge.project_opencode_sessions(str(path), ["s"]) is None
+    conn.close()
 
 
 def test_lone_surrogate_at_ffi_boundary_falls_back():
