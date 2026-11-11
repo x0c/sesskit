@@ -355,6 +355,45 @@ network lookup, generated-token estimate or new runtime dependency is introduced
   Mark actual auth/quota/platform limits explicitly, never as passes. Public
   release/version/tag changes are not part of this feature request by default.
 
+## Session-level audit arithmetic
+
+The existing performance/activity projections can also explain where one agent
+session spent its wall time. This is an analysis recipe, not another dataset or
+a provider benchmark. Use an explicit cutoff (for example, the next user
+message) so the audit does not include itself.
+
+- **Weighted response TPS:** select one runtime and one compatible interval kind
+  (for Pi, `response_elapsed`) with the same output semantics and non-overlapping
+  intervals. Compute `sum(output_tokens) * 1000 / sum(duration_ms)`; do not take
+  an arithmetic mean of per-record `tokens_per_second`, and do not use the whole
+  session wall time as the denominator. Reasoning remains a subset of inclusive
+  output, never an extra addend. This is still a client-observed derived rate,
+  not provider decode speed.
+- **Usage attribution and coverage:** join compatible usage records by native
+  `response_id` when computing cumulative input/output. Cumulative input is not
+  unique context size, and cache-read is not output. A response or usage record
+  without a match keeps the result partial rather than silently completing it.
+- **Tool wall time:** pair normalized `tool_call` and `tool_result` activity by
+  `call_id`, then merge overlapping start/end intervals before summing. Parallel
+  tool durations are not additive wall time; a serial sum answers a different
+  question and must not be presented as elapsed execution time.
+- **Wall decomposition:** only after checking that the selected response
+  intervals do not overlap each other or the tool intervals, compare wall time
+  with `sum(response_elapsed) + merged_tool_time`; the remaining duration is
+  orchestration/other, not automatically model latency. If intervals overlap or
+  endpoints are uncertain, report the measurements independently instead of
+  inventing a complete decomposition.
+
+Read-only verification on one local Pi history (2026-11-11; aggregate counts
+only, no identifiers or content): 109 native response intervals and 242 paired
+tool calls over 4,893.14 seconds. Compatible response durations totaled 3,593.06
+seconds and merged tool intervals 836.62 seconds, leaving 463.46 seconds of other
+time. The 104,441 inclusive-output tokens produced a weighted 29.1 tokens/s;
+45,393 reasoning tokens remained a subset of that output. Four full test runs
+accounted for 486.6 seconds of serial command duration, demonstrating why test
+time alone could not explain the session. These are one-session facts, not a
+runtime or model performance baseline.
+
 ## Delivery verification (2026-11-02)
 
 - Independent native-data oracles checked the public usage/performance APIs for
