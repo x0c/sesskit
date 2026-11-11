@@ -287,9 +287,18 @@ def _verify_installed(installation: Installation, expected: str) -> str:
     return installed
 
 
-def upgrade(*, dry_run: bool = False, current_version: str = __version__, installation=None) -> dict:
+def _installed_version() -> str:
+    """Read package metadata on every call, including after an in-process upgrade."""
+    try:
+        return importlib.metadata.version("sesskit")
+    except importlib.metadata.PackageNotFoundError:
+        return __version__
+
+
+def upgrade(*, dry_run: bool = False, current_version: str | None = None, installation=None) -> dict:
     """Check or perform one explicit upgrade, returning JSON-serializable facts."""
     installation = installation or detect_installation()
+    current_version = current_version or _installed_version()
     _version_parts(current_version)
     release = discover_latest_release()
     current_key = _version_parts(current_version)

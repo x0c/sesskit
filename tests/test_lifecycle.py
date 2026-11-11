@@ -128,6 +128,21 @@ def test_upgrade_uses_normalized_pin_and_verifies_in_fresh_process():
     assert "importlib.metadata" in verify_command[2]
 
 
+def test_repeated_upgrade_in_one_process_rereads_installed_metadata():
+    pip = _completed(["pip"])
+    verify = _completed(["verify"], stdout="0.3.2\n")
+    with mock.patch.object(lifecycle, "discover_latest_release", return_value=_release()), \
+         mock.patch.object(lifecycle.importlib.metadata, "version", side_effect=["0.3.1", "0.3.2"]), \
+         mock.patch.object(lifecycle, "_run", side_effect=[pip, verify]) as run:
+        first = lifecycle.upgrade(installation=_installation())
+        second = lifecycle.upgrade(installation=_installation())
+    assert first["status"] == "updated"
+    assert second["status"] == "unchanged"
+    assert second["current_version"] == "0.3.2"
+    assert second["command"] is None
+    assert run.call_count == 2
+
+
 def test_pip_failure_is_structured_and_does_not_claim_verification():
     failed = _completed(["pip"], code=1, stderr="No matching distribution found")
     with mock.patch.object(lifecycle, "discover_latest_release", return_value=_release()), \
