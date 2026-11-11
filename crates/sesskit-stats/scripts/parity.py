@@ -27,7 +27,6 @@ import sys
 import time
 from collections import Counter
 
-
 ENGINE_RUNTIMES = ("claude", "codex", "opencode", "pi")
 
 
@@ -391,7 +390,7 @@ def check_activity_counts(
     outliers.sort(
         key=lambda o: (
             o["runtime"],
-            -(abs((o["ratio"] or 0)) if o["ratio"] not in (None, float("inf")) else 1e9),
+            -(abs(o["ratio"] or 0) if o["ratio"] not in (None, float("inf")) else 1e9),
         )
     )
     return {"per_runtime": per_runtime, "outliers": outliers}

@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from unittest import mock
 
-from sesskit import cli
+import pytest
+
+from sesskit import __version__, cli
 from sesskit.models import ConversationMessage, make_session_info
 from sesskit.registry import ParserRegistry, RuntimeParser
 
@@ -77,5 +79,44 @@ def test_describe(capsys):
     assert code == 0
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True
-    names = {c["name"] for c in out["data"]["commands"]}
-    assert {"list", "show", "share", "export", "search", "describe"} <= names
+    assert out["data"]["tool_version"] == __version__
+    assert out["meta"]["tool_version"] == __version__
+    commands = {c["name"]: c for c in out["data"]["commands"]}
+    assert {"list", "show", "share", "export", "search", "describe", "version", "upgrade"} <= set(commands)
+    assert commands["upgrade"]["risk"] == "write_local"
+    assert commands["list"]["risk"] == "read"
+
+
+@pytest.mark.parametrize("flag", ["--version", "-V"])
+def test_version_flag_is_plain_text_and_offline(flag, capsys):
+    with mock.patch.object(cli, "default_registry") as registry, pytest.raises(SystemExit) as caught:
+        cli.dispatch([flag])
+    assert caught.value.code == 0
+    assert capsys.readouterr().out.strip() == f"sesskit {__version__}"
+    registry.assert_not_called()
+
+
+def test_version_command_uses_versioned_envelope(capsys):
+    with mock.patch.object(cli, "default_registry", _registry):
+        code = cli.dispatch(["version", "--compact"])
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["data"] == {"name": "sesskit", "version": __version__}
+    assert out["meta"] == {"version": 1, "tool_version": __version__}
+
+
+def test_usage_error_also_carries_tool_version(capsys):
+    with pytest.raises(SystemExit) as caught:
+        cli.dispatch([])
+    assert caught.value.code == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"]["code"] == "usage_error"
+    assert out["meta"]["tool_version"] == __version__
+
+
+def test_root_help_contains_tool_version(capsys):
+    with pytest.raises(SystemExit) as caught:
+        cli.dispatch(["--help"])
+    assert caught.value.code == 0
+    assert f"sesskit {__version__}" in capsys.readouterr().out

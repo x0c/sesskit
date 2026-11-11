@@ -71,11 +71,13 @@ def _scan_pi(directory: Path, procs: list, host=None, envs: dict | None = None):
         mock.patch.object(scan_pi, "live_processes", return_value=list(procs)),
         mock.patch.object(scan_pi, "process_command_line", return_value="pi --approve"),
         mock.patch.object(scan_pi, "open_file_paths", return_value={pid: [] for pid, _ in procs}),
-        mock.patch.object(scan_pi, "process_start_time", return_value=None),
+        mock.patch.object(scan_pi, "process_start_times", return_value={}),
         mock.patch.object(
             scan_pi,
-            "process_environ",
-            side_effect=lambda pid, **kwargs: dict(envs.get(pid, {}) if envs else {}),
+            "process_environs",
+            side_effect=lambda pids, **kwargs: {
+                pid: dict(envs.get(pid, {}) if envs else {}) for pid in pids
+            },
         ),
     ):
         scan_pi.reset_live_session_overrides()

@@ -2247,6 +2247,9 @@ def metric_summary_to_dict(summary: MetricSummary) -> dict:
         "interval_total": summary.interval_total,
         "complete_total": summary.complete_total,
         "reported_total": summary.reported_total,
+        "total_to_report": (
+            summary.complete_total if summary.complete_total is not None else summary.known_total
+        ),
         "unattributed": summary.unattributed,
         "coverage": summary.coverage,
         "contributing": list(summary.contributing),

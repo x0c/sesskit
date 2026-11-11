@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+from sesskit import __version__
+
 API_VERSION = 1
 
 EXIT_OK = 0
@@ -30,8 +32,12 @@ def print_envelope(payload: dict, compact: bool = False) -> None:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def _meta() -> dict:
+    return {"version": API_VERSION, "tool_version": __version__}
+
+
 def ok(data) -> dict:
-    return {"ok": True, "data": data, "error": None, "meta": {"version": API_VERSION}}
+    return {"ok": True, "data": data, "error": None, "meta": _meta()}
 
 
 def err(exc: ApiError) -> dict:
@@ -44,5 +50,5 @@ def err(exc: ApiError) -> dict:
             "hint": exc.hint,
             "next_commands": exc.next_commands,
         },
-        "meta": {"version": API_VERSION},
+        "meta": _meta(),
     }

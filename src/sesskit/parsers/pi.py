@@ -26,8 +26,9 @@ from sesskit.parsers.common import (
     parse_timestamp,
     preprocess_excerpt,
     process_command_line,
-    process_environ,
+    process_environs,
     process_start_time,
+    process_start_times,
     stat_signature,
     terminal_error_evidence,
 )
@@ -1379,18 +1380,14 @@ def _apply_live_flags(
         tui_procs.append((pid, cwd))
     if not tui_procs:
         return
-    starts = {
-        pid: started
-        for pid, started in ((pid, process_start_time(pid)) for pid, _cwd in tui_procs)
-        if started is not None
-    }
+    starts = process_start_times([pid for pid, _cwd in tui_procs])
     live_map = _live_map_path(host)
     _load_persisted_overrides([pid for pid, _cwd in tui_procs], starts, created_ts, live_map)
     open_paths = open_file_paths([pid for pid, _cwd in tui_procs])
     host_keys = tuple(host.env_keys) if host is not None else ()
     if host is not None and host.pi_instance_env_key:
         host_keys = (*host_keys, host.pi_instance_env_key)
-    envs = {pid: process_environ(pid, extra_keys=host_keys) for pid, _cwd in tui_procs}
+    envs = process_environs([pid for pid, _cwd in tui_procs], extra_keys=host_keys)
 
     # Host identity claims: the provider returns live claims only; SessKit binds
     # by the exact session ref, then by the exact session path, newest first.

@@ -60,9 +60,11 @@ graph TD
 ### Snapshot envelope and exit contract
 
 Success prints `{"ok": true, "data": {...}, "error": null, "meta":
-{"version": 1}}`. Failure prints `ok: false` with `data: null` and an `error`
-object carrying `code`, `message`, `hint`, and `next_commands`. The process
-exit code mirrors the outcome so scripts can branch without parsing JSON.
+{"version": 1, "tool_version": "X.Y.Z"}}`. `meta.version` belongs to the
+envelope schema; `meta.tool_version` identifies the installed package. Failure
+prints `ok: false` with `data: null` and an `error` object carrying `code`,
+`message`, `hint`, and `next_commands`. The process exit code mirrors the
+outcome so scripts can branch without parsing JSON.
 
 ### List flow
 
@@ -105,14 +107,27 @@ documents under the product cache directory.
 ### Describe flow
 
 `cmd_describe()` prints command specs as data so tooling can discover flags
-without scraping help text. Unknown command names produce usage errors
-pointing at the describe command itself.
+without scraping help text. Output includes the package version and each
+command's read/write risk. Unknown command names produce usage errors pointing
+at the describe command itself.
+
+### Version and installation lifecycle
+
+Root `--version` / `-V` is plain text and exits before registry construction;
+`version` returns the normal snapshot envelope. `upgrade --dry-run` resolves the
+latest GitHub release and compares versions without invoking pip. An explicit
+`upgrade` is forward-only, supports only owned pip environments, captures pip
+output, and verifies package metadata in a fresh Python process. It never reads
+or writes native session history; foreign package-manager ownership is a
+structured error rather than a bypass.
 
 ## §2.5 Physical path cheat sheet
 
 | Directory (relative to project root) | Contents | Key classes / file count |
 |------|------|--------|
 | `src/sesskit/cli.py` | Snapshot handlers and shared command registration/dispatch | `cmd_list()`, `cmd_search()`, `cmd_show()`, `cmd_export()`, `cmd_share()`, `cmd_describe()`, `resolve_ref()`, `build_parser()`, `dispatch()`, `main()` |
+| `src/sesskit/lifecycle.py` | Latest-release discovery, installation ownership, forward-only upgrade and version readback | `discover_latest_release()`, `detect_installation()`, `upgrade()`, `UpgradeError` |
+| `src/sesskit/lifecycle_cli.py` | Offline version and upgrade snapshot handlers | `cmd_version()`, `cmd_upgrade()` |
 | `src/sesskit/streaming_cli.py` | JSONL observer, input framing and observation budgets | `cmd_stream()`, `StreamCommand.run()`, `print_stream_error()` |
 | `src/sesskit/streaming.py` | Message-stream records and live/history reconciliation | `open_message_stream()`, `MessageStream` |
 | `src/sesskit/envelope.py` | Snapshot envelope constructors and exit codes | `ok()`, `err()`, `print_envelope()`, `ApiError`, `API_VERSION`, `EXIT_OK`, `EXIT_ERROR`, `EXIT_USAGE`, `EXIT_NOT_FOUND`, `EXIT_AMBIGUOUS` |
@@ -133,7 +148,9 @@ pointing at the describe command itself.
 | Build and write share payload | `src/sesskit/cli.py` | `build_share_payload()`, `write_share_envelope()`, `cmd_share()` | Rich events plus metadata; atomic write with protected-path checks |
 | Stage share in cache | `src/sesskit/cli.py` | `share_cache_path()`, `export_share_to_cache()` | Repeatable cache location under the product cache dir |
 | Observe one session's message updates | `src/sesskit/streaming_cli.py` | `cmd_stream()`, `StreamCommand.run()` | JSONL, read-only, bounded by default; unavailable native feed degrades to history |
-| Print command help as data | `src/sesskit/cli.py` | `cmd_describe()`, `_describe_command()` | Unknown names route back to describe hints |
+| Print command help as data | `src/sesskit/cli.py` | `cmd_describe()`, `_describe_command()` | Version plus read/write risk; unknown names route back to describe hints |
+| Read the installed package version | `src/sesskit/cli.py`, `src/sesskit/lifecycle_cli.py` | root version action, `cmd_version()` | Plain `--version` / `-V`, or snapshot `version`; no registry/network |
+| Check or upgrade the installed package | `src/sesskit/lifecycle.py`, `src/sesskit/lifecycle_cli.py` | `upgrade()`, `cmd_upgrade()` | Dry-run first; forward-only pip ownership, no history writes |
 | Dispatch argv | `src/sesskit/cli.py` | `build_parser()`, `dispatch()`, `main()` | JSON argument parser plus subcommand routing |
 | Build success or error envelopes | `src/sesskit/envelope.py` | `ok()`, `err()`, `print_envelope()` | Single envelope shape with version meta |
 | Refresh one hot session | `src/sesskit/registry.py` | `refresh_session()` | Same builder and memo as the next scan; no list filters or liveness |
@@ -151,6 +168,7 @@ envelope fields that callers filter, clip, or match on.
 | Envelope `ok` / `data` / `error` / `meta` | `src/sesskit/envelope.py` envelope | Snapshot-command output contract | Preserve existing success/failure envelopes; do not apply this wrapper to `stream` |
 | Stream `schema` / `type` / `generation` / `mode` | `src/sesskit/streaming.py` records | Independently parseable `sesskit.message-stream/v1` observations | Whole-value upsert/reset semantics; errors also use end records; see the dedicated guide |
 | Envelope `error.code` / `message` / `hint` / `next_commands` | `src/sesskit/envelope.py` error object | Machine code plus human guidance plus follow-ups | Keep hints actionable with exact next commands |
+| Envelope `meta.version` / `meta.tool_version` | `src/sesskit/envelope.py` envelope metadata | Envelope schema version versus installed package version | Additive fields; never use schema version as the tool version |
 | `session_payload()` projection | `src/sesskit/cli.py` session shaping | Field-selected session view | Projection never changes scan or filter semantics |
 | `first_user_msg` / `last_user_msg` / `last_agent_msg` | `src/sesskit/titles.py` excerpt pipeline | Bounded 300-character previews | Handoff digests extracted before clipping; error text may fill agent excerpts on abnormal ends |
 | `native_title` / `fallback_title` | Parser session builders plus title helpers | Authoritative versus derived titles | Native preferred; fallback derives from first meaningful user text |
@@ -194,6 +212,7 @@ flow are documented in the message streaming guide.
 ## §7 Common easy-to-miss conditions and validation paths
 
 - After changing snapshot commands: run `python3 -m pytest tests/test_cli_smoke.py -q` and confirm envelope shapes plus exit codes hold.
+- After changing version/upgrade behavior: run `python3 -m pytest tests/test_lifecycle.py tests/test_cli_smoke.py -q`; then run `sesskit upgrade --dry-run` in a disposable pip-managed venv. Confirm no pip invocation in dry-run, forward-only status, absolute Python argv, structured foreign-owner failures, and post-upgrade metadata readback. Never test through a real Homebrew installation or native history path.
 - After changing `stream`: run `python3 -m pytest tests/test_message_stream.py -ra`; verify independently parseable data/error-end lines, automatic degradation, restored-source recovery and observation budgets. Do not wrap its output in a snapshot envelope.
 - After changing list or search: run `sesskit list --top 5 --compact` and `sesskit search refactor --top 3`, then confirm one JSON envelope per command with bounded excerpts and ranked snippets.
 - After changing show: run `sesskit show <session-id-or-prefix> --full` for a known session plus one unknown id, and confirm the known session prints messages while the unknown id returns a not-found envelope (exit 3) and a prefix collision returns an ambiguous envelope (exit 5).

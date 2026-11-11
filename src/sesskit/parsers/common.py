@@ -684,6 +684,40 @@ def process_start_time(pid: int) -> float | None:
     return time.time() - elapsed
 
 
+def process_start_times(pids: list[int]) -> dict[int, float]:
+    """Batch ``process_start_time`` for one candidate set.
+
+    A single ``ps`` row read preserves the existing etime interpretation while
+    avoiding one fork per agent process. Missing/dead PIDs stay absent.
+    """
+    unique = list(dict.fromkeys(pids))
+    if not unique:
+        return {}
+    if len(unique) == 1:
+        started = process_start_time(unique[0])
+        return {unique[0]: started} if started is not None else {}
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", ",".join(str(pid) for pid in unique), "-o", "pid=,etime="],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    now = time.time()
+    result: dict[int, float] = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid = int(parts[0])
+        if pid not in unique:
+            continue
+        elapsed = _etime_seconds(parts[1])
+        if elapsed is not None:
+            result[pid] = now - elapsed
+    return result
+
+
 def live_pids_by_process_name(process_name: str) -> dict[str, int]:
     """返回「工作目录 -> pid」映射，供没有 pid 注册表、也不能靠 lsof 定位单个
     历史文件、且同目录只标最新一条的运行时（目前是 Kimi Code）复用：找到存活的
@@ -713,15 +747,40 @@ def process_command_line(pid: int) -> str:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 text = f.read().replace(b"\x00", b" ").decode(errors="replace").strip()
         else:
-            out = subprocess.check_output(
-                ["ps", "-p", str(pid), "-o", "command="],
-                stderr=subprocess.DEVNULL,
-            )
-            text = out.decode(errors="replace").strip()
+            table = _ps_axo_pid_command()
+            if table:
+                text = ""
+                for line in table.splitlines():
+                    parts = line.strip().split(None, 1)
+                    if parts and parts[0] == str(pid):
+                        text = parts[1].strip() if len(parts) == 2 else ""
+                        break
+            else:
+                out = subprocess.check_output(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    stderr=subprocess.DEVNULL,
+                )
+                text = out.decode(errors="replace").strip()
     except (OSError, subprocess.CalledProcessError, FileNotFoundError):
         text = ""
     _PROC_CMDLINE_CACHE[pid] = text
     return text
+
+
+def _extract_wanted_environment(out: str, wanted: tuple[str, ...], env: dict[str, str]) -> None:
+    """Merge only declared keys from one process's ``ps eww`` segment."""
+    for key in wanted:
+        if key in env:
+            continue
+        marker = f"{key}="
+        start = out.find(marker)
+        if start < 0:
+            continue
+        start += len(marker)
+        end = start
+        while end < len(out) and not out[end].isspace():
+            end += 1
+        env[key] = out[start:end]
 
 
 def process_environ(
@@ -764,20 +823,70 @@ def process_environ(
         return {}
     env = dict(cached) if cached is not None else {}
     # ps eww 把环境变量拼在同一行；只提取调用方声明的键，避免把命令参数误当环境。
-    for key in wanted:
-        if key in env:
-            continue
-        marker = f"{key}="
-        start = out.find(marker)
-        if start < 0:
-            continue
-        start += len(marker)
-        end = start
-        while end < len(out) and not out[end].isspace():
-            end += 1
-        env[key] = out[start:end]
+    _extract_wanted_environment(out, wanted, env)
     _PROC_ENVIRON_CACHE[pid] = env
     return {key: env[key] for key in wanted if key in env}
+
+
+def process_environs(
+    pids: list[int],
+    *,
+    extra_keys: tuple[str, ...] | list[str] = (),
+) -> dict[int, dict[str, str]]:
+    """Batch initial-environ reads without changing the declared-key boundary.
+
+    Linux retains direct ``/proc`` reads through ``process_environ``. macOS uses
+    one ``ps eww`` call for the candidate set and segments rows by the requested
+    PID column; continuation lines stay with their current process. Processes
+    absent from the snapshot and query failures degrade to empty dictionaries.
+    """
+    unique = list(dict.fromkeys(pids))
+    if not unique:
+        return {}
+    if len(unique) == 1 or sys.platform.startswith("linux"):
+        return {pid: process_environ(pid, extra_keys=extra_keys) for pid in unique}
+    wanted = tuple(dict.fromkeys((*GENERIC_ENV_KEYS, *(extra_keys or ()))))
+    result: dict[int, dict[str, str]] = {}
+    missing: list[int] = []
+    for pid in unique:
+        cached = _PROC_ENVIRON_CACHE.get(pid)
+        if cached is not None and set(wanted) <= set(cached):
+            result[pid] = {key: cached[key] for key in wanted if key in cached}
+        else:
+            missing.append(pid)
+    if not missing:
+        return result
+    try:
+        out = subprocess.check_output(
+            [
+                "ps", "eww", "-p", ",".join(str(pid) for pid in missing),
+                "-o", "pid=,command=",
+            ],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+        for pid in missing:
+            _PROC_ENVIRON_CACHE[pid] = {}
+            result[pid] = {}
+        return result
+
+    requested = set(missing)
+    segments: dict[int, str] = {}
+    current: int | None = None
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if parts and parts[0].isdigit() and int(parts[0]) in requested:
+            current = int(parts[0])
+            segments[current] = parts[1] if len(parts) == 2 else ""
+        elif current is not None:
+            segments[current] += "\n" + line
+    for pid in missing:
+        cached = _PROC_ENVIRON_CACHE.get(pid)
+        env = dict(cached) if cached is not None else {}
+        _extract_wanted_environment(segments.get(pid, ""), wanted, env)
+        _PROC_ENVIRON_CACHE[pid] = env
+        result[pid] = {key: env[key] for key in wanted if key in env}
+    return result
 
 
 def open_file_paths(pids: list[int]) -> dict[int, list[str]]:

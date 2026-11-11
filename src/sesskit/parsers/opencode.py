@@ -34,8 +34,8 @@ from sesskit.parsers.common import (
     live_processes,
     preprocess_excerpt,
     process_command_line,
-    process_environ,
-    process_start_time,
+    process_environs,
+    process_start_times,
     terminal_error_evidence,
 )
 
@@ -381,6 +381,10 @@ def _apply_live_flags(
     if not tui_procs:
         return
 
+    envs = process_environs(
+        [pid for pid, _cwd in tui_procs],
+        extra_keys=host.env_keys if host is not None else (),
+    )
     bound_pids: set[int] = set()
 
     def bind_exact(pid: int) -> None:
@@ -391,7 +395,7 @@ def _apply_live_flags(
                 _mark_live(by_id[session_id], pid)
             bound_pids.add(pid)
             return
-        env = process_environ(pid, extra_keys=host.env_keys if host is not None else ())
+        env = envs.get(pid) or {}
         ident = host_session_ident(env, host)
         session = _session_for_host_ident(by_id, ident)
         if session is not None:
@@ -411,12 +415,13 @@ def _apply_live_flags(
 
     continue_by_cwd: dict[str, list[int]] = {}
     unmatched: list[tuple[int, str, float]] = []
+    starts = process_start_times([pid for pid, _cwd in remaining])
     for pid, cwd in remaining:
         cmdline = cmdlines.get(pid) or ""
         if _is_continue_cmdline(cmdline):
             continue_by_cwd.setdefault(cwd, []).append(pid)
             continue
-        started = process_start_time(pid)
+        started = starts.get(pid)
         if started is None:
             continue
         unmatched.append((pid, cwd, started))

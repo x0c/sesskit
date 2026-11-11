@@ -31,9 +31,14 @@ SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装指定版本的 
 需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。暂不支持 Windows。
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" "sesskit==0.3.1"
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" sesskit
 python -m sesskit describe
 ```
+
+已有 pip 管理的安装可用 `sesskit upgrade --dry-run` 只检查最新版本，用
+`sesskit upgrade` 执行只升不降的升级并回读版本。无需调用 `gh`、手工查 tag、
+运行 `pip show` 或转换 `v` 前缀。由其他包管理器拥有（例如 Homebrew）的安装
+仍使用该管理器的升级路径。
 
 macOS 和 Linux 使用相同命令，无需 Git 或本地构建工具。
 尚无虚拟环境时，先运行 `python3 -m venv .venv && . .venv/bin/activate`。
@@ -60,7 +65,7 @@ sesskit verify --sample 30
 快照命令均输出同一套 JSON 信封：
 
 ```json
-{"ok": true, "data": {...}, "error": null, "meta": {"version": 1}}
+{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.1"}}
 ```
 
 ## Python API
@@ -95,7 +100,8 @@ for runtime_id, items in sessions.items():
 [能力矩阵](docs/INTEGRATION_GUIDE.md#capability-matrix)。`sesskit describe` 也会返回能力声明；
 拿不到的数据不等于零，也不能当成成功证据。
 
-只读。不会启动助手、恢复对话，也不会改写历史文件。
+会话历史保持只读。不会启动助手、恢复对话或改写历史文件；显式运行的
+`upgrade` 命令只更改 SessKit 自己由 pip 管理的安装环境。
 
 会真实启动助手会话的自动化（测试、评测、探针）可以在工作区根目录放一个空的 `.sesskit-ignore` 文件，即可将其排除在列表之外；见 [`docs/CONTRACT.md`](docs/CONTRACT.md)。
 
@@ -111,8 +117,10 @@ sesskit performance pi:SESSION_ID --detail records --limit 100
 ```
 
 Python 接口：`load_usage`、`summarize_usage`、`UsageSelection`、`load_performance`。
-保留每次调用、消息、轮次和会话的统计范围、覆盖情况与原生计时含义；
-缺失不是零，客户端耗时也不是服务端纯解码速度。SessKit 提供数据，不做评测打分。
+只需一个 Token 数时读取 `data.summary.metrics.total_tokens.total_to_report`，
+并同时保留旁边的 `coverage`；部分数据不等于完整总量。保留每次调用、消息、
+轮次和会话的统计范围与原生计时含义；缺失不是零，客户端耗时也不是服务端
+纯解码速度。SessKit 提供数据，不做评测打分。
 运行时支持、筛选、示例和 Schema 见[接入指南](docs/INTEGRATION_GUIDE.md#historical-timing-and-generation-speed)。
 
 ## 契约

@@ -456,6 +456,11 @@ Per metric return:
   explicitly declared native scope; otherwise null.
 - Native `reported_totals`, calculated `detail_total`, selected record ids,
   unattributed amounts where derivable, and reconciliation diagnostics.
+- `total_to_report` is the additive convenience value for consumers that want
+  one number: use `complete_total` when non-null, otherwise `known_total`, and
+  null when neither is defensible. It never changes the underlying evidence or
+  coverage: partial and conflicted results remain explicitly partial/conflicted,
+  and the convenience value must not be presented as a complete scope total.
 - Coverage: `complete`, `partial`, `unknown`, `conflicted`, `not_recorded`, or
   `unsupported`, plus counts of observed/selected/unattributed/rejected records.
   Do not invent a percentage when the true number of calls is unknown.
@@ -603,7 +608,10 @@ network dependencies or implicit file writes for this feature.
   return that token through `--cursor`. Invalid/stale tokens fail explicitly and
   provide a fresh-read command; `--limit`/`--cursor` are invalid in summary mode.
 - Summary coverage is independent of the returned page size. A page's sum is
-  never advertised as the session total. Exact `--turn-id` and `--message-id`
+  never advertised as the session total. Each serialized metric also carries
+  `total_to_report`, the documented convenience choice of `complete_total` then
+  `known_total`; consumers must still read its adjacent coverage.
+  Exact `--turn-id` and `--message-id`
   selectors are mutually exclusive and report matched and unlinked-record counts.
   Unknown attribution is not a zero-token message; report unavailable coverage.
   Unsupported filters/options fail; they are not accepted and ignored.

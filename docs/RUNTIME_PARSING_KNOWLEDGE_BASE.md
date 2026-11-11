@@ -171,7 +171,12 @@ line with the inner task winning and leftover pickup phrasing dropped.
 Liveness never launches processes. Scanners snapshot the process table once
 per scan, resolve command lines and initial environ for candidate agent
 processes, match open history paths or explicit session-id flags, and mark
-`live` plus `pid` on the matching session record. Sub-agent style chats are
+`live` plus `pid` on the matching session record. Command lines reuse that same
+`ps` table; macOS start times and initial environ are batch-read by candidate
+PID set (`ps -p … -o pid=,etime=` and `ps eww -p … -o pid=,command=`), while
+Linux keeps its direct `/proc` reads. Only declared generic/host environment
+keys are extracted. Do not reintroduce one `ps` fork per candidate PID or change
+the binding evidence as a performance shortcut. Sub-agent style chats are
 attributed to their root parent session so the list shows progress on the
 parent while the child still works. A missing short process-name match alone
 never proves termination; open-file evidence outranks the name match.

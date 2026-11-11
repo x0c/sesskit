@@ -93,6 +93,22 @@ def test_payload_shape_matches_schema_required_keys(tmp_path):
     }
 
 
+def test_metric_total_to_report_prefers_complete_then_known():
+    complete = usage_mod.metric_summary_to_dict(usage_mod.MetricSummary(
+        known_total=15, complete_total=20, coverage="partial",
+    ))
+    known = usage_mod.metric_summary_to_dict(usage_mod.MetricSummary(
+        known_total=15, complete_total=None, coverage="partial",
+    ))
+    unknown = usage_mod.metric_summary_to_dict(usage_mod.MetricSummary(coverage="unknown"))
+    assert complete["total_to_report"] == 20
+    assert complete["coverage"] == "partial"
+    assert known["total_to_report"] == 15
+    assert known["coverage"] == "partial"
+    assert unknown["total_to_report"] is None
+    assert unknown["coverage"] == "unknown"
+
+
 def test_load_usage_empty_reports_not_recorded(tmp_path):
     path = str(tmp_path / "s.jsonl")
     _write_jsonl(path, [{"type": "assistant", "message": {"id": "m1", "content": []}}])
@@ -164,6 +180,7 @@ def test_cli_summary_envelope(tmp_path, capsys):
     assert out["ok"] is True
     assert out["data"]["schema"] == "sesskit.usage/v1"
     assert out["data"]["summary"]["metrics"]["input_total"]["known_total"] == 150
+    assert out["data"]["summary"]["metrics"]["input_total"]["total_to_report"] == 150
 
 
 def test_cli_detail_paging_roundtrip(tmp_path, capsys):

@@ -12,8 +12,9 @@ External developers must be able to adopt SessKit without any downstream host.
 First-use examples cover search ingestion, native usage and outcome inspection,
 and incremental consumption. They use public APIs only, do not launch agents or
 modify history, and introduce no telemetry, network service, or runtime dependency.
-The snapshot CLI envelope and existing schemas remain unchanged. Examples are application
-recipes, not additional stable CLI commands or a new typed JSON schema.
+The snapshot CLI envelope and existing schemas remain backward-compatible; new
+fields are additive. Examples are application recipes, not additional stable CLI
+commands or a new typed JSON schema.
 
 ## Stream messages
 
@@ -30,9 +31,13 @@ project's virtual environment and install the published wheel. If you need a new
 environment, run `python3 -m venv .venv && . .venv/bin/activate` first.
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" "sesskit==0.3.1"
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" sesskit
 python -m sesskit describe
 ```
+
+For later upgrades, run `sesskit upgrade --dry-run` to check without writing and
+`sesskit upgrade` to upgrade a supported pip-managed installation with version
+readback. The CLI discovers the release and handles the tag/package-version split.
 
 This avoids Git and local build tools. Use the same interpreter for installation
 and your application. The index selects a compatible prebuilt Rust wheel or the
@@ -103,8 +108,12 @@ narrow = summarize_usage(snapshot, selection=UsageSelection(message_ids=("m1",))
 `summary.known_total` sums only proven non-overlapping records; a stored
 session rollup only ever sets `complete_total`, never joins the sums. Every
 total carries its coverage (`complete`/`partial`/`unknown`/`conflicted`/
-`not_recorded`/`unsupported`) and contributing record ids. The versioned
-`sesskit.usage/v1` payload is described by `schemas/usage.v1.json` (duplicated
+`not_recorded`/`unsupported`) and contributing record ids. For a single CLI
+value, read `data.summary.metrics.total_tokens.total_to_report` (or the same
+field under another metric): it selects `complete_total` when available,
+otherwise the defensible `known_total`. Always retain the adjacent `coverage`;
+a partial or conflicted value is not promoted to a complete scope total. The
+versioned `sesskit.usage/v1` payload is described by `schemas/usage.v1.json` (duplicated
 under `src/sesskit/schemas/`). The [native usage data design](NATIVE_USAGE_DATA_DESIGN.md)
 specifies the full reconciliation rules. SessKit supplies native data;
 evaluation and the meaning of an external task remain with the consumer.

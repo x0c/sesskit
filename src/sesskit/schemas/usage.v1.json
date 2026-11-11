@@ -47,6 +47,10 @@
         "interval_total": { "type": ["integer", "number", "null"] },
         "complete_total": { "type": ["integer", "number", "null"] },
         "reported_total": { "type": ["integer", "number", "null"] },
+        "total_to_report": {
+          "type": ["integer", "number", "null"],
+          "description": "Convenience value: complete_total when non-null, otherwise known_total. Read coverage alongside it; partial/conflicted evidence is not promoted to a complete total."
+        },
         "unattributed": { "type": ["integer", "number", "null"] },
         "coverage": {
           "type": "string",

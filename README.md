@@ -32,9 +32,15 @@ SessKit is not on PyPI yet. Install the fixed-release wheel in your project's vi
 Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not supported on Windows.
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" "sesskit==0.3.1"
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" sesskit
 python -m sesskit describe
 ```
+
+For an existing pip-managed installation, `sesskit upgrade --dry-run` checks the
+latest release without changing anything, and `sesskit upgrade` performs a
+forward-only upgrade and verifies the installed version. No `gh` call, manual tag
+discovery, `pip show`, or `v`-prefix conversion is needed. Package-manager-owned
+installations (for example Homebrew) keep their owner's upgrade route.
 
 The same command works on macOS and Linux; no Git or local build tools are needed.
 Need a virtual environment first? Run `python3 -m venv .venv && . .venv/bin/activate`.
@@ -61,7 +67,7 @@ After changing parsers or load wiring, run `sesskit verify`: it cross-checks con
 Snapshot commands print one JSON envelope:
 
 ```json
-{"ok": true, "data": {...}, "error": null, "meta": {"version": 1}}
+{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.1"}}
 ```
 
 ## Python API
@@ -93,8 +99,10 @@ sesskit performance pi:SESSION_ID --detail records --limit 100
 ```
 
 Python: `load_usage`, `summarize_usage`, `UsageSelection`, and `load_performance`.
-Keep per-call/message/turn/session scope, coverage and native timing meanings;
-missing values are not zero and client timing is not provider decode speed.
+For one token number, use `data.summary.metrics.total_tokens.total_to_report`
+and keep its adjacent `coverage`; partial data is not a complete total. Keep
+per-call/message/turn/session scope and native timing meanings; missing values
+are not zero and client timing is not provider decode speed.
 SessKit supplies data, not evaluation scores. See the [integration guide](docs/INTEGRATION_GUIDE.md#historical-timing-and-generation-speed)
 for runtime support, selectors, examples and schemas.
 
@@ -113,7 +121,9 @@ See the [capability matrix](docs/INTEGRATION_GUIDE.md#capability-matrix) for typ
 activity, incremental reading, questions, native turn markers, usage, and compaction.
 Capabilities are also returned by `sesskit describe`; if a runtime exposes no data, SessKit reports it as unavailable — never as zero, and never as success.
 
-Read-only. It does not launch agents, resume chats, or write history.
+Session history is read-only. SessKit does not launch agents, resume chats, or
+write history. The explicit `upgrade` command changes only its own pip-managed
+package installation.
 
 If your automation launches real agent sessions (tests, evals, probes), keep them out of listings by placing an empty `.sesskit-ignore` file in its workspace root; see [`docs/CONTRACT.md`](docs/CONTRACT.md).
 

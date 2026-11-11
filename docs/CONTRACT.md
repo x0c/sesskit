@@ -7,8 +7,11 @@ command instead emits the versioned JSONL event protocol below; existing command
 and their envelopes are unchanged:
 
 ```json
-{"ok": true, "data": {}, "error": null, "meta": {"version": 1}}
+{"ok": true, "data": {}, "error": null, "meta": {"version": 1, "tool_version": "0.3.1"}}
 ```
+
+`meta.version` is the envelope schema version. The additive `meta.tool_version`
+is the installed SessKit package version; consumers must not confuse the two.
 
 On failure `ok` is false, `data` is null, and `error` has `code`, `message`, `hint`, `next_commands`.
 
@@ -124,6 +127,34 @@ the transport owner's responsibility. See the [integration guide](MESSAGE_STREAM
 ## Install
 
 Not on PyPI yet. Documented install is GitHub (`pip install "sesskit @ git+https://github.com/x0c/sesskit.git"`) or editable source. Corral Homebrew vendors the GitHub Release **sdist** (`scripts/sesskit_dep.py` / formula resource) — do not switch Corral’s runtime dep to a git URL.
+
+## CLI version and installation lifecycle
+
+- `sesskit --version` and `sesskit -V` print `sesskit X.Y.Z` and exit 0 without
+  scanning history or accessing the network. `sesskit version` is the equivalent
+  snapshot-envelope command. `describe` and root `--help` also expose the package
+  version.
+- The documented fixed-release install uses the release's `expanded_assets/vX.Y.Z`
+  HTML page with an **unpinned** `sesskit` requirement. Release tags retain the
+  `v` prefix; package versions never do. Consumers no longer assemble that split
+  themselves for upgrades.
+- `sesskit upgrade --dry-run` discovers the latest release and compares versions
+  without installing or invoking pip. Discovery follows GitHub's official
+  `releases/latest` redirect, validates a numeric `vX.Y.Z` tag, and uses that tag's
+  `expanded_assets` page. A direct `releases/latest/download/wheels.html` URL is
+  not a supported pip page: GitHub serves the asset as `application/octet-stream`,
+  which pip rejects (verified 2026-11-11).
+- `sesskit upgrade` is forward-only. It reports `unchanged` at the same version,
+  `ahead` when the local package is newer, and upgrades an older pip-managed
+  virtualenv/pipx/uv-tool or pip-user installation with the normalized package
+  pin `sesskit==X.Y.Z`. It captures pip output, then verifies the installed
+  metadata version in a fresh Python process. Repeated runs converge to
+  `unchanged`; downgrades are never implicit.
+- Installations owned by another package manager (including Homebrew) or a
+  non-writable environment return a structured error instead of writing through
+  the owner. The upgrade command writes only SessKit's own Python installation;
+  every session/history command remains read-only and no command launches an
+  agent or writes native history.
 
 ## Status tags and abnormal endings
 

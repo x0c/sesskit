@@ -1,8 +1,9 @@
 """SessKit CLI: language-agnostic JSON interface for local agent sessions.
 
-Commands are read-only. Snapshot output is a JSON envelope; ``stream`` emits
-bare versioned JSONL message observations. Snapshot envelope:
-{"ok": true|false, "data": ..., "error": ..., "meta": {"version": 1}}
+History commands are read-only; ``upgrade`` writes only its own pip-managed
+installation. Snapshot output is a JSON envelope; ``stream`` emits bare
+versioned JSONL message observations. Snapshot envelope:
+{"ok": true|false, "data": ..., "error": ..., "meta": {"version": 1, "tool_version": "X.Y.Z"}}
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 not found, 5 ambiguous.
 """
@@ -15,7 +16,7 @@ import sys
 import time
 from datetime import datetime
 
-from sesskit import titles
+from sesskit import __version__, titles
 from sesskit.adapters import list_adapters
 from sesskit.cache import cache_dir
 from sesskit.envelope import (
@@ -29,6 +30,7 @@ from sesskit.envelope import (
     ok,
     print_envelope,
 )
+from sesskit.lifecycle_cli import cmd_upgrade, cmd_version
 from sesskit.models import format_message_time, session_key
 from sesskit.paths import assert_not_history_path, atomic_write_json
 from sesskit.performance_cli import cmd_performance
@@ -89,17 +91,11 @@ class JSONArgumentParser(argparse.ArgumentParser):
             ), getattr(self, "_stream_ref", "unknown"))
             raise SystemExit(EXIT_USAGE)
         print_envelope(
-            {
-                "ok": False,
-                "data": None,
-                "error": {
-                    "code": "usage_error",
-                    "message": message,
-                    "hint": "run sesskit describe or sesskit describe <command>",
-                    "next_commands": ["sesskit describe"],
-                },
-                "meta": {"version": 1},
-            },
+            err(ApiError(
+                "usage_error", message, EXIT_USAGE,
+                hint="run sesskit describe or sesskit describe <command>",
+                next_commands=["sesskit describe"],
+            )),
             compact=bool(getattr(self, "_stream_errors", False) or self.prog.endswith(" stream")),
         )
         raise SystemExit(EXIT_USAGE)
@@ -912,6 +908,28 @@ COMMANDS = [
         "returns": {"passed": "bool", "runtimes": "per-runtime counts", "totals": "aggregate counts"},
     },
     {
+        "name": "version",
+        "help": "Show the installed SessKit package version (offline; no history scan)",
+        "handler": cmd_version,
+        "args": [
+            {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
+            {"flags": ["--json"], "kwargs": {"action": "store_true", "help": "single-line JSON output (same as --compact)"}},
+        ],
+        "returns": {"name": "sesskit", "version": "installed package version"},
+    },
+    {
+        "name": "upgrade",
+        "help": "Check or upgrade this pip-managed SessKit installation; writes no session history",
+        "handler": cmd_upgrade,
+        "risk": "write_local",
+        "args": [
+            {"flags": ["--dry-run"], "kwargs": {"action": "store_true", "help": "discover and compare versions without invoking pip or writing the installation"}},
+            {"flags": ["--compact"], "kwargs": {"action": "store_true", "help": "single-line JSON output"}},
+            {"flags": ["--json"], "kwargs": {"action": "store_true", "help": "single-line JSON output (same as --compact)"}},
+        ],
+        "returns": {"status": "update_available|updated|unchanged|ahead", "current_version": "verified package version", "command": "absolute Python argv when an upgrade is available"},
+    },
+    {
         "name": "describe",
         "help": "Machine-readable command/argument descriptions",
         "handler": None,
@@ -927,8 +945,9 @@ def cmd_describe(args, _registry: ParserRegistry) -> dict:
         spec = next((c for c in COMMANDS if c["name"] == target), None)
         if spec is None:
             raise ApiError("not_found", f"unknown command: {target}", EXIT_NOT_FOUND)
-        return ok(_describe_command(spec, full=True))
+        return ok({"tool_version": __version__, **_describe_command(spec, full=True)})
     return ok({
+        "tool_version": __version__,
         "commands": [_describe_command(spec, full=False) for spec in COMMANDS],
         "runtimes": [_describe_adapter(adapter) for adapter in list_adapters()],
     })
@@ -945,7 +964,8 @@ def _describe_adapter(adapter) -> dict:
 
 
 def _describe_command(spec: dict, full: bool) -> dict:
-    out = {"name": spec["name"], "help": spec["help"]}
+    default_risk = "write_local" if any("--out" in a["flags"] for a in spec.get("args", [])) else "read"
+    out = {"name": spec["name"], "help": spec["help"], "risk": spec.get("risk", default_risk)}
     if full:
         out["args"] = [{"flags": a["flags"], **{k: v for k, v in a.get("kwargs", {}).items() if k != "type"}} for a in spec.get("args", [])]
         out["returns"] = spec.get("returns")
@@ -1027,7 +1047,14 @@ def _recover_stream_session_ref(argv: list[str], stream_parser) -> str:
 
 
 def build_parser() -> JSONArgumentParser:
-    parser = JSONArgumentParser(prog="sesskit", description="Read/parse/export local coding-agent sessions")
+    parser = JSONArgumentParser(
+        prog="sesskit",
+        description=f"Read/parse/export local coding-agent sessions — sesskit {__version__}",
+    )
+    parser.add_argument(
+        "--version", "-V", action="version", version=f"%(prog)s {__version__}",
+        help="show the installed package version and exit",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     for spec in COMMANDS:
         parts = spec["name"].split()
