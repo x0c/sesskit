@@ -155,6 +155,12 @@ Not on PyPI yet. Documented install is GitHub (`pip install "sesskit @ git+https
   the owner. The upgrade command writes only SessKit's own Python installation;
   every session/history command remains read-only and no command launches an
   agent or writes native history.
+- For local same-version artifact acceptance, install the **exact wheel path**,
+  not `--find-links` on its parent build directory. The generated `wheels.html`
+  intentionally links to the public release; pip reads that page too and may
+  select the older published wheel with the same filename instead of the local
+  candidate (verified 2026-11-11). After installation, compare the imported
+  module's content hash with the wheel and verify real CLI behavior.
 
 ## Status tags and abnormal endings
 
