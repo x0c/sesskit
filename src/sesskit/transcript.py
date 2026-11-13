@@ -295,6 +295,15 @@ def _parse_cursor(session: dict) -> list[dict]:
 # --- Pi ---------------------------------------------------------------------
 
 
+def _parse_antigravity(session: dict) -> list[dict]:
+    from sesskit.activity import load_activity, to_v1_dicts
+
+    snapshot = load_activity(session)
+    if snapshot.state != "available":
+        return []
+    return to_v1_dicts(snapshot)
+
+
 def _parse_pi(session: dict) -> list[dict]:
     # 单一解析源：typed 快照是真相，v1 只是兼容投影（含 message_id 分组）。
     from sesskit.activity import load_activity, to_v1_dicts

@@ -15,7 +15,7 @@
   "properties": {
     "runtime": {
       "type": "string",
-      "description": "claude | codex | opencode | kimi | cursor | pi"
+      "description": "claude | codex | opencode | kimi | cursor | pi | antigravity"
     },
     "id": {
       "type": "string"

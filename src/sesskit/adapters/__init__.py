@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from sesskit.adapters.antigravity import adapter as _antigravity
 from sesskit.adapters.base import Capabilities, RuntimeAdapter
 from sesskit.adapters.claude import adapter as _claude
 from sesskit.adapters.codex import adapter as _codex
@@ -12,7 +13,7 @@ from sesskit.adapters.pi import adapter as _pi
 
 _ADAPTERS: dict[str, RuntimeAdapter] = {
     adapter.id: adapter
-    for adapter in (_claude, _codex, _opencode, _kimi, _cursor, _pi)
+    for adapter in (_claude, _codex, _opencode, _kimi, _cursor, _pi, _antigravity)
 }
 
 

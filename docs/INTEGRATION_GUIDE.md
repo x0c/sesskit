@@ -21,7 +21,7 @@ commands or a new typed JSON schema.
 Use the [message streaming guide](MESSAGE_STREAMING_GUIDE.md) for the additive
 Python `open_message_stream` API, caller-owned native feed bridge, and
 `sesskit stream` JSONL protocol. Missing or failed live inputs degrade to existing
-history automatically. The v0.3.1 release below includes this surface; existing
+history automatically. The v0.3.2 release below includes this surface; existing
 snapshot command envelopes and schemas remain unchanged.
 
 ## Install a fixed release
@@ -31,7 +31,7 @@ project's virtual environment and install the published wheel. If you need a new
 environment, run `python3 -m venv .venv && . .venv/bin/activate` first.
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" sesskit
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.2" sesskit
 python -m sesskit describe
 ```
 
@@ -47,7 +47,7 @@ API and JSON contracts are unchanged. Windows is not a supported platform.
 The example files live in the repository's `examples/` directory and source
 archives; wheels install only the library and CLI. The original search,
 activity-usage and follow recipes, usage calibration, and historical-performance
-additions below work with the fixed v0.3.1 release. No `PYTHONPATH` override is
+additions below work with the fixed v0.3.2 release. No `PYTHONPATH` override is
 needed. Review output locally: export and follow output may
 contain private prompts, code, tool output, or credentials from native history.
 Nothing is uploaded automatically. Do not redirect output onto native history.
@@ -146,7 +146,7 @@ report = performance_summary(snapshot)
 | Kimi | Native step/stream intervals, first-part latency and compatible stream rates |
 | Codex | Whole-turn elapsed rate and native first-output latency, not per-call decode speed |
 | Claude | Request-to-reply and recorded duration evidence; no rate from unverified endpoints |
-| Cursor | Explicitly unsupported historical metrics; no guessed rates |
+| Cursor / Antigravity | Explicitly unsupported historical metrics; no guessed rates |
 
 Rates retain their interval and output semantics. Never average unlike intervals,
 sum overlapping durations, or mistake client timing for provider decode speed.
@@ -243,9 +243,10 @@ Current adapter declarations (also returned by `sesskit describe`):
 | kimi | No | No | No | No | Yes | No |
 | cursor | Yes | Yes | Yes | No | No | No |
 | pi | Yes | Yes | No | Yes | Yes | Yes |
+| antigravity | Yes | Yes | Yes | No | No | Yes |
 
-All six adapters retain plain conversation and v1 transcript access. Kimi's typed
-adaptation is deferred. None currently declares verified permission-record
+All seven adapters retain plain conversation and v1 transcript access. Only Kimi's
+typed adaptation remains deferred. None currently declares verified permission-record
 support. Native tool-result status, message origin, and relation capabilities are
 also available through `get_adapter(...).capabilities` / `sesskit describe`.
 

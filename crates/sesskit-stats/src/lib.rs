@@ -4,6 +4,7 @@
 //! the Python reference in `src/sesskit/usage.py` for the total-token metric.
 
 pub mod aggregate;
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod jsonl;
@@ -55,6 +56,7 @@ pub struct Sources {
     pub codex: Vec<PathBuf>,
     pub pi: Vec<PathBuf>,
     pub opencode: Vec<PathBuf>,
+    pub antigravity: Vec<PathBuf>,
 }
 
 fn env_dir(name: &str) -> Option<PathBuf> {
@@ -76,6 +78,7 @@ pub fn discover(home: &Path, window: &Window) -> Sources {
     });
     jsonl_files(&pi, 2, window.start, &mut s.pi);
     s.opencode = opencode::db_paths(home);
+    s.antigravity = antigravity::discover(home, window.start);
     s
 }
 
@@ -88,6 +91,7 @@ pub fn collect(home: &Path, window: &Window) -> Vec<SessionStats> {
         .map(|p| (Runtime::Claude, p))
         .chain(sources.codex.into_iter().map(|p| (Runtime::Codex, p)))
         .chain(sources.pi.into_iter().map(|p| (Runtime::Pi, p)))
+        .chain(sources.antigravity.into_iter().map(|p| (Runtime::Antigravity, p)))
         .collect();
     let (mut files, dbs): (Vec<SessionStats>, Vec<SessionStats>) = rayon::join(
         || {
@@ -96,6 +100,7 @@ pub fn collect(home: &Path, window: &Window) -> Vec<SessionStats> {
                     Runtime::Claude => claude::read(path, window),
                     Runtime::Codex => codex::read(path, window),
                     Runtime::Pi => pi::read(path, window),
+                    Runtime::Antigravity => antigravity::read(path, window),
                     Runtime::Opencode => None,
                 })
                 .collect()

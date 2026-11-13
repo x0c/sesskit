@@ -122,7 +122,7 @@ class RuntimeParser:
 
         # Prefer the shared session-dict entry for known runtimes
         # (existence checks + OpenCode id); it dispatches via adapters.
-        if self.id in {"claude", "codex", "opencode", "kimi", "cursor", "pi"}:
+        if self.id in {"claude", "codex", "opencode", "kimi", "cursor", "pi", "antigravity"}:
             # Keep source aligned with this parser when callers omit/mismatch it.
             payload = session if session.get("source") == self.id else {**session, "source": self.id}
             return load_session_conversation(payload, include_errors=include_errors)

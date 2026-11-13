@@ -1,6 +1,6 @@
 """Conformance suite: every runtime adapter passes the same invariants.
 
-Typed runtimes (pi, claude, codex, cursor, opencode) are exercised through
+Typed runtimes (pi, claude, codex, cursor, opencode, antigravity) are exercised through
 their real loaders on synthetic native-history fixtures: snapshot load,
 v1 parity, and plain-conversation consistency. Kimi is covered on the
 v1/load paths only; its typed adaptation is deferred.
@@ -78,7 +78,7 @@ def _done_snapshot(events: list[ActivityEvent] | None = None) -> ActivitySnapsho
 # --- synthetic typed snapshots, parametrized over typed runtimes ---
 
 
-@pytest.mark.parametrize("runtime", ["pi", "claude", "codex", "cursor", "opencode"])
+@pytest.mark.parametrize("runtime", ["pi", "claude", "codex", "cursor", "opencode", "antigravity"])
 def test_typed_snapshot_passes_conformance(runtime):
     from sesskit.models import ConversationMessage
 
@@ -350,6 +350,26 @@ def _opencode_fixture(directory: Path) -> dict:
     return {"source": "opencode", "path": str(path), "id": "s1"}
 
 
+def _antigravity_fixture(directory: Path) -> dict:
+    path = directory / "transcript_full.jsonl"
+    _write_jsonl(path, [
+        {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+         "status": "DONE", "created_at": "2026-10-20T00:00:00.000Z",
+         "content": "<USER_REQUEST>Run checks.</USER_REQUEST>"},
+        {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+         "status": "DONE", "created_at": "2026-10-20T00:00:01.000Z",
+         "content": "Running.",
+         "tool_calls": [{"name": "run_command", "args": {"CommandLine": "true"}}]},
+        {"step_index": 2, "source": "MODEL", "type": "GENERIC",
+         "status": "DONE", "created_at": "2026-10-20T00:00:02.000Z",
+         "content": "ok"},
+        {"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE",
+         "status": "DONE", "created_at": "2026-10-20T00:00:03.000Z",
+         "content": "Checked."},
+    ])
+    return {"source": "antigravity", "path": str(path), "id": "antigravity-1"}
+
+
 def _kimi_fixture(directory: Path) -> dict:
     path = directory / "wire.jsonl"
     _write_jsonl(path, [
@@ -369,11 +389,11 @@ def _kimi_fixture(directory: Path) -> dict:
     return {"source": "kimi", "path": str(path), "id": "kimi-1"}
 
 
-@pytest.mark.parametrize("runtime", ["pi", "claude", "codex", "cursor", "opencode"])
+@pytest.mark.parametrize("runtime", ["pi", "claude", "codex", "cursor", "opencode", "antigravity"])
 def test_loader_fixtures_pass_conformance(runtime):
     builders = {"pi": _pi_fixture, "claude": _claude_fixture,
                 "codex": _codex_fixture, "cursor": _cursor_fixture,
-                "opencode": _opencode_fixture}
+                "opencode": _opencode_fixture, "antigravity": _antigravity_fixture}
     with tempfile.TemporaryDirectory() as directory:
         session = builders[runtime](Path(directory))
         snapshot = load_activity(session)

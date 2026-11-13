@@ -11,6 +11,7 @@ pub enum Runtime {
     Codex,
     Opencode,
     Pi,
+    Antigravity,
 }
 
 impl Runtime {
@@ -20,6 +21,7 @@ impl Runtime {
             Runtime::Codex => "codex",
             Runtime::Opencode => "opencode",
             Runtime::Pi => "pi",
+            Runtime::Antigravity => "antigravity",
         }
     }
 }

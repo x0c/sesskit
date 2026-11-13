@@ -2,7 +2,7 @@
 
 **Languages:** English | [简体中文](README.zh-CN.md)
 
-Parse and export local **Claude Code**, **Codex CLI**, **Cursor**, **OpenCode**, **Kimi Code**, and **Pi** agent session files from disk into one JSON schema.
+Parse and export local **Claude Code**, **Codex CLI**, **Cursor**, **OpenCode**, **Kimi Code**, **Pi**, and **Antigravity** agent session files from disk into one JSON schema.
 
 This is a **Python library and JSON CLI** — not a TUI, not a session manager. Other tools integrate by shelling out to `sesskit` or by validating against the published JSON Schema.
 
@@ -32,7 +32,7 @@ SessKit is not on PyPI yet. Install the fixed-release wheel in your project's vi
 Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not supported on Windows.
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" sesskit
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.2" sesskit
 python -m sesskit describe
 ```
 
@@ -67,7 +67,7 @@ After changing parsers or load wiring, run `sesskit verify`: it cross-checks con
 Snapshot commands print one JSON envelope:
 
 ```json
-{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.1"}}
+{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.2"}}
 ```
 
 ## Python API
@@ -116,6 +116,7 @@ for runtime support, selectors, examples and schemas.
 | OpenCode | Parse / export local session files |
 | Kimi Code | Parse / export local session files |
 | Pi | Parse / export local session files |
+| Antigravity | Parse / export local session files |
 
 See the [capability matrix](docs/INTEGRATION_GUIDE.md#capability-matrix) for typed
 activity, incremental reading, questions, native turn markers, usage, and compaction.

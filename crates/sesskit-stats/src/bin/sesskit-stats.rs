@@ -51,11 +51,17 @@ fn main() {
         let t = Instant::now();
         let src = sesskit_stats::discover(&home, &window);
         out["discover_s"] = serde_json::json!(t.elapsed().as_secs_f64());
-        out["files"] = serde_json::json!({"claude": src.claude.len(), "codex": src.codex.len(), "pi": src.pi.len()});
+        out["files"] = serde_json::json!({
+            "claude": src.claude.len(),
+            "codex": src.codex.len(),
+            "pi": src.pi.len(),
+            "antigravity": src.antigravity.len(),
+        });
         for (name, files, f) in [
             ("claude", &src.claude, sesskit_stats::claude::read as fn(&std::path::Path, &Window) -> Option<sesskit_stats::SessionStats>),
             ("codex", &src.codex, sesskit_stats::codex::read),
             ("pi", &src.pi, sesskit_stats::pi::read),
+            ("antigravity", &src.antigravity, sesskit_stats::antigravity::read),
         ] {
             let t = Instant::now();
             let mut slowest = (0.0f64, String::new(), 0u64);

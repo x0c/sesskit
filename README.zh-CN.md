@@ -2,7 +2,7 @@
 
 **语言：** [English](README.md) | 简体中文
 
-从磁盘解析并导出本机 **Claude Code**、**Codex CLI**、**Cursor**、**OpenCode**、**Kimi Code** 和 **Pi** 助手的会话文件，统一成一套 JSON 契约。
+从磁盘解析并导出本机 **Claude Code**、**Codex CLI**、**Cursor**、**OpenCode**、**Kimi Code**、**Pi** 和 **Antigravity** 助手的会话文件，统一成一套 JSON 契约。
 
 这是 **Python 解析库 + JSON 命令行**，不是终端界面，也不是会话管理器。其他工具可调用 `sesskit` CLI，或按公开 JSON Schema 自行实现。
 
@@ -31,7 +31,7 @@ SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装指定版本的 
 需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。暂不支持 Windows。
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.1" sesskit
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.2" sesskit
 python -m sesskit describe
 ```
 
@@ -65,7 +65,7 @@ sesskit verify --sample 30
 快照命令均输出同一套 JSON 信封：
 
 ```json
-{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.1"}}
+{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.2"}}
 ```
 
 ## Python API
@@ -95,6 +95,7 @@ for runtime_id, items in sessions.items():
 | OpenCode | 解析 / 导出本机会话文件 |
 | Kimi Code | 解析 / 导出本机会话文件 |
 | Pi | 解析 / 导出本机会话文件 |
+| Antigravity | 解析 / 导出本机会话文件 |
 
 结构化活动、增量读取、提问、原生轮次标记、用量与压缩记录的支持情况，见
 [能力矩阵](docs/INTEGRATION_GUIDE.md#capability-matrix)。`sesskit describe` 也会返回能力声明；

@@ -98,7 +98,7 @@ class ActivityReader:
         raise NotImplementedError
 
 
-_INCREMENTAL_RUNTIMES = ("pi", "claude", "codex", "cursor", "opencode")
+_INCREMENTAL_RUNTIMES = ("pi", "claude", "codex", "cursor", "opencode", "antigravity")
 
 
 def supports_incremental(session: dict) -> bool:
@@ -131,6 +131,10 @@ def open_activity_reader(session: dict, cursor: str | Mapping[str, Any] | None =
         from sesskit.activity_opencode import OpenCodeActivityReader
 
         return OpenCodeActivityReader(session, cursor)
+    if runtime_id == "antigravity":
+        from sesskit.activity_antigravity import AntigravityActivityReader
+
+        return AntigravityActivityReader(session, cursor)
     raise IncrementalUnsupported(
         f"incremental reading is unsupported for runtime {runtime_id!r}; use load_activity instead",
     )

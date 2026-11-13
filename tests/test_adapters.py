@@ -12,7 +12,7 @@ from sesskit.activity import load_activity, to_v1_dicts
 from sesskit.activity_reader import IncrementalUnsupported
 from sesskit.adapters import Capabilities, RuntimeAdapter, get_adapter, list_adapters
 from sesskit.models import ConversationMessage
-from sesskit.parsers import claude, codex, cursor, kimi, opencode, pi
+from sesskit.parsers import antigravity, claude, codex, cursor, kimi, opencode, pi
 from sesskit.registry import ConversationLoadError, RuntimeParser, default_registry, load_session_conversation
 from sesskit.transcript import load_events
 
@@ -119,6 +119,22 @@ def _pi_session(tmp_path):
     return {"source": "pi", "path": path, "id": "pi-demo"}
 
 
+def _antigravity_session(tmp_path):
+    path = _write_jsonl(tmp_path / "transcript.jsonl", [
+        {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+         "status": "DONE", "created_at": "2026-10-20T00:00:00.000Z",
+         "content": "<USER_REQUEST>fix the icon</USER_REQUEST>"},
+        {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+         "status": "DONE", "created_at": "2026-10-20T00:00:01.000Z",
+         "content": "fixing now",
+         "tool_calls": [{"name": "VIEW_FILE", "args": {"path": "a.py"}}]},
+        {"step_index": 2, "source": "MODEL", "type": "VIEW_FILE",
+         "status": "DONE", "created_at": "2026-10-20T00:00:02.000Z",
+         "content": "file bytes"},
+    ])
+    return {"source": "antigravity", "path": path, "id": "sess-antigravity"}
+
+
 BUILDERS = {
     "claude": _claude_session,
     "codex": _codex_session,
@@ -126,6 +142,7 @@ BUILDERS = {
     "kimi": _kimi_session,
     "cursor": _cursor_session,
     "pi": _pi_session,
+    "antigravity": _antigravity_session,
 }
 
 DIRECT_LOADERS = {
@@ -135,12 +152,13 @@ DIRECT_LOADERS = {
     "cursor": lambda s: cursor.load_conversation(s["path"]),
     "pi": lambda s: pi.load_conversation(s["path"]),
     "opencode": lambda s: opencode.load_conversation(s["path"], s["id"]),
+    "antigravity": lambda s: antigravity.load_conversation(s["path"]),
 }
 
 
 def test_registry_lists_six_adapters():
     adapters = list_adapters()
-    assert [a.id for a in adapters] == ["claude", "codex", "opencode", "kimi", "cursor", "pi"]
+    assert [a.id for a in adapters] == ["claude", "codex", "opencode", "kimi", "cursor", "pi", "antigravity"]
     assert all(isinstance(a, RuntimeAdapter) for a in adapters)
     assert all(isinstance(a.capabilities, Capabilities) for a in adapters)
     assert get_adapter("pi").display_name == "Pi"
@@ -150,16 +168,17 @@ def test_registry_lists_six_adapters():
 
 def test_capability_declarations():
     caps = {a.id: a.capabilities for a in list_adapters()}
-    # Incremental reading covers Pi (JSONL tree), Claude and Codex (JSONL
-    # byte offsets), plus Cursor and OpenCode (SQLite row cursors);
+    # Incremental reading covers Pi (JSONL tree), Claude, Codex, and Antigravity
+    # (JSONL byte offsets), plus Cursor and OpenCode (SQLite row cursors);
     # snapshots are the fallback elsewhere.
     assert caps["pi"].incremental_reading is True
     assert caps["claude"].incremental_reading is True
     assert caps["codex"].incremental_reading is True
     assert caps["cursor"].incremental_reading is True
     assert caps["opencode"].incremental_reading is True
+    assert caps["antigravity"].incremental_reading is True
     assert all(caps[r].incremental_reading is False
-               for r in caps if r not in {"pi", "claude", "codex", "cursor", "opencode"})
+               for r in caps if r not in {"pi", "claude", "codex", "cursor", "opencode", "antigravity"})
     # Typed activity covers every runtime except Kimi (deferred scope).
     assert caps["kimi"].typed_activity is False
     assert all(caps[r].typed_activity is True for r in caps if r != "kimi")
@@ -168,12 +187,14 @@ def test_capability_declarations():
     assert caps["codex"].structured_questions is True
     assert caps["cursor"].structured_questions is True
     assert caps["opencode"].structured_questions is True
+    assert caps["antigravity"].structured_questions is True
     assert caps["pi"].structured_questions is False
     assert caps["kimi"].structured_questions is False
     # Native tool-result status only where history marks success/failure.
     assert caps["pi"].native_tool_result_status is True
     assert caps["claude"].native_tool_result_status is True
     assert caps["opencode"].native_tool_result_status is True
+    assert caps["antigravity"].native_tool_result_status is True
     assert caps["codex"].native_tool_result_status is False
     assert caps["cursor"].native_tool_result_status is False
     assert caps["kimi"].native_tool_result_status is False
@@ -181,13 +202,16 @@ def test_capability_declarations():
     assert caps["cursor"].native_turn_boundaries is False
     assert caps["kimi"].native_turn_boundaries is False
     assert caps["pi"].native_turn_boundaries is True
+    assert caps["antigravity"].native_turn_boundaries is False
+    assert caps["antigravity"].usage_data is False
     # Nothing normalized yet for permissions.
     assert all(c.permission_records is False for c in caps.values())
     # Stage G: relations, usage, compaction, and origin are normalized where
     # native history provides evidence (Kimi deferred; cursor has no native
     # usage or compaction markers).
-    assert all(caps[r].subagent_linkage is True for r in caps if r != "kimi")
+    assert all(caps[r].subagent_linkage is True for r in caps if r not in {"kimi", "antigravity"})
     assert caps["kimi"].subagent_linkage is False
+    assert caps["antigravity"].subagent_linkage is False
     for runtime in ("claude", "codex", "opencode", "pi"):
         assert caps[runtime].usage_data is True
         assert caps[runtime].compaction_markers is True
@@ -198,8 +222,11 @@ def test_capability_declarations():
     assert caps["kimi"].usage_data is True
     assert caps["kimi"].compaction_markers is False
     assert caps["kimi"].message_origin is False
+    assert caps["antigravity"].usage_data is False
+    assert caps["antigravity"].compaction_markers is True
+    assert caps["antigravity"].message_origin is True
     # Error-only turns: declared behind an explicit flag by every
-    # typed-activity runtime (loader support is Pi-first today).
+    # typed-activity runtime.
     assert caps["kimi"].conversation_include_errors is False
     assert all(caps[r].conversation_include_errors is True for r in caps if r != "kimi")
     # Capabilities stay frozen.
@@ -209,7 +236,7 @@ def test_capability_declarations():
 
 def test_default_registry_wraps_adapters():
     registry = default_registry()
-    assert registry.ids == ("claude", "codex", "opencode", "kimi", "cursor", "pi")
+    assert registry.ids == ("claude", "codex", "opencode", "kimi", "cursor", "pi", "antigravity")
     for runtime_id in registry.ids:
         assert registry.get(runtime_id).adapter is get_adapter(runtime_id)
     with pytest.raises(KeyError, match="unregistered runtime"):
@@ -265,7 +292,7 @@ def test_open_reader_capability_gate(tmp_path):
     reader = get_adapter("pi").open_reader(session)
     first = reader.poll()
     assert first.state in {"available", "empty"}
-    for runtime_id in ("claude", "codex", "cursor", "opencode"):
+    for runtime_id in ("claude", "codex", "cursor", "opencode", "antigravity"):
         reader = get_adapter(runtime_id).open_reader(
             {"source": runtime_id, "path": "", "id": "x"})
         assert reader.poll().state == "unavailable"

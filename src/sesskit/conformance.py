@@ -47,8 +47,8 @@ from sesskit.registry import ConversationLoadError, ParserRegistry, load_session
 from sesskit.transcript import count_events, load_events
 from sesskit.visibility import visible_in_conversation
 
-RUNTIME_IDS = ("claude", "codex", "opencode", "kimi", "cursor", "pi")
-TYPED_RUNTIMES = ("pi", "claude", "codex", "cursor", "opencode")
+RUNTIME_IDS = ("claude", "codex", "opencode", "kimi", "cursor", "pi", "antigravity")
+TYPED_RUNTIMES = ("pi", "claude", "codex", "cursor", "opencode", "antigravity")
 LEGACY_V1_ONLY = ("kimi",)
 
 
@@ -336,7 +336,7 @@ def run_conformance(
     v1-level checks still run against ``v1_events``.
     """
     violations: list[Violation] = []
-    if runtime != "kimi" and (snapshot is None or snapshot.state == "unsupported"):
+    if runtime not in LEGACY_V1_ONLY and (snapshot is None or snapshot.state == "unsupported"):
         violations.append(Violation("typed_activity_unavailable",
                                     "runtime declares typed activity but snapshot is unsupported"))
     if snapshot is not None and snapshot.state == "available":
@@ -474,7 +474,7 @@ def verify_session(session: dict) -> dict:
     if snapshot.state == "unavailable" and activity_load_error is None:
         activity_load_error = "Unavailable"
     activity_load_ok = activity_load_error is None or (
-        snapshot.state == "unsupported" and runtime == "kimi")
+        snapshot.state == "unsupported" and runtime in LEGACY_V1_ONLY)
 
     started = time.perf_counter()
     try:
@@ -581,7 +581,7 @@ def verify_session(session: dict) -> dict:
             reader_info["open_poll_ms"] = (time.perf_counter() - started) * 1000
             reader_info["comparison_state"] = "failed"
         source_stamps.append(_source_stamp(session))
-    elif runtime == "kimi":
+    elif runtime in LEGACY_V1_ONLY:
         reader_info["comparison_state"] = "unsupported"
     elif runtime in TYPED_RUNTIMES:
         reader_info.update(ok=False, error_kind="UnsupportedCapability",
