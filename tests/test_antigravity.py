@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -100,6 +101,67 @@ def _write_transcript(root: Path, cid: str, rows: list[dict], *, full: bool = Tr
 def _scan_root(root: Path, **kwargs) -> list[dict]:
     with mock.patch.object(ag, "_roots", return_value=[str(root)]):
         return ag.scan_sessions(**kwargs)
+
+
+@pytest.fixture
+def retained_scan_root(tmp_path: Path) -> tuple[Path, list[str]]:
+    root = tmp_path / "history"
+    root.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    ids = [f"session-{index}" for index in range(10)]
+    _init_summaries_db(
+        root,
+        [(cid, cid, "", json.dumps([project.as_uri()]), 2, 0, "", 0) for cid in ids],
+    )
+    for index, cid in enumerate(ids):
+        stamp = datetime(2026, 11, 10, 10, 0, 20, tzinfo=timezone.utc).timestamp() - index
+        path = _write_transcript(root, cid, [
+            {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+             "status": "DONE", "content": f"Inspect task {index}"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+             "content": f"Result {index}", "created_at": f"2026-11-10T10:00:{20-index:02d}Z"},
+        ])
+        os.utime(path, (stamp, stamp))
+    return root, ids
+
+
+@pytest.mark.parametrize("keep_ids", [None, set(), {"missing", "provisional"}])
+def test_retained_ids_do_not_filter_recent_histories(retained_scan_root, keep_ids) -> None:
+    root, ids = retained_scan_root
+    sessions = _scan_root(root, limit=2, keep_ids=keep_ids)
+    assert [session["id"] for session in sessions] == ids[:2]
+    assert all(session["path"] for session in sessions)
+    assert all(session["first_user_msg"] for session in sessions)
+
+
+@pytest.mark.parametrize("retained_index", [0, 9])
+def test_retained_ids_are_extra_to_quota_even_past_overfetch(
+    retained_scan_root, retained_index: int,
+) -> None:
+    root, ids = retained_scan_root
+    keep = ids[retained_index]
+    sessions = _scan_root(root, limit=1, keep_ids={keep})
+    expected = [ids[0], ids[1]] if retained_index == 0 else [ids[0], keep]
+    assert [session["id"] for session in sessions] == expected
+    assert len({session["id"] for session in sessions}) == len(sessions)
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_retained_ids_zero_and_unlimited_quota(retained_scan_root, limit: int) -> None:
+    root, ids = retained_scan_root
+    sessions = _scan_root(root, limit=limit, keep_ids={ids[-1]})
+    expected = ids if limit < 0 else [ids[-1]]
+    assert [session["id"] for session in sessions] == expected
+
+
+def test_retained_ids_do_not_bypass_subagent_filter(retained_scan_root) -> None:
+    root, ids = retained_scan_root
+    summaries = ag._read_summaries(str(root))
+    summaries[ids[-1]]["is_subagent"] = True
+    with mock.patch.object(ag, "_read_all_summaries", return_value=summaries):
+        sessions = _scan_root(root, limit=1, keep_ids={ids[-1]})
+    assert [session["id"] for session in sessions] == ids[:1]
 
 
 def test_subagents_excluded_via_summaries_and_parents_table(tmp_path: Path) -> None:

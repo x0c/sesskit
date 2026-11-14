@@ -1308,10 +1308,14 @@ def scan_sessions(
     )
     host_marker = host.title_prompt_marker if host is not None else None
     host_prefixes = ephemeral_prefixes_for(host)
-    sessions: list[SessionInfo] = []
+    retained_ids = keep_ids or set()
+    recent: list[SessionInfo] = []
+    retained: list[SessionInfo] = []
     overfetch = max(int(limit) * 3, int(limit) + 5) if int(limit) > 0 else 0
     for cid in ids:
-        if keep_ids is not None and cid not in keep_ids:
+        # Retention augments the recent quota, never filters discovery. Keep
+        # walking candidates after overfetch so older retained IDs are visited.
+        if int(limit) >= 0 and len(recent) >= overfetch and cid not in retained_ids:
             continue
         summary = summaries.get(cid)
         if summary and summary.get("is_subagent"):
@@ -1335,13 +1339,11 @@ def scan_sessions(
             continue
         if cwd and is_ephemeral_agent_cwd(cwd, extra_prefixes=host_prefixes):
             continue
-        sessions.append(info)
-        if overfetch and len(sessions) >= overfetch:
-            break
-    sessions.sort(key=lambda s: float(s.get("mtime") or 0), reverse=True)
+        (retained if cid in retained_ids else recent).append(info)
+    recent.sort(key=lambda s: float(s.get("mtime") or 0), reverse=True)
     if int(limit) >= 0:
-        sessions = sessions[: int(limit)]
-    return sessions
+        recent = recent[: int(limit)]
+    return sorted(recent + retained, key=lambda s: float(s.get("mtime") or 0), reverse=True)
 
 
 def _sort_key(cid: str, transcripts: dict[str, str], dbs: dict[str, str]) -> float:
