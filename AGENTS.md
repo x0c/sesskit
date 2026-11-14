@@ -2,7 +2,7 @@
 
 Read, parse, export and observe local coding-agent messages through one normalized model.
 
-Standalone Python library plus JSON CLI covering six runtimes (`claude`, `codex`, `opencode`, `kimi`, `cursor`, `pi`). No downstream-host coupling: no downstream product names, host-specific paths, or host-owned semantics belong in docs, code, or schemas.
+Standalone Python library plus JSON CLI covering seven runtimes (`claude`, `codex`, `opencode`, `kimi`, `cursor`, `pi`, `antigravity`). No downstream-host coupling: no downstream product names, host-specific paths, or host-owned semantics belong in docs, code, or schemas.
 
 ## 文档导航
 
