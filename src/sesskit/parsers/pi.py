@@ -473,8 +473,17 @@ def _build_session_info_from_entries(
     last_error_text = ""
     leaf_id: str | None = None
     last_assistant_has_text = False
+    # An empty-body failure (quota / abort) stands in for the turn's reply, but
+    # only while it is still the newest thing in the branch. Once a later entry
+    # appears (the user says "continue", the retry succeeds and the assistant
+    # keeps running tools), that error is no longer the latest message and must
+    # not keep owning the list preview: consumers would show a session that died
+    # hours ago while it is actually working.
+    error_placeholder: tuple[int, str] | None = None
+    newest_content_pos = -1
+    newest_assistant_pos = -1
     event_time = parse_timestamp(header.get("timestamp"))
-    for item in branch:
+    for position, item in enumerate(branch):
         message = item["message"]
         role = message.get("role")
         text = _text(message.get("content"))
@@ -490,6 +499,7 @@ def _build_session_info_from_entries(
             last_role = "user"
             last_stop_reason = None
             last_error_text = ""
+            newest_content_pos = position
         elif role == "assistant":
             stop_reason = str(message.get("stopReason") or "").strip() or None
             error_text = str(message.get("errorMessage") or "").strip()
@@ -497,13 +507,22 @@ def _build_session_info_from_entries(
             last_assistant_has_text = bool(text)
             last_stop_reason = stop_reason
             last_error_text = error_text
+            newest_assistant_pos = position
             if text:
                 last_agent = text
+                newest_content_pos = position
             if stop_reason in {"error", "aborted"} or error_text:
                 # Empty-body failures (rate limit / abort) still own the turn.
                 last_stop_reason = stop_reason if stop_reason in {"error", "aborted"} else "error"
                 if not text and error_text:
-                    last_agent = error_text
+                    error_placeholder = (position, error_text)
+    if error_placeholder is not None:
+        error_pos, error_text = error_placeholder
+        # Newer content or a newer assistant entry supersedes the failure; fall
+        # back to the last real reply (possibly empty, so clients show the
+        # latest user prompt instead of a stale error).
+        if error_pos == newest_assistant_pos and error_pos > newest_content_pos:
+            last_agent = error_text
     if not first_user:
         return None
     try:

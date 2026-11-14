@@ -60,6 +60,78 @@ class CodexAbnormalEndingTests(unittest.TestCase):
             self.assertEqual([e["type"] for e in events], ["user_message", "assistant_message"])
             self.assertIn("usage limit", events[-1]["text"])
 
+    def test_usage_limit_resolved_by_later_turn_leaves_the_preview(self) -> None:
+        """A quota error the user already retried is not the latest reply.
+
+        ``task_complete`` + usage error used to keep owning ``last_agent_msg``
+        until a later assistant *text* arrived. A retried turn that only issues
+        function calls therefore left the list showing a session that died.
+        """
+        sid = "01a0a432-cccc-7300-951f-c6cc548cb2f4"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / f"rollout-2026-09-15T16-50-00-{sid}.jsonl"
+            err = {
+                "message": "You've hit your usage limit. Try again later.",
+                "codex_error_info": "usage_limit_exceeded",
+            }
+            lines = [
+                {
+                    "timestamp": "2026-09-15T08:50:00.000Z",
+                    "type": "session_meta",
+                    "payload": {"cwd": "/tmp/demo"},
+                },
+                {
+                    "timestamp": "2026-09-15T08:50:01.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "ship the fix"},
+                },
+                {
+                    "timestamp": "2026-09-15T08:50:02.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn-1",
+                        "last_agent_message": "Tests pass, shipping it now.",
+                        "error": None,
+                    },
+                },
+                {
+                    "timestamp": "2026-09-15T08:50:03.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "continue"},
+                },
+                {
+                    "timestamp": "2026-09-15T08:50:04.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn-2",
+                        "last_agent_message": None,
+                        "error": err,
+                    },
+                },
+                {
+                    "timestamp": "2026-09-15T08:52:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": "turn-3"},
+                },
+                {
+                    "timestamp": "2026-09-15T08:52:01.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "shell",
+                        "arguments": "{}",
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            info = codex._build_session_info(str(path), {})
+            assert info is not None
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info["last_agent_msg"], "Tests pass, shipping it now.")
+            self.assertEqual(info["last_user_msg"], "continue")
+
     def test_task_complete_without_error_stays_done(self) -> None:
         sid = "01a0a432-bbbb-7300-951f-c6cc548cb2f4"
         with tempfile.TemporaryDirectory() as tmp:
@@ -351,6 +423,131 @@ class PiAbnormalEndingTests(unittest.TestCase):
                     self.assertEqual(info["status_tag"], titles.STATUS_NONE)
                     self.assertEqual(info["last_agent_msg"] or "", expected_agent_text)
                     self.assertEqual(info["completion_id"], "")
+
+    def test_superseded_error_does_not_own_the_preview(self) -> None:
+        """A quota error the user already continued past is not the latest message.
+
+        Live shape (2026-11-14, Forenote Pi session): quota error, then the user
+        says "continue", then the retry works but the model only issues tool
+        calls, so the branch carries no newer assistant text. The error text used
+        to stay in ``last_agent_msg`` and the phone kept showing a session that
+        died hours ago while it was actually working.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "superseded-error.jsonl"
+            lines: list[dict] = [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "pi-superseded",
+                    "timestamp": "2026-11-14T18:00:00.000Z",
+                    "cwd": "/tmp/demo",
+                },
+                {
+                    "type": "message",
+                    "id": "u1",
+                    "parentId": None,
+                    "timestamp": "2026-11-14T18:00:01.000Z",
+                    "message": {"role": "user", "content": "tighten the row spacing"},
+                },
+                {
+                    "type": "message",
+                    "id": "a1",
+                    "parentId": "u1",
+                    "timestamp": "2026-11-14T18:00:02.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": "I will restyle the Overdue heading next.",
+                        "stopReason": "stop",
+                    },
+                },
+                {
+                    "type": "message",
+                    "id": "u2",
+                    "parentId": "a1",
+                    "timestamp": "2026-11-14T18:00:03.000Z",
+                    "message": {"role": "user", "content": "keep going"},
+                },
+                {
+                    "type": "message",
+                    "id": "a2",
+                    "parentId": "u2",
+                    "timestamp": "2026-11-14T18:00:04.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [],
+                        "stopReason": "error",
+                        "errorMessage": "Codex error: The usage limit has been reached",
+                    },
+                },
+                {
+                    "type": "message",
+                    "id": "u3",
+                    "parentId": "a2",
+                    "timestamp": "2026-11-14T18:02:00.000Z",
+                    "message": {"role": "user", "content": "continue"},
+                },
+                {
+                    "type": "message",
+                    "id": "a3",
+                    "parentId": "u3",
+                    "timestamp": "2026-11-14T18:02:10.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "Rerunning the failing step."},
+                            {"type": "toolCall", "id": "call1", "name": "bash", "arguments": {}},
+                        ],
+                        "stopReason": "toolUse",
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            built = pi._build_session_info(str(path))
+            assert built is not None
+            info, _created = built
+            self.assertEqual(info["status_tag"], titles.STATUS_NONE)
+            self.assertEqual(info["last_user_msg"], "continue")
+            self.assertEqual(info["last_agent_msg"], "I will restyle the Overdue heading next.")
+
+    def test_failed_turn_without_later_reply_keeps_the_error(self) -> None:
+        """Same file, no recovery: the error still describes the latest activity."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "terminal-error.jsonl"
+            lines: list[dict] = [
+                {
+                    "type": "session",
+                    "version": 3,
+                    "id": "pi-terminal",
+                    "timestamp": "2026-11-14T18:00:00.000Z",
+                    "cwd": "/tmp/demo",
+                },
+                {
+                    "type": "message",
+                    "id": "u1",
+                    "parentId": None,
+                    "timestamp": "2026-11-14T18:00:01.000Z",
+                    "message": {"role": "user", "content": "tighten the row spacing"},
+                },
+                {
+                    "type": "message",
+                    "id": "a1",
+                    "parentId": "u1",
+                    "timestamp": "2026-11-14T18:00:02.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [],
+                        "stopReason": "error",
+                        "errorMessage": "Codex error: The usage limit has been reached",
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+            built = pi._build_session_info(str(path))
+            assert built is not None
+            info, _created = built
+            self.assertEqual(info["status_tag"], titles.STATUS_ABORTED)
+            self.assertIn("usage limit", info["last_agent_msg"])
 
     def test_status_uses_only_the_active_branch_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

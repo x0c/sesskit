@@ -235,6 +235,8 @@ Previously confirmed failures, now covered by parser fixes + `tests/test_abnorma
 4. **Pi weekly rate limit:** `stopReason=error` + `errorMessage` → `STATUS_ABORTED`; error text retained in list fields and `load_events` (no longer user-only). Plain conversation hides error-only turns by default (chat view shows only real user/assistant text); pass `include_errors=True` (`sesskit show/export --include-errors`) to bring them back.
 5. **Pi / OpenCode success paths** remain `STATUS_DONE` with the assistant reply.
 
+**A failure excerpt is only the preview while it is still the newest evidence (2026-11-15, owner report).** Codex `task_complete`+error and Pi empty-body `stopReason=error` fill `last_agent_msg` so an error-only turn is visible; that text must stop owning the excerpt as soon as the branch moves on — a later user prompt, a later assistant entry, or (Codex) newer turn activity. Otherwise a session that already recovered shows the old quota/abort error as its latest message in every list while it is actually working. On supersede, fall back to the most recent real assistant text, then to the wider-read backfill, and finally to the client's user-prompt preview; `status_tag`, `terminal_error_*`, `load_events` and completion identity keep their own evidence rules (`PiAbnormalEndingTests`, `CodexAbnormalEndingTests`).
+
 Until consumers migrate, prefer `status_tag` + `last_agent_msg` together: do not treat `STATUS_DONE` alone as “notify job finished” without confirming the sample is not an older SessKit build.
 
 ## Completion identity (native-finality + metadata-invariant)

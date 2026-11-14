@@ -450,6 +450,13 @@ def _build_session_info(
     # same turn (a background command finishing after the turn ended) closes
     # an item of the finished turn and is not new turn activity.
     terminal_turn_id = ""
+    # The failure excerpt (``task_complete`` with no assistant message) is the
+    # turn's reply only while nothing newer exists. Positions let the end of the
+    # scan drop it once the user continued or a new turn started, instead of
+    # leaving a recovered session looking dead in every list.
+    error_excerpt_pos: int | None = None
+    text_excerpt = ""
+    content_excerpt_pos: int | None = None
     tail_has_activity_time = False
     for idx, e in enumerate(tail_entries):
         entry_time = _activity_time(e)
@@ -475,19 +482,25 @@ def _build_session_info(
         if user_text:
             last_user_msg = user_text
             last_event_type = "user_message"
+            content_excerpt_pos = idx
             tail_fingerprint = f"user:{_native_event_id(e, payload)}:{user_text[:120]}"
         elif assistant_text:
             last_agent_msg = assistant_text
+            text_excerpt = assistant_text
             last_event_type = "agent_message"
+            content_excerpt_pos = idx
             tail_fingerprint = f"agent:{_native_event_id(e, payload)}:{assistant_text[:120]}"
         elif t == "event_msg" and pt == "task_complete":
             msg = str(payload.get("last_agent_message") or "").strip()
             err_text = _task_complete_error_text(payload)
             if msg:
                 last_agent_msg = msg
+                text_excerpt = msg
+                content_excerpt_pos = idx
             elif err_text:
                 # Quota / provider failures often complete with null last_agent_message.
                 last_agent_msg = err_text
+                error_excerpt_pos = idx
             last_event_type = "task_complete_error" if err_text else "task_complete"
             if err_text:
                 raw_err = payload.get("error")
@@ -575,6 +588,14 @@ def _build_session_info(
         # `turn_aborted`) mint notifiable identity from their own stable
         # native evidence.
         tail_fingerprint = ""
+    if error_excerpt_pos is not None and (
+        (content_excerpt_pos is not None and content_excerpt_pos > error_excerpt_pos)
+        or (last_turn_activity_idx is not None and last_turn_activity_idx > error_excerpt_pos)
+    ):
+        # Same rule as the status above: newer content or a newer turn makes the
+        # failure stale, so the preview falls back to the last real reply (empty
+        # when the wider read finds none, letting clients show the last prompt).
+        last_agent_msg = text_excerpt
     if not last_agent_msg:
         # List excerpts only; status and completion identity stay on the 8 KB tail.
         wider_user, wider_agent = _backfill_excerpts(path)
