@@ -7,7 +7,7 @@ command instead emits the versioned JSONL event protocol below; existing command
 and their envelopes are unchanged:
 
 ```json
-{"ok": true, "data": {}, "error": null, "meta": {"version": 1, "tool_version": "0.3.3"}}
+{"ok": true, "data": {}, "error": null, "meta": {"version": 1, "tool_version": "0.3.4"}}
 ```
 
 `meta.version` is the envelope schema version. The additive `meta.tool_version`

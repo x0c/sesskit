@@ -58,6 +58,7 @@ from sesskit.models import ConversationMessage, SessionInfo, effective_session_t
 from sesskit.parsers.common import (
     ephemeral_prefixes_for,
     is_ephemeral_agent_cwd,
+    live_pid_snapshot,
     parse_timestamp,
     preprocess_excerpt,
     stat_signature,
@@ -362,15 +363,16 @@ class AntigravityTurnTracker:
     def open_tool_calls(self) -> int:
         return len(self.issued_calls - self.answered_calls)
 
-    def _reset_turn(self) -> None:
+    def _reset_turn(self, *, clear_async: bool = False) -> None:
         self.issued_calls.clear()
         self.answered_calls.clear()
         self.pending_by_step.clear()
         self.pending_fifo.clear()
         self.call_meta.clear()
-        self.pending_async.clear()
-        self.timer_watches.clear()
-        self.completed_async.clear()
+        if clear_async:
+            self.pending_async.clear()
+            self.timer_watches.clear()
+            self.completed_async.clear()
 
     def _resolve_async_token(self, token: str) -> None:
         tok = token.strip()
@@ -416,7 +418,7 @@ class AntigravityTurnTracker:
             has_user_payload = bool(user_text or media)
             is_human = source != "SYSTEM"
             if is_human and (has_user_payload or status_upper in _ABORT_STATUSES):
-                self._reset_turn()
+                self._reset_turn(clear_async=(status_upper in _ABORT_STATUSES))
             if not has_user_payload and status_upper not in _ABORT_STATUSES:
                 return
             self.row_user_text = user_text or (format_media_text(media) if media else "")
@@ -1584,9 +1586,9 @@ def refresh_session(session: dict, *, host=None) -> SessionInfo | None:
     return _build_session_info(cid, tpath, dpath, summaries, history, host=host)
 
 
-def scan_signature() -> object | None:
-    """Cheap list-level version: file stamps of transcripts, dbs, summaries."""
-    parts: list[object] = []
+def scan_signature() -> tuple | None:
+    """Cheap list-level version: file stamps of summaries, transcripts, dbs, locks + agy pids."""
+    paths: list[str] = []
     for root in _roots():
         for name in (
             "conversation_summaries.db",
@@ -1595,10 +1597,22 @@ def scan_signature() -> object | None:
         ):
             full = os.path.join(root, name)
             if os.path.isfile(full):
-                parts.append((full, stat_signature(full)))
-    for path in list(_transcript_candidates().values()) + list(_db_candidates().values()):
-        parts.append((path, stat_signature(path)))
-    # Include SQLite WAL alongside conversation_summaries.db so status flips
-    # invalidate scan caches before checkpointing.
-    parts.sort(key=lambda item: str(item[0]))
-    return tuple(parts) if parts else None
+                paths.append(full)
+        presence_dir = os.path.join(root, "presence")
+        if os.path.isdir(presence_dir):
+            try:
+                for entry in os.listdir(presence_dir):
+                    if entry.endswith(".lock"):
+                        paths.append(os.path.join(presence_dir, entry))
+            except OSError:
+                pass
+    paths.extend(_transcript_candidates().values())
+    dbs = list(_db_candidates().values())
+    paths.extend(dbs)
+    for dpath in dbs:
+        wal = f"{dpath}-wal"
+        if os.path.isfile(wal):
+            paths.append(wal)
+    if not paths:
+        return None
+    return (stat_signature(paths), live_pid_snapshot("agy"))

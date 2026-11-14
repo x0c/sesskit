@@ -1378,7 +1378,7 @@ def test_transcript_pending_async_lifecycle_timers_subagents_and_daemon(tmp_path
             },
         ],
     )
-    # Workflow/subagent async launch stays pending until reset by new USER_EXPLICIT turn or kill.
+    # Workflow/subagent async launch stays pending across ordinary follow-up turns until resolved or aborted.
     wf_path = _write_transcript(
         root,
         "workflow-session",
@@ -1450,7 +1450,7 @@ def test_transcript_pending_async_lifecycle_timers_subagents_and_daemon(tmp_path
     assert load_activity({"source": "antigravity", "path": str(wf_path), "id": "workflow-session"}).outcome.status == "pending"
     assert scanned2["quoted-doc"]["status_tag"] == titles.STATUS_DONE
 
-    # New USER_EXPLICIT turn clears stale async from prior turn.
+    # Ordinary USER_EXPLICIT follow-up preserves pending_async from active wf-9 until resolved.
     reader = open_activity_reader({"source": "antigravity", "path": str(wf_path), "id": "workflow-session"})
     assert reader.poll().outcome.status == "pending"
     with open(wf_path, "a", encoding="utf-8") as fh:
@@ -1473,6 +1473,37 @@ def test_transcript_pending_async_lifecycle_timers_subagents_and_daemon(tmp_path
                     "type": "PLANNER_RESPONSE",
                     "status": "DONE",
                     "created_at": "2026-11-14T10:01:05Z",
+                    "content": "Side answer while wf-9 runs.",
+                }
+            )
+            + "\n"
+        )
+    assert reader.poll().outcome.status == "pending"
+    with open(wf_path, "a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "step_index": 6,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "created_at": "2026-11-14T10:01:10Z",
+                    "content": (
+                        "<SYSTEM_MESSAGE>\n"
+                        "[Message] timestamp=2026-11-14T10:01:10Z sender=wf-9 "
+                        "priority=MESSAGE_PRIORITY_HIGH content=Workflow wf-9 finished\n"
+                        "</SYSTEM_MESSAGE>"
+                    ),
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "step_index": 7,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-14T10:01:12Z",
                     "content": "Fresh answer.",
                 }
             )
@@ -1579,5 +1610,213 @@ def test_tool_result_errors_stay_pending_while_error_message_aborts(tmp_path: Pa
             conversation=load_session_conversation(sess),
         )
         assert rep.passed, rep.violations
+
+
+def test_scan_signature_tracks_real_files_not_path_characters(tmp_path: Path) -> None:
+    empty_root = tmp_path / "empty-ag"
+    empty_root.mkdir()
+    with mock.patch.object(ag, "_roots", return_value=[str(empty_root)]):
+        assert ag.scan_signature() is None
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    root = tmp_path / ".gemini" / "antigravity-cli"
+    root.mkdir(parents=True)
+    uris = json.dumps([f"file://{proj}"])
+    db_path = _init_summaries_db_with_idle(
+        root,
+        [("sig-1", "Sig Session", "", uris, 2, "CASCADE_RUN_STATUS_RUNNING", 0, 1)],
+    )
+    tpath = _write_transcript(
+        root,
+        "sig-1",
+        [
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:00Z",
+                "content": "<USER_REQUEST>hi</USER_REQUEST>",
+            }
+        ],
+    )
+    with (
+        mock.patch.object(ag, "_roots", return_value=[str(root)]),
+        mock.patch.object(ag, "live_pid_snapshot", return_value=(1234,)),
+    ):
+        sig1 = ag.scan_signature()
+        assert isinstance(sig1, tuple) and len(sig1) == 2
+        file_stamps, pids = sig1
+        assert pids == (1234,)
+        statted_paths = {entry[0] for entry in file_stamps}
+        assert "." not in statted_paths and "/" not in statted_paths
+        assert str(db_path) in statted_paths
+        assert str(tpath) in statted_paths
+
+        with open(tpath, "a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "step_index": 1,
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-14T10:00:02Z",
+                        "content": "Finished.",
+                    }
+                )
+                + "\n"
+            )
+        sig2 = ag.scan_signature()
+        assert sig2 != sig1
+
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "UPDATE conversation_summaries "
+                "SET status = 'CASCADE_RUN_STATUS_IDLE', not_fully_idle = 0 "
+                "WHERE conversation_id = 'sig-1'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        sig3 = ag.scan_signature()
+        assert sig3 != sig2
+
+
+def test_side_user_input_during_running_background_task_preserves_pending(tmp_path: Path) -> None:
+    from sesskit.activity import load_activity
+    from sesskit.activity_reader import open_activity_reader
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    root = tmp_path / ".gemini" / "antigravity-cli"
+    root.mkdir(parents=True)
+    uris = json.dumps([f"file://{proj}"])
+    _init_summaries_db_with_idle(
+        root,
+        [
+            ("side-q", "Side Question", "", uris, 7, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+            ("cancel-q", "Canceled Abort", "", uris, 6, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+        ],
+    )
+    prefix_rows = [
+        {
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:00Z",
+            "content": "<USER_REQUEST>build crate</USER_REQUEST>",
+        },
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:01Z",
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "cargo test"}}],
+        },
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "RUNNING",
+            "created_at": "2026-11-14T10:00:02Z",
+            "content": (
+                "Created At: 2026-11-14T10:00:02Z\n"
+                "Tool is running as a background task with task id: side-q/task-1\n"
+                "Task Description: cargo test"
+            ),
+        },
+        {
+            "step_index": 3,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:05Z",
+            "content": "<USER_REQUEST>why was quota hidden?</USER_REQUEST>",
+        },
+        {
+            "step_index": 4,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:10Z",
+            "content": "Here is why quota was hidden while the build continues.",
+        },
+    ]
+    tpath = _write_transcript(root, "side-q", prefix_rows)
+    scanned = {s["id"]: s for s in _scan_root(root, limit=20)}
+    assert scanned["side-q"]["status_tag"] == titles.STATUS_PENDING
+    assert scanned["side-q"]["completion_id"] == ""
+    assert load_activity({"source": "antigravity", "path": str(tpath), "id": "side-q"}).outcome.status == "pending"
+    reader = open_activity_reader({"source": "antigravity", "path": str(tpath), "id": "side-q"})
+    assert reader.poll().outcome.status == "pending"
+
+    done_rows = prefix_rows + [
+        {
+            "step_index": 5,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:20Z",
+            "content": (
+                "<SYSTEM_MESSAGE>\n"
+                "[Message] timestamp=2026-11-14T10:00:20Z sender=side-q/task-1 "
+                'priority=MESSAGE_PRIORITY_HIGH content=Task id "side-q/task-1" finished with result:'
+            ),
+        },
+        {
+            "step_index": 6,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:25Z",
+            "content": "Cargo build finished cleanly.",
+        },
+    ]
+    _write_transcript(root, "side-q", done_rows)
+    with mock.patch.object(ag, "_roots", return_value=[str(root)]):
+        final_info = ag.refresh_session(scanned["side-q"])
+    assert final_info is not None and final_info["status_tag"] == titles.STATUS_DONE
+    assert final_info["completion_id"].startswith(f"{titles.STATUS_DONE}:")
+    assert load_activity({"source": "antigravity", "path": str(tpath), "id": "side-q"}).outcome.status == "done"
+    assert reader.poll().outcome.status == "done"
+
+    cancel_rows = [
+        prefix_rows[0],
+        prefix_rows[1],
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "RUNNING",
+            "created_at": "2026-11-14T10:00:02Z",
+            "content": "Tool is running as a background task with task id: cancel-q/task-1",
+        },
+        {
+            "step_index": 3,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "CANCELED",
+            "created_at": "2026-11-14T10:00:05Z",
+            "content": "<USER_REQUEST>stop and reply cleanly</USER_REQUEST>",
+        },
+        {
+            "step_index": 4,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:08Z",
+            "content": "Canceled previous work and finished.",
+        },
+    ]
+    cpath = _write_transcript(root, "cancel-q", cancel_rows)
+    scanned_cancel = {s["id"]: s for s in _scan_root(root, limit=20)}
+    assert scanned_cancel["cancel-q"]["status_tag"] == titles.STATUS_DONE
+    assert scanned_cancel["cancel-q"]["completion_id"].startswith(f"{titles.STATUS_DONE}:")
+    assert load_activity({"source": "antigravity", "path": str(cpath), "id": "cancel-q"}).outcome.status == "done"
 
 

@@ -304,6 +304,7 @@ def test_signature_matches_parser_signature():
     assert get_adapter("claude").signature() == claude.scan_signature()
     assert get_adapter("pi").signature() == pi.scan_signature()
     assert get_adapter("cursor").signature() == cursor.scan_signature()
+    assert get_adapter("antigravity").signature() == antigravity.scan_signature()
 
 
 def test_legacy_test_double_still_works():
