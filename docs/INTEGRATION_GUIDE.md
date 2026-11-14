@@ -21,7 +21,7 @@ commands or a new typed JSON schema.
 Use the [message streaming guide](MESSAGE_STREAMING_GUIDE.md) for the additive
 Python `open_message_stream` API, caller-owned native feed bridge, and
 `sesskit stream` JSONL protocol. Missing or failed live inputs degrade to existing
-history automatically. The v0.3.5 release below includes this surface; existing
+history automatically. The v0.3.6 release below includes this surface; existing
 snapshot command envelopes and schemas remain unchanged.
 
 ## Install a fixed release
@@ -31,7 +31,7 @@ project's virtual environment and install the published wheel. If you need a new
 environment, run `python3 -m venv .venv && . .venv/bin/activate` first.
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.5" sesskit
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.6" sesskit
 python -m sesskit describe
 ```
 
@@ -47,7 +47,7 @@ API and JSON contracts are unchanged. Windows is not a supported platform.
 The example files live in the repository's `examples/` directory and source
 archives; wheels install only the library and CLI. The original search,
 activity-usage and follow recipes, usage calibration, and historical-performance
-additions below work with the fixed v0.3.5 release. No `PYTHONPATH` override is
+additions below work with the fixed v0.3.6 release. No `PYTHONPATH` override is
 needed. Review output locally: export and follow output may
 contain private prompts, code, tool output, or credentials from native history.
 Nothing is uploaded automatically. Do not redirect output onto native history.
