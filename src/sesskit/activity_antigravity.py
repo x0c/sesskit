@@ -79,34 +79,6 @@ def _coerce_input(raw: object) -> object:
     return {"value": raw}
 
 
-def _normalize_media(raw: object) -> list[dict[str, str]]:
-    if not isinstance(raw, list):
-        return []
-    items: list[dict[str, str]] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        item: dict[str, str] = {}
-        mime = entry.get("mime_type")
-        if isinstance(mime, str) and mime.strip():
-            item["mime_type"] = mime.strip()
-        uri = entry.get("uri")
-        if isinstance(uri, str) and uri.strip():
-            item["uri"] = uri.strip()
-        if item:
-            items.append(item)
-    return items
-
-
-def _format_media_text(media: list[dict[str, str]]) -> str:
-    parts: list[str] = []
-    for entry in media:
-        mime = entry.get("mime_type") or "media"
-        uri = entry.get("uri") or ""
-        parts.append(f"[{mime}] {uri}".strip() if uri else f"[{mime}]")
-    return "\n".join(parts)
-
-
 def _antigravity_usage(row: dict, *, model: str | None, record: str) -> Usage | None:
     in_tok = _nonneg_int(row.get("input_tokens"))
     cache_tok = _nonneg_int(row.get("cache_read_tokens"))
@@ -142,14 +114,6 @@ def _antigravity_error(
         retryable=retryable,
         scope=scope,  # type: ignore[arg-type]
         http_status=native_http_status(None, message),
-    )
-
-
-def _is_tool_result_row(row: dict) -> bool:
-    kind = str(row.get("type") or "")
-    source = str(row.get("source") or "")
-    return kind in scan_antigravity._TOOL_RESULT_TYPES or (
-        source == "MODEL" and kind not in ("PLANNER_RESPONSE", "CHECKPOINT", "SYSTEM_MESSAGE")
     )
 
 
@@ -245,29 +209,6 @@ def _attach_antigravity_interactions(
         )
 
 
-def _match_pending_call(
-    pending_by_step: dict[int, str],
-    pending_fifo: list[str],
-    row_step: object,
-) -> str:
-    if (
-        isinstance(row_step, int)
-        and not isinstance(row_step, bool)
-        and row_step in pending_by_step
-    ):
-        call_id = pending_by_step.pop(row_step)
-        if call_id in pending_fifo:
-            pending_fifo.remove(call_id)
-        return call_id
-    if pending_fifo:
-        call_id = pending_fifo.pop(0)
-        stale_keys = [k for k, v in pending_by_step.items() if v == call_id]
-        for k in stale_keys:
-            del pending_by_step[k]
-        return call_id
-    return ""
-
-
 class _AntigravityFeed:
     """Stateful row-sequence interpreter shared by snapshots and the reader."""
 
@@ -317,7 +258,7 @@ class _AntigravityFeed:
             status_upper = str(row.get("status") or "").upper()
             created = row.get("created_at")
             ts = parse_timestamp(created) if isinstance(created, str) else None
-            media = _normalize_media(row.get("media"))
+            media = scan_antigravity.normalize_media(row.get("media"))
 
             if kind == "USER_INPUT":
                 self.pending_by_step.clear()
@@ -342,12 +283,14 @@ class _AntigravityFeed:
                         "user_message",
                         ts,
                         record,
-                        text=_format_media_text(media),
+                        text=scan_antigravity.format_media_text(media),
                         origin=origin,
                         raw_input={"media": media},
                     )
-                elif status_upper == "ERROR":
-                    err_text = scan_antigravity._row_error_text(row) or "error"
+                elif status_upper in scan_antigravity._ABORT_STATUSES:
+                    err_text = scan_antigravity._row_error_text(row) or (
+                        "canceled" if "CANCEL" in status_upper else "error"
+                    )
                     self._add(
                         "assistant_message",
                         ts,
@@ -358,8 +301,10 @@ class _AntigravityFeed:
                 continue
 
             if kind == "SYSTEM_MESSAGE":
-                if status_upper == "ERROR":
-                    err_text = scan_antigravity._row_error_text(row) or "error"
+                if status_upper in scan_antigravity._ABORT_STATUSES:
+                    err_text = scan_antigravity._row_error_text(row) or (
+                        "canceled" if "CANCEL" in status_upper else "error"
+                    )
                     self._add(
                         "assistant_message",
                         ts,
@@ -396,9 +341,12 @@ class _AntigravityFeed:
                     candidate = content.strip()
                     if candidate != "None":
                         text = candidate
-                err_text = scan_antigravity._row_error_text(row) if status_upper == "ERROR" else ""
-                if status_upper == "ERROR" and not text:
-                    err_msg = err_text or "error"
+                is_abort = status_upper in scan_antigravity._ABORT_STATUSES
+                err_text = scan_antigravity._row_error_text(row) if is_abort else ""
+                if is_abort and not text:
+                    err_msg = err_text or (
+                        "canceled" if "CANCEL" in status_upper else "error"
+                    )
                     self._add(
                         "assistant_message",
                         ts,
@@ -419,7 +367,7 @@ class _AntigravityFeed:
                         "assistant_message",
                         ts,
                         record,
-                        text=_format_media_text(media),
+                        text=scan_antigravity.format_media_text(media),
                         usage=usage,
                         raw_output={"media": media},
                     )
@@ -450,8 +398,8 @@ class _AntigravityFeed:
                                 self.pending_by_step[step_val + 1 + index] = call_id
                 continue
 
-            if _is_tool_result_row(row):
-                call_id = _match_pending_call(
+            if scan_antigravity.is_tool_result_row(row):
+                call_id = scan_antigravity.match_pending_call(
                     self.pending_by_step, self.pending_fifo, row.get("step_index")
                 )
                 if status_upper == "DONE":
@@ -484,14 +432,21 @@ class _AntigravityFeed:
                         self.results[call_id] = (output_text or raw_output, outcome, record)
                 continue
 
-            if status_upper == "ERROR":
-                err_msg = scan_antigravity._row_error_text(row) or "error"
+            if kind == "ERROR_MESSAGE" or status_upper in scan_antigravity._ABORT_STATUSES:
+                err_msg = scan_antigravity._row_error_text(row) or (
+                    "canceled" if "CANCEL" in status_upper else "error"
+                )
                 self._add(
                     "assistant_message",
                     ts,
                     record,
                     text=err_msg,
-                    error=_antigravity_error(err_msg, record=record, scope="turn"),
+                    error=_antigravity_error(
+                        err_msg,
+                        record=record,
+                        field="error" if kind == "ERROR_MESSAGE" else "status",
+                        scope="turn",
+                    ),
                 )
 
         self._link_interactions()
@@ -510,102 +465,62 @@ class _AntigravityOutcomeAcc:
     """Stateful tail-outcome accumulator shared by snapshots and incremental reads."""
 
     def __init__(self) -> None:
-        self.tail_kind: str = ""
-        self.tail_status: str = ""
-        self.tail_record: str = ""
-        self.tail_error: str = ""
-        self.tail_has_user_text: bool = False
-        self.tail_has_agent_text: bool = False
-        self.tail_is_tool: bool = False
-        self.issued_calls: set[str] = set()
-        self.answered_calls: set[str] = set()
-        self.pending_by_step: dict[int, str] = {}
-        self.pending_fifo: list[str] = []
+        self._tracker = scan_antigravity.AntigravityTurnTracker()
 
     def add(self, lineno: int, row: dict) -> None:
-        if not scan_antigravity._is_antigravity_record(row):
-            return
-        record = _record_ref(lineno)
-        kind = str(row.get("type") or "")
-        status_upper = str(row.get("status") or "").upper()
-        media = _normalize_media(row.get("media"))
-
-        self.tail_kind = kind
-        self.tail_status = status_upper
-        self.tail_record = record
-        self.tail_error = scan_antigravity._row_error_text(row)
-        self.tail_has_user_text = False
-        self.tail_has_agent_text = False
-        self.tail_is_tool = _is_tool_result_row(row)
-
-        if kind == "USER_INPUT":
-            self.pending_by_step.clear()
-            self.pending_fifo.clear()
-            text = scan_antigravity.unwrap_user_request(row.get("content") or "")
-            self.tail_has_user_text = bool((text and text != "None") or media)
-        elif kind == "PLANNER_RESPONSE":
-            content = row.get("content")
-            text = ""
-            if isinstance(content, str) and content.strip():
-                cand = content.strip()
-                if cand != "None":
-                    text = cand
-            self.tail_has_agent_text = bool(text or (media and not row.get("tool_calls")))
-            calls = row.get("tool_calls")
-            if isinstance(calls, list):
-                step_val = row.get("step_index")
-                for index, call in enumerate(calls):
-                    if not isinstance(call, dict):
-                        continue
-                    step_label = step_val if step_val is not None else index
-                    call_id = f"{step_label}-{index}"
-                    if call_id in self.issued_calls:
-                        call_id = f"{call_id}:{lineno}"
-                    self.issued_calls.add(call_id)
-                    self.pending_fifo.append(call_id)
-                    if isinstance(step_val, int) and not isinstance(step_val, bool):
-                        self.pending_by_step[step_val + 1 + index] = call_id
-        elif self.tail_is_tool:
-            call_id = _match_pending_call(
-                self.pending_by_step, self.pending_fifo, row.get("step_index")
-            )
-            if call_id:
-                self.answered_calls.add(call_id)
+        self._tracker.observe(row, lineno=lineno)
 
     def result(self) -> SessionOutcome:
-        if self.tail_status == "ERROR":
-            err_text = self.tail_error or "error"
-            ev = Evidence(_NATIVE, field="status", record=self.tail_record)
+        tracker = self._tracker
+        if not tracker.tail_type:
+            return SessionOutcome("unknown", Evidence(_UNKNOWN))
+        if tracker.tail_type == "ERROR_MESSAGE" or (
+            not tracker.tail_is_tool
+            and tracker.tail_status in scan_antigravity._ABORT_STATUSES
+        ):
+            fallback = "canceled" if "CANCEL" in tracker.tail_status else "error"
+            err_text = tracker.tail_error or fallback
+            field = "error" if tracker.tail_type == "ERROR_MESSAGE" else "status"
+            ev = Evidence(_NATIVE, field=field, record=tracker.tail_record)
             return SessionOutcome(
                 "aborted",
                 ev,
                 error=_antigravity_error(
                     err_text,
-                    record=self.tail_record,
-                    field="status",
-                    scope="tool" if self.tail_is_tool else "turn",
+                    record=tracker.tail_record,
+                    field=field,
+                    scope="turn",
                 ),
             )
-        if self.tail_status == "RUNNING":
+        if tracker.tail_status == "RUNNING":
             return SessionOutcome(
                 "pending",
-                Evidence(_NATIVE, field="status", record=self.tail_record),
+                Evidence(_NATIVE, field="status", record=tracker.tail_record),
             )
-        if self.issued_calls - self.answered_calls:
+        if (
+            tracker.pending_async
+            or tracker.tail_is_tool
+            or tracker.tail_type == "SYSTEM_MESSAGE"
+        ):
+            return SessionOutcome(
+                "pending",
+                Evidence(_INFERRED, field="tail_role", record=tracker.tail_record),
+            )
+        if tracker.open_tool_calls > 0 or tracker.tail_has_tool_calls:
             return SessionOutcome("unknown", Evidence(_UNKNOWN))
         if (
-            self.tail_kind == "PLANNER_RESPONSE"
-            and self.tail_has_agent_text
-            and self.tail_status != "INVALID"
+            tracker.tail_type == "PLANNER_RESPONSE"
+            and tracker.tail_status == "DONE"
+            and bool(tracker.tail_reply.strip())
         ):
             return SessionOutcome(
                 "done",
-                Evidence(_INFERRED, field="tail_role", record=self.tail_record),
+                Evidence(_INFERRED, field="tail_role", record=tracker.tail_record),
             )
-        if self.tail_kind == "USER_INPUT" and self.tail_has_user_text:
+        if tracker.tail_type == "USER_INPUT" and tracker.tail_has_user_text:
             return SessionOutcome(
                 "pending",
-                Evidence(_INFERRED, field="tail_role", record=self.tail_record),
+                Evidence(_INFERRED, field="tail_role", record=tracker.tail_record),
             )
         return SessionOutcome("unknown", Evidence(_UNKNOWN))
 

@@ -26,13 +26,19 @@ Native stores (all under ``~``; read-only, never written):
 
 Resume: ``agy --conversation <uuid>`` (``agy --continue`` for the latest).
 
-Status mapping: transcript tail ``PLANNER_RESPONSE`` with answer text maps to
-``STATUS_DONE``; tail ``USER_INPUT`` or in-flight ``RUNNING`` maps to
-``STATUS_PENDING``; ``summary.get("killed")`` or tail transcript row
-``status == "ERROR"`` maps to ``STATUS_ABORTED`` with deterministic
-``completion_id_for`` and ``terminal_error_evidence``; anything else (including
-non-killed sqlite-only rows) maps to ``STATUS_NONE`` (never default to success).
-Subagent conversations marked in ``conversation_summaries.db`` or
+Status mapping: an idle, non-killed transcript ending on a non-tool
+``PLANNER_RESPONSE`` with ``status == "DONE"``, non-empty assistant answer
+text (or non-tool media), zero open tool calls, and no pending non-daemon
+background tasks maps to ``STATUS_DONE`` (with ``completion_id`` anchored strictly
+on the tail reply). Live engine activity (``CASCADE_RUN_STATUS_RUNNING`` or
+``not_fully_idle`` in ``conversation_summaries.db``), pending async work, open
+tool calls, tool-result rows (including mid-turn tool ``ERROR``/``INVALID``),
+``SYSTEM_MESSAGE`` tails, and ``USER_INPUT`` tails map to ``STATUS_PENDING``.
+``summary.get("killed")``, ``ERROR_MESSAGE`` rows, or non-tool terminal rows
+with ``ERROR``/``CANCELED``/``CANCELLED`` status map to ``STATUS_ABORTED`` with
+deterministic ``completion_id_for`` and ``terminal_error_evidence``; anything else
+(including non-killed sqlite-only rows) maps to ``STATUS_NONE`` (never default
+to success). Subagent conversations marked in ``conversation_summaries.db`` or
 ``conversation_parents`` are excluded from ``scan_sessions``.
 """
 
@@ -45,6 +51,7 @@ import os
 import re
 import shutil
 import sqlite3
+from typing import Any
 
 from sesskit import titles
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
@@ -77,12 +84,45 @@ _TOOL_RESULT_TYPES = frozenset(
         "GENERIC",
     }
 )
+_NON_TOOL_TYPES = frozenset(
+    {"PLANNER_RESPONSE", "USER_INPUT", "CHECKPOINT", "SYSTEM_MESSAGE", "ERROR_MESSAGE"}
+)
+_ABORT_STATUSES = frozenset({"ERROR", "CANCELED", "CANCELLED"})
+_CLOSED_TOOL_STATUSES = frozenset({"DONE", "ERROR", "INVALID"})
+_TERMINAL_TASK_STATUSES = frozenset(
+    {"DONE", "COMPLETED", "CANCELLED", "CANCELED", "ERROR", "FAILED", "STOPPED"}
+)
 
 _MODEL_SELECTION_RE = re.compile(
     r"`Model Selection`\s+from\s+.+?\s+to\s+(.+?)(?:\.(?=\s|<|$)|(?=<)|(?=\n)|$)"
 )
 _PBTXT_TITLE_RE = re.compile(r'(?m)^title:\s*(?:"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\')')
 _FILE_URI_RE = re.compile(r"file://([A-Za-z0-9_\-./~%]+)")
+_BG_TASK_ID_RE = re.compile(
+    r"(?:^|\n)Tool is running as a background task with task id:\s*([^\s\"'\\]+)"
+)
+_SYS_MESSAGE_HEADER_RE = re.compile(r"(?:^|\n)\[Message\]\s")
+_SYS_SENDER_RE = re.compile(r"(?:^|\s)sender=([^\s\]]+)")
+_SYS_TASK_DONE_RE = re.compile(
+    r'Task id\s+"([^"]+)"\s+(?:was\s+cancell?ed|finished|failed|stopped|ended)',
+    re.IGNORECASE,
+)
+_TASK_CANCELLED_RE = re.compile(
+    r'(?:cannot kill task|Task)\s+"([^"]+)"\s*(?::\s*task is not running|cancelled|canceled|killed|stopped)',
+    re.IGNORECASE,
+)
+_WAIT_CANCELLED_RE = re.compile(
+    r"Wait cancelled\s*\(task\s+([^\s)]+)\s+has already finished\)",
+    re.IGNORECASE,
+)
+_TASK_STATUS_RE = re.compile(r"Task:\s*(\S+)\s+Status:\s*([A-Z_]+)", re.IGNORECASE)
+_ASYNC_SUBAGENT_PHRASES = (
+    "running in the background",
+    "running asynchronously",
+    "background task",
+    "will be notified",
+    "launched in the background",
+)
 
 
 def _roots() -> list[str]:
@@ -168,87 +208,432 @@ def _row_error_text(row: dict) -> str:
     err = row.get("error")
     if isinstance(err, str) and err.strip():
         return err.strip()
-    if str(row.get("status") or "").upper() == "ERROR":
+    if str(row.get("status") or "").upper() in _ABORT_STATUSES:
         content = row.get("content")
         if isinstance(content, str) and content.strip():
             return content.strip()
     return ""
 
 
+def normalize_media(raw: object) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    items: list[dict[str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        item: dict[str, str] = {}
+        mime = entry.get("mime_type")
+        if isinstance(mime, str) and mime.strip():
+            item["mime_type"] = mime.strip()
+        uri = entry.get("uri")
+        if isinstance(uri, str) and uri.strip():
+            item["uri"] = uri.strip()
+        if item:
+            items.append(item)
+    return items
+
+
+def format_media_text(media: list[dict[str, str]]) -> str:
+    parts: list[str] = []
+    for entry in media:
+        mime = entry.get("mime_type") or "media"
+        uri = entry.get("uri") or ""
+        parts.append(f"[{mime}] {uri}".strip() if uri else f"[{mime}]")
+    return "\n".join(parts)
+
+
+def coerce_tool_args(raw: object) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {"raw": raw}
+        return parsed if isinstance(parsed, dict) else {"raw": parsed}
+    return {}
+
+
+def is_tool_result_row(row: dict) -> bool:
+    kind = str(row.get("type") or "")
+    source = str(row.get("source") or "")
+    if kind in _TOOL_RESULT_TYPES:
+        return True
+    return source == "MODEL" and kind not in _NON_TOOL_TYPES
+
+
+def match_pending_call(
+    pending_by_step: dict[int, str],
+    pending_fifo: list[str],
+    row_step: object,
+) -> str:
+    if (
+        isinstance(row_step, int)
+        and not isinstance(row_step, bool)
+        and row_step in pending_by_step
+    ):
+        call_id = pending_by_step.pop(row_step)
+        if call_id in pending_fifo:
+            pending_fifo.remove(call_id)
+        return call_id
+    if pending_fifo:
+        call_id = pending_fifo.pop(0)
+        stale_keys = [k for k, v in pending_by_step.items() if v == call_id]
+        for k in stale_keys:
+            del pending_by_step[k]
+        return call_id
+    return ""
+
+
+def _extract_json_id(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return ""
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    for key in ("task_id", "taskId", "conversation_id", "conversationId", "agent_id", "workflow_id", "id"):
+        val = parsed.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _maybe_async_launch_token(
+    tool_name: str,
+    content: str,
+    call_id: str,
+    lineno: int,
+    status_upper: str,
+) -> str:
+    if status_upper == "RUNNING":
+        bg_match = _BG_TASK_ID_RE.search(content)
+        if bg_match:
+            return bg_match.group(1)
+        json_id = _extract_json_id(content)
+        return json_id or f"call:{call_id or lineno}"
+    if tool_name in {"invoke_subagent", "run_workflow"} and status_upper == "DONE":
+        lower = content.lower()
+        stripped = content.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                st = str(parsed.get("status") or "").strip().lower()
+                if st in {"running", "queued", "started", "pending", "async"}:
+                    return _extract_json_id(content) or f"call:{call_id or lineno}"
+        if any(phrase in lower for phrase in _ASYNC_SUBAGENT_PHRASES):
+            return _extract_json_id(content) or f"call:{call_id or lineno}"
+    return ""
+
+
+class AntigravityTurnTracker:
+    """Ordered turn, tool-call, and async-task finality tracker."""
+
+    def __init__(self) -> None:
+        self.issued_calls: set[str] = set()
+        self.answered_calls: set[str] = set()
+        self.pending_by_step: dict[int, str] = {}
+        self.pending_fifo: list[str] = []
+        self.call_meta: dict[str, tuple[str, dict[str, Any], bool]] = {}
+        self.pending_async: dict[str, str] = {}
+        self.timer_watches: dict[str, str] = {}
+        self.completed_async: set[str] = set()
+        self.tail_type: str = ""
+        self.tail_status: str = ""
+        self.tail_is_tool: bool = False
+        self.tail_has_tool_calls: bool = False
+        self.tail_reply: str = ""
+        self.tail_error: str = ""
+        self.tail_has_user_text: bool = False
+        self.tail_step_index: object = None
+        self.tail_record: str = ""
+        self.model: str | None = None
+        self.row_user_text: str = ""
+        self.row_reply_text: str = ""
+
+    @property
+    def open_tool_calls(self) -> int:
+        return len(self.issued_calls - self.answered_calls)
+
+    def _reset_turn(self) -> None:
+        self.issued_calls.clear()
+        self.answered_calls.clear()
+        self.pending_by_step.clear()
+        self.pending_fifo.clear()
+        self.call_meta.clear()
+        self.pending_async.clear()
+        self.timer_watches.clear()
+        self.completed_async.clear()
+
+    def _resolve_async_token(self, token: str) -> None:
+        tok = token.strip()
+        if not tok:
+            return
+        self.pending_async.pop(tok, None)
+        self.timer_watches.pop(tok, None)
+        self.completed_async.add(tok)
+        expired_timers = [
+            timer_id
+            for timer_id, watch in self.timer_watches.items()
+            if watch == tok
+        ]
+        for timer_id in expired_timers:
+            self.pending_async.pop(timer_id, None)
+            self.timer_watches.pop(timer_id, None)
+            self.completed_async.add(timer_id)
+
+    def _clear_async_kind(self, kinds: frozenset[str]) -> None:
+        victims = [tok for tok, kind in self.pending_async.items() if kind in kinds]
+        for tok in victims:
+            self._resolve_async_token(tok)
+
+    def observe(self, row: dict, *, lineno: int = 0) -> None:
+        self.row_user_text = ""
+        self.row_reply_text = ""
+        if not _is_antigravity_record(row):
+            return
+        kind = str(row.get("type") or "")
+        source = str(row.get("source") or "").upper()
+        status_upper = str(row.get("status") or "").upper()
+        media = normalize_media(row.get("media"))
+        row_error = _row_error_text(row)
+        record = f"line:{lineno}" if lineno else ""
+
+        if kind == "USER_INPUT":
+            raw_content = row.get("content") or ""
+            picked = model_name_from_user_input(raw_content)
+            if picked:
+                self.model = picked
+            text = unwrap_user_request(raw_content)
+            user_text = text if (text and text != "None") else ""
+            has_user_payload = bool(user_text or media)
+            is_human = source != "SYSTEM"
+            if is_human and (has_user_payload or status_upper in _ABORT_STATUSES):
+                self._reset_turn()
+            if not has_user_payload and status_upper not in _ABORT_STATUSES:
+                return
+            self.row_user_text = user_text or (format_media_text(media) if media else "")
+            self.tail_type = kind
+            self.tail_status = status_upper
+            self.tail_is_tool = False
+            self.tail_has_tool_calls = False
+            self.tail_reply = ""
+            self.tail_error = row_error
+            self.tail_has_user_text = has_user_payload
+            self.tail_step_index = row.get("step_index")
+            self.tail_record = record
+            return
+
+        if kind == "PLANNER_RESPONSE":
+            content = row.get("content")
+            content_text = ""
+            if isinstance(content, str) and content.strip():
+                candidate = content.strip()
+                if candidate != "None":
+                    content_text = candidate
+            raw_calls = row.get("tool_calls")
+            valid_calls = (
+                [c for c in raw_calls if isinstance(c, dict)]
+                if isinstance(raw_calls, list)
+                else []
+            )
+            reply = content_text
+            if not reply and media and not valid_calls:
+                reply = format_media_text(media)
+            step_val = row.get("step_index")
+            for index, call in enumerate(valid_calls):
+                step_label = step_val if step_val is not None else index
+                call_id = f"{step_label}-{index}"
+                if call_id in self.issued_calls:
+                    call_id = f"{call_id}:{lineno or len(self.issued_calls)}"
+                self.issued_calls.add(call_id)
+                self.pending_fifo.append(call_id)
+                if isinstance(step_val, int) and not isinstance(step_val, bool):
+                    self.pending_by_step[step_val + 1 + index] = call_id
+                tool_name = str(call.get("name") or "")
+                tool_args = coerce_tool_args(call.get("args"))
+                is_daemon = tool_args.get("IsDaemon") is True
+                self.call_meta[call_id] = (tool_name, tool_args, is_daemon)
+            self.row_reply_text = reply
+            self.tail_type = kind
+            self.tail_status = status_upper
+            self.tail_is_tool = False
+            self.tail_has_tool_calls = bool(valid_calls)
+            self.tail_reply = reply
+            self.tail_error = row_error
+            self.tail_has_user_text = False
+            self.tail_step_index = step_val
+            self.tail_record = record
+            return
+
+        if is_tool_result_row(row):
+            call_id = match_pending_call(
+                self.pending_by_step, self.pending_fifo, row.get("step_index")
+            )
+            tool_name, tool_args, is_daemon = self.call_meta.get(call_id, ("", {}, False))
+            content_str = str(row.get("content") or "")
+            bg_match = _BG_TASK_ID_RE.search(content_str) if status_upper == "RUNNING" else None
+            if call_id and (
+                status_upper in _CLOSED_TOOL_STATUSES
+                or (status_upper == "RUNNING" and bg_match is not None)
+            ):
+                self.answered_calls.add(call_id)
+            async_token = ""
+            if not is_daemon:
+                async_token = _maybe_async_launch_token(
+                    tool_name, content_str, call_id, lineno, status_upper
+                )
+            if async_token:
+                watch = str(tool_args.get("TimerCondition") or "").strip()
+                if watch and watch.lower() != "never" and watch in self.completed_async:
+                    self.completed_async.add(async_token)
+                else:
+                    async_kind = (
+                        "timer"
+                        if tool_name == "schedule"
+                        else (tool_name if tool_name in {"invoke_subagent", "run_workflow"} else "bg_task")
+                    )
+                    self.pending_async[async_token] = async_kind
+                    if watch and watch.lower() != "never":
+                        self.timer_watches[async_token] = watch
+            self._apply_tool_result_cancellations(tool_name, tool_args, content_str, status_upper)
+            self.tail_type = kind
+            self.tail_status = status_upper
+            self.tail_is_tool = True
+            self.tail_has_tool_calls = False
+            self.tail_reply = ""
+            self.tail_error = row_error
+            self.tail_has_user_text = False
+            self.tail_step_index = row.get("step_index")
+            self.tail_record = record
+            return
+
+        if kind == "SYSTEM_MESSAGE":
+            content_str = str(row.get("content") or "")
+            for tok in _SYS_TASK_DONE_RE.findall(content_str):
+                self._resolve_async_token(tok)
+            for sender in _SYS_SENDER_RE.findall(content_str):
+                if sender in self.pending_async or any(
+                    w == sender for w in self.timer_watches.values()
+                ):
+                    self._resolve_async_token(sender)
+            if _SYS_MESSAGE_HEADER_RE.search(content_str):
+                any_timers = [
+                    tid for tid, w in self.timer_watches.items() if w.lower() == "any"
+                ]
+                for tid in any_timers:
+                    self._resolve_async_token(tid)
+            self.tail_type = kind
+            self.tail_status = status_upper
+            self.tail_is_tool = False
+            self.tail_has_tool_calls = False
+            self.tail_reply = ""
+            self.tail_error = row_error
+            self.tail_has_user_text = False
+            self.tail_step_index = row.get("step_index")
+            self.tail_record = record
+            return
+
+        self.tail_type = kind
+        self.tail_status = status_upper
+        self.tail_is_tool = False
+        self.tail_has_tool_calls = False
+        self.tail_reply = ""
+        self.tail_error = row_error
+        self.tail_has_user_text = False
+        self.tail_step_index = row.get("step_index")
+        self.tail_record = record
+
+    def _apply_tool_result_cancellations(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        content_str: str,
+        status_upper: str,
+    ) -> None:
+        if tool_name in {"manage_task", "manage_subagents", ""}:
+            for match in _TASK_CANCELLED_RE.finditer(content_str):
+                tok = match.group(1)
+                if tok:
+                    self._resolve_async_token(tok)
+            for tok, st in _TASK_STATUS_RE.findall(content_str):
+                if st.upper() in _TERMINAL_TASK_STATUSES:
+                    self._resolve_async_token(tok)
+        if tool_name in {"schedule", ""}:
+            for tok in _WAIT_CANCELLED_RE.findall(content_str):
+                self._resolve_async_token(tok)
+        if (
+            tool_name in {"manage_task", ""}
+            and "No background tasks are currently running." in content_str
+        ):
+            self._clear_async_kind(frozenset({"bg_task", "timer"}))
+        action = str(tool_args.get("Action") or tool_args.get("action") or "").strip()
+        if tool_name == "manage_task" and status_upper == "DONE":
+            if action == "kill_all":
+                self._clear_async_kind(frozenset({"bg_task", "timer"}))
+            elif action == "kill":
+                tid = tool_args.get("TaskId")
+                if isinstance(tid, str) and tid.strip():
+                    self._resolve_async_token(tid)
+        elif tool_name == "manage_subagents" and status_upper == "DONE":
+            if action == "kill_all":
+                self._clear_async_kind(frozenset({"invoke_subagent"}))
+            elif action in {"kill", "cancel"}:
+                for key in ("id", "agent_id", "conversation_id", "TaskId"):
+                    val = tool_args.get(key)
+                    if isinstance(val, str) and val.strip():
+                        self._resolve_async_token(val)
+
+
 def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage], dict]:
     """Project transcript rows to plain user/assistant turns plus list hints."""
     messages: list[ConversationMessage] = []
+    tracker = AntigravityTurnTracker()
     first_user = ""
     last_user = ""
     last_agent = ""
     first_ts: float | None = None
     last_ts: float | None = None
-    model: str | None = None
-    tail_type: str | None = None
-    tail_status: str | None = None
-    tail_step_index: object = None
-    tail_error = ""
-    for row in rows:
-        kind = str(row.get("type") or "")
+    for idx, row in enumerate(rows, 1):
         created = row.get("created_at")
         ts = parse_timestamp(created) if isinstance(created, str) else None
-        row_status = str(row.get("status") or "")
-        row_error = _row_error_text(row)
+        tracker.observe(row, lineno=idx)
+        kind = str(row.get("type") or "")
+        row_status = str(row.get("status") or "").upper()
         if kind == "USER_INPUT":
-            text = unwrap_user_request(row.get("content") or "")
-            picked = model_name_from_user_input(row.get("content") or "")
-            if picked:
-                model = picked
-            if not text or text == "None":
-                if row_status.upper() == "ERROR":
-                    tail_type = kind
-                    tail_status = row_status
-                    tail_step_index = row.get("step_index")
-                    tail_error = row_error
-                    if ts is not None:
-                        if first_ts is None:
-                            first_ts = ts
-                        last_ts = ts
+            if not tracker.row_user_text and row_status not in _ABORT_STATUSES:
                 continue
             if ts is not None:
                 if first_ts is None:
                     first_ts = ts
                 last_ts = ts
-            if not first_user:
-                first_user = text
-            last_user = text
-            messages.append(ConversationMessage(role="user", text=text, timestamp=ts))
-            tail_type = kind
-            tail_status = row_status
-            tail_step_index = row.get("step_index")
-            tail_error = row_error
+            if tracker.row_user_text:
+                if not first_user:
+                    first_user = tracker.row_user_text
+                last_user = tracker.row_user_text
+                messages.append(
+                    ConversationMessage(role="user", text=tracker.row_user_text, timestamp=ts)
+                )
         elif kind == "PLANNER_RESPONSE":
-            content = row.get("content")
-            thinking = row.get("thinking")
-            text = ""
-            if isinstance(content, str) and content.strip():
-                text = content.strip()
-            elif isinstance(thinking, str) and thinking.strip():
-                text = thinking.strip()
-            tail_type = kind
-            tail_status = row_status
-            tail_step_index = row.get("step_index")
-            tail_error = row_error
             if ts is not None:
                 if first_ts is None:
                     first_ts = ts
                 last_ts = ts
-            if not text or text == "None":
-                continue
-            last_agent = text
-            messages.append(ConversationMessage(role="assistant", text=text, timestamp=ts))
+            if tracker.row_reply_text:
+                last_agent = tracker.row_reply_text
+                messages.append(
+                    ConversationMessage(
+                        role="assistant", text=tracker.row_reply_text, timestamp=ts
+                    )
+                )
         else:
-            # Tool results / bookkeeping: not part of plain conversation,
-            # but the tail kind/status still informs list status.
-            tail_type = kind
-            tail_status = row_status
-            tail_step_index = row.get("step_index")
-            tail_error = row_error
             if ts is not None:
                 if first_ts is None:
                     first_ts = ts
@@ -259,27 +644,57 @@ def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage
         "last_agent": last_agent,
         "first_ts": first_ts,
         "last_ts": last_ts,
-        "model": model,
-        "tail_type": tail_type,
-        "tail_status": tail_status,
-        "tail_step_index": tail_step_index,
-        "tail_error": tail_error,
+        "model": tracker.model,
+        "tail_type": tracker.tail_type or None,
+        "tail_status": tracker.tail_status or None,
+        "tail_is_tool": tracker.tail_is_tool,
+        "tail_has_tool_calls": tracker.tail_has_tool_calls,
+        "tail_reply": tracker.tail_reply,
+        "open_tool_calls": tracker.open_tool_calls,
+        "pending_async": tuple(sorted(tracker.pending_async)),
+        "tail_step_index": tracker.tail_step_index,
+        "tail_error": tracker.tail_error,
     }
     return messages, meta
 
 
+def _summary_is_active(summary: dict | None) -> bool:
+    if not summary:
+        return False
+    status = str(summary.get("status") or "").strip().upper()
+    return status == "CASCADE_RUN_STATUS_RUNNING" or bool(summary.get("not_fully_idle"))
+
+
 def _status_for_transcript(meta: dict, summary: dict | None = None) -> str:
-    if (summary or {}).get("killed"):
+    summary_info = summary or {}
+    if summary_info.get("killed"):
         return titles.STATUS_ABORTED
-    tail_status = (meta.get("tail_status") or "").upper()
-    if tail_status == "ERROR":
-        return titles.STATUS_ABORTED
-    if tail_status == "RUNNING":
+    if _summary_is_active(summary_info):
         return titles.STATUS_PENDING
-    tail_type = meta.get("tail_type") or ""
-    if tail_type == "PLANNER_RESPONSE" and (meta.get("last_agent") or "").strip():
+    tail_status = str(meta.get("tail_status") or "").upper()
+    tail_type = str(meta.get("tail_type") or "")
+    tail_is_tool = bool(meta.get("tail_is_tool"))
+    if tail_type == "ERROR_MESSAGE" or (not tail_is_tool and tail_status in _ABORT_STATUSES):
+        return titles.STATUS_ABORTED
+    if (
+        tail_status == "RUNNING"
+        or tail_is_tool
+        or tail_type == "SYSTEM_MESSAGE"
+        or meta.get("tail_has_tool_calls")
+        or int(meta.get("open_tool_calls") or 0) > 0
+        or bool(meta.get("pending_async"))
+    ):
+        return titles.STATUS_PENDING
+    if (
+        tail_type == "PLANNER_RESPONSE"
+        and tail_status == "DONE"
+        and not meta.get("tail_has_tool_calls")
+        and int(meta.get("open_tool_calls") or 0) == 0
+        and not meta.get("pending_async")
+        and bool(str(meta.get("tail_reply") or "").strip())
+    ):
         return titles.STATUS_DONE
-    if tail_type == "USER_INPUT" and (meta.get("last_user") or "").strip():
+    if tail_type == "USER_INPUT" and str(meta.get("last_user") or "").strip():
         return titles.STATUS_PENDING
     return titles.STATUS_NONE
 
@@ -323,23 +738,34 @@ def _read_summaries(root: str) -> dict[str, dict]:
                 parent_map[child_id] = parent_id
 
         has_parent_cols = True
+        has_idle_col = True
         try:
             rows = conn.execute(
                 "SELECT conversation_id, title, preview, step_count,"
                 " last_modified_time, workspace_uris, status, killed,"
                 " last_user_input_time, app_data_dir,"
-                " parent_conversation_id, nesting_depth FROM conversation_summaries"
+                " parent_conversation_id, nesting_depth, not_fully_idle"
+                " FROM conversation_summaries"
             ).fetchall()
         except sqlite3.Error:
-            has_parent_cols = False
+            has_idle_col = False
             try:
                 rows = conn.execute(
                     "SELECT conversation_id, title, preview, step_count,"
                     " last_modified_time, workspace_uris, status, killed,"
-                    " last_user_input_time, app_data_dir FROM conversation_summaries"
+                    " last_user_input_time, app_data_dir,"
+                    " parent_conversation_id, nesting_depth FROM conversation_summaries"
                 ).fetchall()
             except sqlite3.Error:
-                rows = []
+                has_parent_cols = False
+                try:
+                    rows = conn.execute(
+                        "SELECT conversation_id, title, preview, step_count,"
+                        " last_modified_time, workspace_uris, status, killed,"
+                        " last_user_input_time, app_data_dir FROM conversation_summaries"
+                    ).fetchall()
+                except sqlite3.Error:
+                    rows = []
 
         out: dict[str, dict] = {}
         for row in rows:
@@ -351,6 +777,7 @@ def _read_summaries(root: str) -> dict[str, dict]:
                 depth = int(row[11] or 0) if has_parent_cols else 0
             except (TypeError, ValueError):
                 depth = 0
+            not_fully_idle = bool(row[12]) if has_idle_col else False
             linked_parent = parent_map.get(cid, "")
             out[cid] = {
                 "title": str(row[1] or "").strip(),
@@ -360,6 +787,7 @@ def _read_summaries(root: str) -> dict[str, dict]:
                 "workspace_uris": str(row[5] or ""),
                 "status": str(row[6] or ""),
                 "killed": bool(row[7]),
+                "not_fully_idle": not_fully_idle,
                 "last_user_input_time": row[8],
                 "app_data_dir": str(row[9] or ""),
                 "parent_conversation_id": parent_cid or linked_parent,
@@ -377,6 +805,7 @@ def _read_summaries(root: str) -> dict[str, dict]:
                     "workspace_uris": "",
                     "status": "",
                     "killed": False,
+                    "not_fully_idle": False,
                     "last_user_input_time": None,
                     "app_data_dir": "",
                     "parent_conversation_id": parent_id,
@@ -406,6 +835,9 @@ def _read_all_summaries() -> dict[str, dict]:
                     **{k: v for k, v in entry.items() if v not in ("", None, False)},
                     "is_subagent": prev_sub or bool(entry.get("is_subagent")),
                     "killed": bool(prev.get("killed")) or bool(entry.get("killed")),
+                    "not_fully_idle": (
+                        bool(prev.get("not_fully_idle")) or bool(entry.get("not_fully_idle"))
+                    ),
                 }
     return merged
 
@@ -734,21 +1166,30 @@ def _build_session_info(
         is_killed = bool((summary or {}).get("killed"))
         tail_status = str(meta.get("tail_status") or "").upper()
         tail_error = str(meta.get("tail_error") or "").strip()
+        status_tag = _status_for_transcript(meta, summary)
         terminal_error: dict[str, object] = {}
-        if is_killed or tail_status == "ERROR":
-            status_tag = titles.STATUS_ABORTED
+        if status_tag == titles.STATUS_ABORTED:
             if tail_error:
                 last_agent = preprocess_excerpt(tail_error, host) or tail_error
             anchor = str(step) if step is not None else f"row:{len(rows)}"
             id_tail = tail_error or last_agent or last_user
-            terminal_error = terminal_error_evidence(
-                kind="" if tail_error else ("user_interrupt" if is_killed else "error"),
-                message=tail_error or ("interrupted by user" if is_killed else "error"),
+            fallback_msg = (
+                "interrupted by user"
+                if is_killed
+                else ("canceled" if "CANCEL" in tail_status else "error")
             )
-        else:
-            status_tag = _status_for_transcript(meta)
+            fallback_kind = "user_interrupt" if is_killed else "error"
+            terminal_error = terminal_error_evidence(
+                kind="" if tail_error else fallback_kind,
+                message=tail_error or fallback_msg,
+            )
+        elif status_tag == titles.STATUS_DONE:
             anchor = str(step) if step is not None else ""
-            id_tail = last_agent or last_user
+            tail_reply_raw = str(meta.get("tail_reply") or "")
+            id_tail = preprocess_excerpt(tail_reply_raw, host) or tail_reply_raw
+        else:
+            anchor = ""
+            id_tail = ""
         from sesskit.models import completion_id_for
 
         completion_id = completion_id_for(
@@ -1147,14 +1588,17 @@ def scan_signature() -> object | None:
     """Cheap list-level version: file stamps of transcripts, dbs, summaries."""
     parts: list[object] = []
     for root in _roots():
-        for name in ("conversation_summaries.db", "history.jsonl"):
+        for name in (
+            "conversation_summaries.db",
+            "conversation_summaries.db-wal",
+            "history.jsonl",
+        ):
             full = os.path.join(root, name)
             if os.path.isfile(full):
                 parts.append((full, stat_signature(full)))
     for path in list(_transcript_candidates().values()) + list(_db_candidates().values()):
         parts.append((path, stat_signature(path)))
-    # Sort for stability; no WAL special-casing: Antigravity writes go
-    # through SQLite WAL, but list fields (title/preview/status) come from
-    # the summaries db and transcript files, both covered above.
+    # Include SQLite WAL alongside conversation_summaries.db so status flips
+    # invalidate scan caches before checkpointing.
     parts.sort(key=lambda item: str(item[0]))
     return tuple(parts) if parts else None

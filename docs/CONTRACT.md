@@ -7,7 +7,7 @@ command instead emits the versioned JSONL event protocol below; existing command
 and their envelopes are unchanged:
 
 ```json
-{"ok": true, "data": {}, "error": null, "meta": {"version": 1, "tool_version": "0.3.2"}}
+{"ok": true, "data": {}, "error": null, "meta": {"version": 1, "tool_version": "0.3.3"}}
 ```
 
 `meta.version` is the envelope schema version. The additive `meta.tool_version`
@@ -117,7 +117,7 @@ the transport owner's responsibility. See the [integration guide](MESSAGE_STREAM
 
 ## Supported runtimes
 
-`claude`, `codex`, `opencode`, `kimi`, `cursor`, `pi`
+`claude`, `codex`, `opencode`, `kimi`, `cursor`, `pi`, `antigravity`
 
 ## Language-agnostic access
 
@@ -222,6 +222,7 @@ Use these when implementing or reviewing parsers (not an event-bus API — SessK
 | Cursor | Prefer transcript / store tail; list `status_tag` is weak today | Prefer unknown over false done when terminal reason is unclear |
 | Claude | Stop / transcript end without interrupt markers | `system` entries with `error` (`formatted` human text + `status` HTTP code; 2.1+ live shape) → aborted; `[Request interrupted by user]` and its tool-use variant `[Request interrupted by user for tool use]` → aborted (neither is human input); final assistant text beginning `You've hit your session limit` → aborted |
 | Kimi | Stable `step.end` / assistant tail | Cancel / failure markers in wire history |
+| Antigravity | Terminal `PLANNER_RESPONSE` with `status == "DONE"`, empty `tool_calls`, non-empty `content`/media, zero open calls, zero non-daemon `pending_async`, and DB idle (`not CASCADE_RUN_STATUS_RUNNING` / `not_fully_idle`; thinking-only rows, tool calls/results, mid-turn tool `ERROR`/`INVALID`, `SYSTEM_MESSAGE`, `USER_INPUT` stay `pending`) | `ERROR_MESSAGE` turn rows (e.g. quota/rate-limit/API errors), non-tool `ERROR`/`CANCELED`/`CANCELLED`, or DB `killed` → aborted |
 
 ### Verified gaps closed (2026-09-15 live Mac runs)
 
@@ -312,6 +313,7 @@ exception to the native identity requirement.
 - **Late same-turn item completions do not reopen a finished Codex turn (2026-10-07).** A Codex background command can keep running after its turn ends and write `item_completed` with the same `turn_id` after `task_complete` / `turn_aborted`. That row closes an item of the finished turn; it is not new turn activity and must not clear the terminal status or identity. `task_started`, and item activity carrying a different (or missing) `turn_id`, still invalidate an earlier terminal verdict. Verified failure: a quota `task_complete` (error, turn `01a115a7…`) followed two minutes later by that turn's `CommandExecution` completion returned an empty status, and the consumer kept showing Working for an exhausted session.
 - **Window-stable identity inputs (2026-10-01 acceptance rejection):** changing availability of user/list excerpts within a rolling scan window must never change the id of the same native final event. Both the anchor AND the tail material hashed into `completion_id` must be deterministic functions of the anchored terminal evidence (the terminal record/message identity plus its own text) — never of whether an excerpt happens to sit inside the bounded tail. Verified failure on installed 0.2.3: a Claude history (20 KB user text + final assistant event `a-final`, `stop_reason=end_turn`) parsed `STATUS_DONE`; after 90 metadata rows pushed the user text out of the 64 KB tail, the rescan was still `STATUS_DONE` with the identical terminal event and text, but `completion_id` changed and the consumer sent two pushes for one genuine completion. The stable-anchor guarantee therefore covers arbitrary metadata appends and window-boundary shifts, not only tiny appended rows. Display excerpts (`last_user_msg` wider-window backfill and friends) may keep using wider reads; identity inputs may not.
 - **Same rule in every runtime adapter:** when fixing one adapter's id source, audit all six for the same aggregate-mtime/size/metadata pattern and correct each in scope. Abnormal endings keep their own identity path (`STATUS_ABORTED` with retained error evidence); waiting, device preferences, and per-device receipt dedupe are consumer-side and unchanged.
+- **Antigravity finality & window invariance:** Antigravity intermediate tool steps (`PLANNER_RESPONSE` with `tool_calls`) and mid-turn parking steps before non-daemon async tasks/subagents (`run_command` background tasks, `schedule` timers, `invoke_subagent`, `run_workflow`) are non-terminal (`STATUS_PENDING` with empty `completion_id`), and `thinking` is never emitted as assistant text or `tail_reply`. `STATUS_DONE` requires DB summary idle (`not CASCADE_RUN_STATUS_RUNNING` and `not not_fully_idle`), `open_tool_calls == 0`, empty non-daemon `pending_async`, and a terminal no-tool `PLANNER_RESPONSE` (`status == "DONE"`) whose own `content`/media supplies `tail_text` for `completion_id_for`. Mid-turn tool-result `ERROR`/`INVALID` rows remain `STATUS_PENDING`; `ERROR_MESSAGE` rows, non-tool abort statuses, and DB `killed` produce `STATUS_ABORTED`.
 
 ## Cross-runtime model evolution contract
 

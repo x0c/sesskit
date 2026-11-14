@@ -300,6 +300,7 @@ def test_abnormal_endings_killed_and_tail_error_vs_recovered_error(tmp_path: Pat
         [
             {
                 "step_index": 0,
+                "source": "USER_EXPLICIT",
                 "type": "USER_INPUT",
                 "status": "DONE",
                 "created_at": "2026-11-10T10:00:00Z",
@@ -307,12 +308,11 @@ def test_abnormal_endings_killed_and_tail_error_vs_recovered_error(tmp_path: Pat
             },
             {
                 "step_index": 1,
-                "source": "MODEL",
-                "type": "GENERIC",
-                "status": "ERROR",
+                "source": "SYSTEM",
+                "type": "ERROR_MESSAGE",
+                "status": "DONE",
                 "error": "429 rate limit exceeded",
                 "created_at": "2026-11-10T10:00:03Z",
-                "content": "Encountered error: 429 rate limit exceeded",
             },
         ],
     )
@@ -967,4 +967,617 @@ def test_delete_session_cleans_artifacts_descendants_and_respects_flock(tmp_path
     ag.delete_session("other-1", root=str(root))
     assert not (root / "brain" / "other-1").exists()
     ag.delete_session("nonexistent-id", root=str(root))
+
+
+def _init_summaries_db_with_idle(
+    root: Path,
+    rows: list[tuple[str, str, str, str, int, str, int, int]],
+) -> Path:
+    """Create conversation_summaries.db with explicit status and not_fully_idle."""
+    root.mkdir(parents=True, exist_ok=True)
+    db_path = root / "conversation_summaries.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                preview TEXT NOT NULL DEFAULT '',
+                step_count INTEGER NOT NULL DEFAULT 0,
+                last_modified_time TEXT NOT NULL DEFAULT '',
+                workspace_uris TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                killed INTEGER NOT NULL DEFAULT 0,
+                not_fully_idle INTEGER NOT NULL DEFAULT 0,
+                last_user_input_time TEXT NOT NULL DEFAULT '',
+                app_data_dir TEXT NOT NULL DEFAULT '',
+                parent_conversation_id TEXT NOT NULL DEFAULT '',
+                nesting_depth INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        for cid, title, preview, uris, steps, status, killed, nfi in rows:
+            conn.execute(
+                "INSERT INTO conversation_summaries ("
+                "conversation_id, title, preview, step_count, last_modified_time,"
+                " workspace_uris, status, killed, not_fully_idle, last_user_input_time,"
+                " app_data_dir, parent_conversation_id, nesting_depth"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0)",
+                (
+                    cid,
+                    title,
+                    preview,
+                    steps,
+                    "2026-11-14T10:00:10Z",
+                    uris,
+                    status,
+                    killed,
+                    nfi,
+                    "2026-11-14T10:00:00Z",
+                    str(root),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def test_tool_calling_and_thinking_never_trigger_false_done(tmp_path: Path) -> None:
+    from sesskit.activity import load_activity
+    from sesskit.activity_reader import open_activity_reader
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    root = tmp_path / ".gemini" / "antigravity-cli"
+    root.mkdir(parents=True)
+    uris = json.dumps([f"file://{proj}"])
+    _init_summaries_db(
+        root,
+        [
+            ("thinking-tool", "Thinking+Tools", "", uris, 2, 0, "", 0),
+            ("thinking-only", "Thinking Only", "", uris, 2, 0, "", 0),
+            ("prose-tool", "Prose+Tools", "", uris, 2, 0, "", 0),
+            ("stale-reply", "Stale Reply", "", uris, 4, 0, "", 0),
+        ],
+    )
+    user_row = {
+        "step_index": 0,
+        "source": "USER_EXPLICIT",
+        "type": "USER_INPUT",
+        "status": "DONE",
+        "created_at": "2026-11-14T10:00:00Z",
+        "content": "<USER_REQUEST>check</USER_REQUEST>",
+    }
+    _write_transcript(
+        root,
+        "thinking-tool",
+        [
+            user_row,
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:01Z",
+                "thinking": "Internal CoT should never notify or show up as assistant reply.",
+                "content": "",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "ls"}}],
+            },
+        ],
+    )
+    _write_transcript(
+        root,
+        "thinking-only",
+        [
+            user_row,
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:01Z",
+                "thinking": "Still thinking without final answer.",
+                "content": "",
+            },
+        ],
+    )
+    _write_transcript(
+        root,
+        "prose-tool",
+        [
+            user_row,
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:01Z",
+                "content": "Let me inspect the repo first.",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "ls"}}],
+            },
+        ],
+    )
+    # Earlier turn completed with reply A; later turn ends on an empty PLANNER_RESPONSE:
+    # tail must NOT inherit turn 1's last_agent to fake STATUS_DONE.
+    _write_transcript(
+        root,
+        "stale-reply",
+        [
+            user_row,
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:01Z",
+                "content": "First answer.",
+            },
+            {
+                "step_index": 2,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:02Z",
+                "content": "<USER_REQUEST>follow up</USER_REQUEST>",
+            },
+            {
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:03Z",
+                "thinking": "CoT after second question",
+                "content": "",
+            },
+        ],
+    )
+
+    scanned = {s["id"]: s for s in _scan_root(root, limit=20)}
+
+    for cid, expected_tag in (
+        ("thinking-tool", titles.STATUS_PENDING),
+        ("thinking-only", titles.STATUS_NONE),
+        ("prose-tool", titles.STATUS_PENDING),
+        ("stale-reply", titles.STATUS_NONE),
+    ):
+        info = scanned[cid]
+        assert info["status_tag"] == expected_tag, (cid, info["status_tag"])
+        assert info["completion_id"] == ""
+        snap = load_activity({"source": "antigravity", "path": info["path"], "id": cid})
+        assert snap.outcome.status != "done"
+        poll = open_activity_reader(
+            {"source": "antigravity", "path": info["path"], "id": cid}
+        ).poll()
+        assert poll.outcome.status != "done"
+
+    assert scanned["thinking-tool"]["last_agent_msg"] == ""
+    assert scanned["thinking-only"]["last_agent_msg"] == ""
+    assert ag.load_conversation(scanned["thinking-tool"]["path"]) == [
+        m for m in ag.load_conversation(scanned["thinking-tool"]["path"]) if m.role == "user"
+    ]
+    assert [m.role for m in ag.load_conversation(scanned["thinking-only"]["path"])] == ["user"]
+
+
+def test_engine_running_and_not_fully_idle_suppress_completion(tmp_path: Path) -> None:
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    root = tmp_path / ".gemini" / "antigravity-cli"
+    root.mkdir(parents=True)
+    uris = json.dumps([f"file://{proj}"])
+    db_path = _init_summaries_db_with_idle(
+        root,
+        [
+            ("running-row", "Running", "", uris, 2, "CASCADE_RUN_STATUS_RUNNING", 0, 0),
+            ("nfi-row", "Not Idle", "", uris, 2, "CASCADE_RUN_STATUS_IDLE", 0, 1),
+            ("idle-row", "Idle", "", uris, 2, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+        ],
+    )
+    rows = [
+        {
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:00Z",
+            "content": "<USER_REQUEST>do work</USER_REQUEST>",
+        },
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:05Z",
+            "content": "Working on background steps, please hold.",
+        },
+    ]
+    for cid in ("running-row", "nfi-row", "idle-row"):
+        _write_transcript(root, cid, rows)
+
+    scanned = {s["id"]: s for s in _scan_root(root, limit=20)}
+    assert scanned["running-row"]["status_tag"] == titles.STATUS_PENDING
+    assert scanned["running-row"]["completion_id"] == ""
+    assert scanned["nfi-row"]["status_tag"] == titles.STATUS_PENDING
+    assert scanned["nfi-row"]["completion_id"] == ""
+    assert scanned["idle-row"]["status_tag"] == titles.STATUS_DONE
+    assert scanned["idle-row"]["completion_id"].startswith(f"{titles.STATUS_DONE}:")
+
+    # Once nfi-row flips to idle in DB, refresh_session emits completion.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE conversation_summaries SET not_fully_idle = 0 WHERE conversation_id = 'nfi-row'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with mock.patch.object(ag, "_roots", return_value=[str(root)]):
+        refreshed = ag.refresh_session(scanned["nfi-row"])
+    assert refreshed is not None
+    assert refreshed["status_tag"] == titles.STATUS_DONE
+    assert refreshed["completion_id"].startswith(f"{titles.STATUS_DONE}:")
+
+
+def test_transcript_pending_async_lifecycle_timers_subagents_and_daemon(tmp_path: Path) -> None:
+    from sesskit.activity import load_activity
+    from sesskit.activity_reader import open_activity_reader
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    root = tmp_path / ".gemini" / "antigravity-cli"
+    root.mkdir(parents=True)
+    uris = json.dumps([f"file://{proj}"])
+    _init_summaries_db_with_idle(
+        root,
+        [
+            ("bg-session", "BG Task", "", uris, 10, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+            ("daemon-session", "Daemon Cron", "", uris, 4, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+            ("workflow-session", "Workflow Async", "", uris, 4, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+            ("quoted-doc", "Quoted Doc", "", uris, 4, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+        ],
+    )
+
+    bg_rows = [
+        {
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:00Z",
+            "content": "<USER_REQUEST>run tests</USER_REQUEST>",
+        },
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:01Z",
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest"}}],
+        },
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "RUNNING",
+            "created_at": "2026-11-14T10:00:02Z",
+            "content": (
+                "Created At: 2026-11-14T10:00:02Z\n"
+                "Tool is running as a background task with task id: bg-session/task-2\n"
+                "Task Description: pytest"
+            ),
+        },
+        {
+            "step_index": 3,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:03Z",
+            "tool_calls": [
+                {
+                    "name": "schedule",
+                    "args": {"DurationSeconds": 120, "TimerCondition": "bg-session/task-2"},
+                }
+            ],
+        },
+        {
+            "step_index": 4,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "RUNNING",
+            "created_at": "2026-11-14T10:00:04Z",
+            "content": (
+                "Created At: 2026-11-14T10:00:04Z\n"
+                "Tool is running as a background task with task id: bg-session/task-4"
+            ),
+        },
+        {
+            "step_index": 5,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:05Z",
+            "content": "Tests running in background, waiting for wakeup.",
+        },
+    ]
+    tpath = _write_transcript(root, "bg-session", bg_rows)
+
+    # Mid-wait: DB may already say IDLE, yet transcript pending_async keeps BOTH pending.
+    scanned = {s["id"]: s for s in _scan_root(root, limit=20)}
+    assert scanned["bg-session"]["status_tag"] == titles.STATUS_PENDING
+    assert scanned["bg-session"]["completion_id"] == ""
+    assert load_activity({"source": "antigravity", "path": str(tpath), "id": "bg-session"}).outcome.status == "pending"
+
+    # Task notification arrives -> still SYSTEM_MESSAGE -> still pending (never done).
+    # Note: dependent TimerCondition timer task-4 also auto-cancels!
+    sys_done = {
+        "step_index": 6,
+        "source": "SYSTEM",
+        "type": "SYSTEM_MESSAGE",
+        "status": "DONE",
+        "created_at": "2026-11-14T10:00:20Z",
+        "content": (
+            "<SYSTEM_MESSAGE>\n"
+            "[Message] timestamp=2026-11-14T02:00:20Z sender=bg-session/task-2 "
+            'priority=MESSAGE_PRIORITY_HIGH content=Task id "bg-session/task-2" finished with result:'
+        ),
+    }
+    _write_transcript(root, "bg-session", bg_rows + [sys_done])
+    with mock.patch.object(ag, "_roots", return_value=[str(root)]):
+        mid = ag.refresh_session(scanned["bg-session"])
+    assert mid is not None and mid["status_tag"] == titles.STATUS_PENDING
+    assert load_activity({"source": "antigravity", "path": str(tpath), "id": "bg-session"}).outcome.status == "pending"
+
+    # Final no-tool PLANNER_RESPONSE after pending_async cleared -> DONE.
+    final_done = {
+        "step_index": 7,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "created_at": "2026-11-14T10:00:22Z",
+        "content": "All tests passed.",
+    }
+    _write_transcript(root, "bg-session", bg_rows + [sys_done, final_done])
+    with mock.patch.object(ag, "_roots", return_value=[str(root)]):
+        done = ag.refresh_session(scanned["bg-session"])
+    assert done is not None and done["status_tag"] == titles.STATUS_DONE
+    assert done["completion_id"].startswith(f"{titles.STATUS_DONE}:")
+    assert load_activity({"source": "antigravity", "path": str(tpath), "id": "bg-session"}).outcome.status == "done"
+
+    # Daemon schedule (IsDaemon=True) never holds pending_async across final turn reply.
+    _write_transcript(
+        root,
+        "daemon-session",
+        [
+            bg_rows[0],
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:01Z",
+                "tool_calls": [
+                    {"name": "schedule", "args": {"CronExpression": "*/5 * * * *", "IsDaemon": True}}
+                ],
+            },
+            {
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-14T10:00:02Z",
+                "content": "Created At: 2026-11-14T10:00:02Z\nTool is running as a background task with task id: daemon-session/task-2",
+            },
+            {
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:03Z",
+                "content": "Daemon scheduled, session complete.",
+            },
+        ],
+    )
+    # Workflow/subagent async launch stays pending until reset by new USER_EXPLICIT turn or kill.
+    wf_path = _write_transcript(
+        root,
+        "workflow-session",
+        [
+            bg_rows[0],
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:01Z",
+                "tool_calls": [{"name": "run_workflow", "args": {"Description": "fanout"}}],
+            },
+            {
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:02Z",
+                "content": json.dumps({"workflow_id": "wf-9", "status": "running"}),
+            },
+            {
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:03Z",
+                "content": "Waiting on workflow wf-9.",
+            },
+        ],
+    )
+    # Quoting a background task log inside a DONE read_file does NOT create phantom pending_async.
+    _write_transcript(
+        root,
+        "quoted-doc",
+        [
+            bg_rows[0],
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:01Z",
+                "tool_calls": [{"name": "read_file", "args": {"Path": "doc.md"}}],
+            },
+            {
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:02Z",
+                "content": "Tool is running as a background task with task id: fake/task-99\nNo background tasks are currently running.",
+            },
+            {
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-14T10:00:03Z",
+                "content": "Read the docs cleanly.",
+            },
+        ],
+    )
+
+    scanned2 = {s["id"]: s for s in _scan_root(root, limit=20)}
+    assert scanned2["daemon-session"]["status_tag"] == titles.STATUS_DONE
+    assert scanned2["workflow-session"]["status_tag"] == titles.STATUS_PENDING
+    assert scanned2["workflow-session"]["completion_id"] == ""
+    assert load_activity({"source": "antigravity", "path": str(wf_path), "id": "workflow-session"}).outcome.status == "pending"
+    assert scanned2["quoted-doc"]["status_tag"] == titles.STATUS_DONE
+
+    # New USER_EXPLICIT turn clears stale async from prior turn.
+    reader = open_activity_reader({"source": "antigravity", "path": str(wf_path), "id": "workflow-session"})
+    assert reader.poll().outcome.status == "pending"
+    with open(wf_path, "a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "step_index": 4,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "created_at": "2026-11-14T10:01:00Z",
+                    "content": "<USER_REQUEST>fresh question</USER_REQUEST>",
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "step_index": 5,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-14T10:01:05Z",
+                    "content": "Fresh answer.",
+                }
+            )
+            + "\n"
+        )
+    assert reader.poll().outcome.status == "done"
+
+
+def test_tool_result_errors_stay_pending_while_error_message_aborts(tmp_path: Path) -> None:
+    from sesskit.activity import load_activity, to_v1_dicts
+    from sesskit.conformance import run_conformance
+    from sesskit.registry import load_session_conversation
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    root = tmp_path / ".gemini" / "antigravity-cli"
+    root.mkdir(parents=True)
+    uris = json.dumps([f"file://{proj}"])
+    _init_summaries_db_with_idle(
+        root,
+        [
+            ("midturn-tool-err", "Tool Err", "", uris, 3, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+            ("turn-api-err", "API Err", "", uris, 2, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+            ("turn-api-recovered", "API Recovered", "", uris, 3, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+        ],
+    )
+    user_row = {
+        "step_index": 0,
+        "source": "USER_EXPLICIT",
+        "type": "USER_INPUT",
+        "status": "DONE",
+        "created_at": "2026-11-14T10:00:00Z",
+        "content": "<USER_REQUEST>do work</USER_REQUEST>",
+    }
+    tool_err_rows = [
+        user_row,
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:01Z",
+            "tool_calls": [{"name": "read_file", "args": {"Path": "missing.py"}}],
+        },
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "ERROR",
+            "error": "file does not exist",
+            "created_at": "2026-11-14T10:00:02Z",
+            "content": "file does not exist",
+        },
+    ]
+    api_err_rows = [
+        user_row,
+        {
+            "step_index": 1,
+            "source": "SYSTEM",
+            "type": "ERROR_MESSAGE",
+            "status": "DONE",
+            "error": 'API error (attempt 1): request failed: operation timed out',
+            "created_at": "2026-11-14T10:00:02Z",
+        },
+    ]
+    recovered_rows = api_err_rows + [
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-14T10:00:06Z",
+            "content": "Succeeded after retry.",
+        }
+    ]
+    p_tool = _write_transcript(root, "midturn-tool-err", tool_err_rows)
+    p_api = _write_transcript(root, "turn-api-err", api_err_rows)
+    p_rec = _write_transcript(root, "turn-api-recovered", recovered_rows)
+
+    scanned = {s["id"]: s for s in _scan_root(root, limit=20)}
+    assert scanned["midturn-tool-err"]["status_tag"] == titles.STATUS_PENDING
+    assert scanned["midturn-tool-err"]["completion_id"] == ""
+    assert scanned["midturn-tool-err"].get("terminal_error_kind", "") == ""
+
+    assert scanned["turn-api-err"]["status_tag"] == titles.STATUS_ABORTED
+    assert scanned["turn-api-err"]["completion_id"].startswith(f"{titles.STATUS_ABORTED}:")
+    assert "operation timed out" in scanned["turn-api-err"]["last_agent_msg"]
+
+    assert scanned["turn-api-recovered"]["status_tag"] == titles.STATUS_DONE
+    assert scanned["turn-api-recovered"]["completion_id"].startswith(f"{titles.STATUS_DONE}:")
+
+    for cid, p, expected_outcome in (
+        ("midturn-tool-err", p_tool, "pending"),
+        ("turn-api-err", p_api, "aborted"),
+        ("turn-api-recovered", p_rec, "done"),
+    ):
+        sess = {"source": "antigravity", "path": str(p), "id": cid}
+        snap = load_activity(sess)
+        assert snap.outcome.status == expected_outcome
+        rep = run_conformance(
+            "antigravity",
+            snapshot=snap,
+            v1_events=to_v1_dicts(snap),
+            conversation=load_session_conversation(sess),
+        )
+        assert rep.passed, rep.violations
+
 
