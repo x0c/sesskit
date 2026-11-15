@@ -146,13 +146,14 @@ existing Rust core:
   --pure --sdist` builds the local native wheel, an explicit setuptools-built
   compatibility wheel and the source distribution. Build release artifacts
   from the accepted committed-source archive, not unrelated working edits.
-- **A universal2 macOS wheel needs the rustup toolchain, not Homebrew's `cargo`
-  (2026-11-15).** `cargo` on this Mac's `PATH` comes from Homebrew and has no
-  `x86_64-apple-darwin` std, so `maturin build --target universal2-apple-darwin`
-  dies with `error[E0463]: can't find crate for 'core'`. The same command
-  succeeds with `PATH="$HOME/.cargo/bin:$PATH"` in front of it. Build the native
-  wheel that way (or take the CI artifact) and state which platforms the local
-  build actually covers instead of assuming universal2.
+- **The universal2 wheel needs rustup's toolchain (2026-11-15).** A `cargo` /
+  `rustc` installed by a system package manager can shadow rustup and cannot see
+  the `x86_64-apple-darwin` standard library, so
+  `maturin build --target universal2-apple-darwin` fails with
+  `error[E0463]: can't find crate for 'core'`. Check
+  `rustup target list --installed`, then build with rustup's toolchain first on
+  `PATH`; when that is unavailable, publish the wheel the local build actually
+  produced and state the covered platforms instead of assuming universal2.
 - **Version sync and the local release asset set (2026-11-15).** Besides
   `pyproject.toml`, `src/sesskit/__init__.py`, `README.md`, `README.zh-CN.md`,
   `docs/INTEGRATION_GUIDE.md` and `tests/test_examples.py`, the version also
