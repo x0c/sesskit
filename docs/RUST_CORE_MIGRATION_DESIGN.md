@@ -146,6 +146,24 @@ existing Rust core:
   --pure --sdist` builds the local native wheel, an explicit setuptools-built
   compatibility wheel and the source distribution. Build release artifacts
   from the accepted committed-source archive, not unrelated working edits.
+- **A universal2 macOS wheel needs the rustup toolchain, not Homebrew's `cargo`
+  (2026-11-15).** `cargo` on this Mac's `PATH` comes from Homebrew and has no
+  `x86_64-apple-darwin` std, so `maturin build --target universal2-apple-darwin`
+  dies with `error[E0463]: can't find crate for 'core'`. The same command
+  succeeds with `PATH="$HOME/.cargo/bin:$PATH"` in front of it. Build the native
+  wheel that way (or take the CI artifact) and state which platforms the local
+  build actually covers instead of assuming universal2.
+- **Version sync and the local release asset set (2026-11-15).** Besides
+  `pyproject.toml`, `src/sesskit/__init__.py`, `README.md`, `README.zh-CN.md`,
+  `docs/INTEGRATION_GUIDE.md` and `tests/test_examples.py`, the version also
+  lives in `Cargo.toml`, the root `Cargo.lock` (`sesskit-python`) and `uv.lock`.
+  `scripts/build_release.py --out dist --pure --sdist` builds the wheels and the
+  sdist from the clean archive, `--index-only` rewrites `wheels.html` after a
+  wheel built to another `--out` is swapped in, and a GitHub release also carries
+  `SHA256SUMS` (the three artifacts) and `source-commit.txt`. When the checkout
+  carries another agent's uncommitted work, make the release commit in an
+  isolated clone of `HEAD` and push from there; the working checkout stays behind
+  and needs a later pull.
 - Linux cross-builds use the same command with `--target <triple> --zig` and
   a manylinux_2_17 floor; no local container runtime is needed.
 - `.github/workflows/native-wheels.yml` builds and runs installed-wheel tests
