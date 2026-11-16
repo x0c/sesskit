@@ -49,7 +49,19 @@ def extract_text(content) -> str | None:
         command_args = re.search(r"<command-args>(.*?)</command-args>", t, re.DOTALL)
         if command_args:
             args = command_args.group(1).strip()
-            return args or None
+            if args:
+                return args
+            # A prompt-based skill has both native command fields. Preserve
+            # command-only invocation, but not unrelated local-command echoes.
+            name = re.search(r"<command-name>(/[^<>\s]+)</command-name>", t)
+            message = re.search(r"<command-message>([^<>]+)</command-message>", t)
+            if (
+                t.startswith(("<command-name>", "<command-message>"))
+                and name and message
+                and name.group(1).lstrip("/") == message.group(1).strip().lstrip("/")
+            ):
+                return name.group(1)
+            return None
         if t.startswith(_SKIP_PREFIXES):
             return None
         if re.match(r"^<\w+>.*</\w+>$", t, re.DOTALL):
@@ -64,7 +76,10 @@ def extract_text(content) -> str | None:
                 t = (part.get("text") or "").strip()
                 if t:
                     texts.append(t)
-        return " ".join(texts) if texts else None
+        joined = " ".join(texts)
+        if joined.startswith(("<command-name>", "<command-message>")):
+            return extract_text(joined)
+        return joined or None
     return None
 
 

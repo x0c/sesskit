@@ -77,6 +77,31 @@ def message_text(content: object) -> str:
     return "\n\n".join(parts)
 
 
+_PI_SKILL_BLOCK_RE = re.compile(
+    r'\A<skill name="(?P<name>[a-z0-9]+(?:-[a-z0-9]+)*)" location="[^"\r\n]+">'
+    r'(?P<instructions>[\s\S]*)</skill>(?P<arguments>[\s\S]*)\Z'
+)
+
+
+def user_message_text(content: object) -> str:
+    """Human request from a Pi user turn, excluding native skill instructions.
+
+    Pi persists an explicit ``/skill:name arguments`` command as one complete
+    ``<skill …>…</skill>`` block followed by its arguments. Only that exact
+    native shape is unwrapped; assistant examples and malformed lookalikes
+    remain verbatim. A no-argument call retains its concise invocation marker.
+    """
+    text = message_text(content)
+    match = _PI_SKILL_BLOCK_RE.fullmatch(text)
+    if match is None:
+        return text
+    name = match.group("name")
+    if len(name) > 64:
+        return text
+    arguments = match.group("arguments").strip()
+    return arguments or f"/skill:{name}"
+
+
 def read_entries(path: str) -> list[dict]:
     entries: list[dict] = []
     try:
@@ -486,7 +511,7 @@ def _build_session_info_from_entries(
     for position, item in enumerate(branch):
         message = item["message"]
         role = message.get("role")
-        text = _text(message.get("content"))
+        text = user_message_text(message.get("content")) if role == "user" else _text(message.get("content"))
         timestamp = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
         if timestamp is not None:
             event_time = timestamp
@@ -720,7 +745,7 @@ def load_conversation(path: str, *, include_errors: bool = False) -> list[Conver
     for item in _active_messages(_read_entries(path)):
         message = item["message"]
         role = message.get("role")
-        text = _text(message.get("content"))
+        text = user_message_text(message.get("content")) if role == "user" else _text(message.get("content"))
         if role == "assistant" and not text and include_errors:
             stop_reason = str(message.get("stopReason") or "").strip()
             error_text = str(message.get("errorMessage") or "").strip()

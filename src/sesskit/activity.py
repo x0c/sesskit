@@ -331,7 +331,7 @@ def _build_pi_events(
         usage = _pi_usage(message, record)
         if role == "user":
             add("user_message", ts, message_id, record,
-                text=scan_pi.message_text(message.get("content")),
+                text=scan_pi.user_message_text(message.get("content")),
                 origin="human")
             continue
         if role == "toolResult":
@@ -1157,7 +1157,10 @@ def _codex_injected_user_text(entry: dict) -> str | None:
         if isinstance(part, dict) and part.get("type") == "input_text"
     ]
     text = "\n".join(part for part in parts if part).strip()
-    if text.startswith(("# AGENTS.md instructions", "<environment_context>")):
+    if (
+        text.startswith(("# AGENTS.md instructions", "<environment_context>"))
+        or scan_codex.is_skill_context_text(text)
+    ):
         return text or None
     return None
 

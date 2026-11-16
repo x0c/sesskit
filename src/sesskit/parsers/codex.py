@@ -166,6 +166,17 @@ def _terminal_fingerprint(kind: str, entry: dict, payload: dict, text: str) -> s
     return ""
 
 
+_SKILL_CONTEXT_RE = re.compile(
+    r"\A<skill>\s*<name>[^<>\r\n]+</name>\s*<path>[^<>\r\n]+</path>"
+    r"[\s\S]*</skill>\Z"
+)
+
+
+def is_skill_context_text(text: str) -> bool:
+    """A complete Codex-injected skill fragment, not an ordinary $skill prompt."""
+    return _SKILL_CONTEXT_RE.fullmatch(text.strip()) is not None
+
+
 def _response_message_text(payload: dict, role: str) -> str:
     """提取新版 response_item message 的指定角色文本，忽略框架注入上下文。"""
     if payload.get("type") != "message" or payload.get("role") != role:
@@ -180,6 +191,8 @@ def _response_message_text(payload: dict, role: str) -> str:
     ]
     text = "\n".join(part for part in parts if part)
     if text.startswith(("# AGENTS.md instructions", "<environment_context>")):
+        return ""
+    if role == "user" and is_skill_context_text(text):
         return ""
     return text
 
