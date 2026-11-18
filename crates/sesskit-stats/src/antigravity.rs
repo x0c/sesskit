@@ -432,6 +432,10 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
         None
     };
 
+    if window.full {
+        b.loop_count = crate::loops::antigravity_from_bytes(&bytes).ok().flatten();
+    }
+
     Some(b.finish(window))
 }
 

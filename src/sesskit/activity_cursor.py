@@ -34,6 +34,7 @@ from sesskit.models import (
     QuestionOption,
     SessionOutcome,
     ToolResultOutcome,
+    Usage,
 )
 from sesskit.parsers import cursor as scan_cursor
 from sesskit.parsers.common import classify_tool
@@ -257,7 +258,8 @@ class _CursorFeed:
                     text = content.strip() if isinstance(content, str) else ""
                     self._add("assistant_message", rowid, text=text)
                     continue
-                hit_orphan = self._assistant_parts(content, rowid) or hit_orphan
+                model = scan_cursor.model_name_from_blob(obj)
+                hit_orphan = self._assistant_parts(content, rowid, model) or hit_orphan
                 continue
             if role == "tool" and isinstance(content, list):
                 for part in content:
@@ -275,17 +277,29 @@ class _CursorFeed:
         self._link_new_calls()
         return fresh, hit_orphan
 
-    def _assistant_parts(self, content: list[object], rowid: int) -> bool:
+    def _assistant_parts(self, content: list[object], rowid: int, model: str | None = None) -> bool:
         hit_orphan = False
+        usage = (
+            Usage(
+                Evidence(
+                    "native",
+                    field="content[].providerOptions.cursor.modelName",
+                    record=f"rowid:{rowid}",
+                ),
+                model=model,
+            )
+            if model
+            else None
+        )
         for part in content:
             if not isinstance(part, dict):
                 continue
             part_type = part.get("type")
             if part_type in {"thinking", "reasoning"}:
                 text = str(part.get("text") or part.get("thinking") or "").strip()
-                self._add("thinking", rowid, text=text)
+                self._add("thinking", rowid, text=text, usage=usage)
             elif part_type == "text":
-                self._add("assistant_message", rowid, text=str(part.get("text") or "").strip())
+                self._add("assistant_message", rowid, text=str(part.get("text") or "").strip(), usage=usage)
             elif part_type == "tool-call":
                 call_id = str(part.get("toolCallId") or "")
                 name = str(part.get("toolName") or "tool")

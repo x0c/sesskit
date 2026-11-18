@@ -35,6 +35,7 @@ from sesskit.models import format_message_time, session_key
 from sesskit.paths import assert_not_history_path, atomic_write_json
 from sesskit.performance_cli import cmd_performance
 from sesskit.registry import ConversationLoadError, ParserRegistry, default_registry
+from sesskit.stats_cli import cmd_stats, stats_args
 from sesskit.streaming_cli import StreamCommand, cmd_stream, print_stream_error
 from sesskit.transcript import SCHEMA_ID, count_events, load_events
 
@@ -120,6 +121,7 @@ def session_payload(session: dict, fields: list[str] | None = None) -> dict:
         "time": session.get("display_time") or "",
         "mtime": session.get("mtime"),
         "size_kb": round(session.get("size_kb") or 0, 1),
+        "loop_count": session.get("loop_count"),
         "status": STATUS_LABELS.get(status_tag, "unknown"),
         "status_tag": status_tag,
         "history_path": session.get("path") or "",
@@ -626,20 +628,327 @@ def cmd_verify(args, registry: ParserRegistry):
     return ok(report), code
 
 
+def _usage_selection_models_supported(usage_mod) -> bool:
+    """Whether this build's ``UsageSelection`` carries a native model filter."""
+    try:
+        fields = getattr(usage_mod.UsageSelection, "__dataclass_fields__", {}) or {}
+    except (AttributeError, TypeError):
+        return False
+    return "models" in fields
+
+
+def _filter_records_by_ids(records, *, turn_id=None, message_id=None):
+    if turn_id:
+        return [r for r in records if r.turn_id == turn_id]
+    if message_id:
+        return [r for r in records
+                if r.message_id == message_id or r.response_id == message_id]
+    return list(records)
+
+
+def _record_matches_model(record, allowed: set) -> bool:
+    """Model-or-requested exact match, mirroring ``UsageSelection.models``."""
+    return (
+        getattr(record, "model", None) in allowed
+        or getattr(record, "requested_model", None) in allowed
+    )
+
+
+def _filter_records_by_model(records, wanted):
+    """Exact-match native-model filter over model OR requested_model."""
+    if not wanted:
+        return list(records)
+    allowed = set(wanted)
+    return [r for r in records if _record_matches_model(r, allowed)]
+
+
+def _effective_requested_model(observation):
+    """Merged requested_model: observation wins, usage fills gaps.
+
+    Mirrors ``usage._observation_labels`` (empty string counts as absent).
+    Reuses the sibling helper when importable so the CLI filter and the
+    summary selector never drift; otherwise falls back to the same inline
+    OR logic.
+    """
+    try:
+        from sesskit.usage import _observation_labels as _labels
+    except Exception:  # noqa: BLE001 — sibling helper is optional
+        _labels = None
+    if _labels is not None:
+        try:
+            return _labels(observation).get("requested_model")
+        except Exception:  # noqa: BLE001 — fall back to inline OR below
+            _labels = None
+    obs = getattr(observation, "requested_model", None)
+    if isinstance(obs, str) and obs:
+        return obs
+    if obs is not None and not isinstance(obs, str):
+        return obs
+    usage = getattr(observation, "usage", None)
+    fallback = getattr(usage, "requested_model", None)
+    if isinstance(fallback, str) and not fallback:
+        return None
+    return fallback
+
+
+def _filter_observations_by_model(observations, wanted):
+    """Exact-match native-model filter over model OR merged requested_model.
+
+    The requested side uses the merged observation-or-usage label (same
+    caliber as the summary ``UsageSelection.models`` path), never a bare
+    single-level field.
+    """
+    if not wanted:
+        return list(observations)
+    allowed = set(wanted)
+    kept = []
+    for observation in observations:
+        usage = getattr(observation, "usage", None)
+        if getattr(usage, "model", None) in allowed:
+            kept.append(observation)
+            continue
+        if _effective_requested_model(observation) in allowed:
+            kept.append(observation)
+    return kept
+
+
+def _hook_item_matches_model(item, allowed: set) -> bool:
+    """Model filter for ``iter_message_models`` rows.
+
+    Rows that already carry ``requested_model`` match on model OR requested
+    directly; older sibling builds whose rows lack the key degrade to
+    model-only. Accepts dict rows (normalized) and attribute rows
+    (un-normalized dataclass) via getattr fallback, never raising.
+    """
+    try:
+        model = item.get("model") if isinstance(item, dict) else getattr(item, "model", None)
+    except Exception:  # noqa: BLE001 — a malformed row never fails filtering
+        model = None
+    if model in allowed:
+        return True
+    try:
+        if isinstance(item, dict):
+            requested = item.get("requested_model", None)
+            if requested is None:
+                # Sibling build without the key: getattr fallback, still no crash.
+                requested = getattr(item, "requested_model", None)
+        else:
+            requested = getattr(item, "requested_model", None)
+    except Exception:  # noqa: BLE001 — a malformed row never fails filtering
+        requested = None
+    return requested is not None and requested in allowed
+
+
+def _bare_suffix(native_id: str) -> str:
+    """Bare suffix of a namespaced native id; identity otherwise.
+
+    Handles ``...:message:<bare>`` (opencode, pi position fallback),
+    ``...:entry:<bare>`` (pi) and the bare ``entry:<bare>`` record form.
+    """
+    if ":message:" in native_id:
+        return native_id.rsplit(":message:", 1)[-1]
+    if ":entry:" in native_id:
+        return native_id.rsplit(":entry:", 1)[-1]
+    if native_id.startswith("entry:"):
+        return native_id[len("entry:"):]
+    return native_id
+
+
+def _enrich_hook_seq(items: list[dict], activity) -> list[dict]:
+    """Fill ``seq=None`` hook rows by exact native identity, plus a guarded suffix backfill.
+
+    The sibling ``iter_message_models`` correlates on exact native
+    message/response identity only. Some runtimes namespace activity
+    ``message_id`` values (opencode ``...:message:<bare>``, pi
+    ``...:entry:<bare>``) while usage records keep the bare id, so exact
+    matching alone leaves ``seq`` empty even though the native identity is
+    the same. This backfills ``seq`` from the activity snapshot by exact
+    match first, then by bare-suffix match only when that bare suffix maps
+    to a single distinct activity id in the session; ambiguous bares keep
+    ``seq=None``. It never fabricates a seq: rows without a native id
+    match keep ``seq=None``.
+    """
+    events = getattr(activity, "events", None) or ()
+    if not events or not items or not any(i.get("seq") is None for i in items):
+        return items
+    exact: dict[str, int] = {}
+    bare_to_fulls: dict[str, set[str]] = {}
+    bare_first_seq: dict[str, int] = {}
+    for event in events:
+        seq = getattr(event, "seq", None)
+        if not isinstance(seq, int):
+            continue
+        message_id = getattr(event, "message_id", None)
+        if not isinstance(message_id, str) or not message_id:
+            continue
+        if message_id not in exact:
+            exact[message_id] = seq
+        bare = _bare_suffix(message_id)
+        if not bare or bare == message_id:
+            # Bare activity ids (e.g. claude) are covered by exact match;
+            # only namespaced ids participate in suffix backfill.
+            continue
+        fulls = bare_to_fulls.setdefault(bare, set())
+        fulls.add(message_id)
+        if bare not in bare_first_seq:
+            bare_first_seq[bare] = seq
+    if not exact:
+        return items
+    unique_bare = {
+        bare: seq for bare, seq in bare_first_seq.items()
+        if len(bare_to_fulls.get(bare, ())) == 1
+    }
+    enriched = []
+    for item in items:
+        if item.get("seq") is not None:
+            enriched.append(item)
+            continue
+        seq = None
+        for key in (item.get("message_id"), item.get("response_id")):
+            if not isinstance(key, str) or not key:
+                continue
+            if key in exact:
+                seq = exact[key]
+                break
+            bare = _bare_suffix(key)
+            if bare and bare in unique_bare:
+                seq = unique_bare[bare]
+                break
+        if seq is None:
+            enriched.append(item)
+            continue
+        filled = dict(item)
+        filled["seq"] = seq
+        enriched.append(filled)
+    return enriched
+
+
+def _message_entry(event) -> dict:
+    """One per-message model attribution entry from an activity event."""
+    usage = getattr(event, "usage", None)
+    model = getattr(usage, "model", None) if usage is not None else None
+    provider = getattr(usage, "provider", None) if usage is not None else None
+    usage_evidence = getattr(usage, "evidence", None) if usage is not None else None
+    evidence = usage_evidence if usage_evidence is not None else getattr(event, "evidence", None)
+    entry: dict = {
+        "seq": getattr(event, "seq", None),
+        "type": getattr(event, "type", None),
+        "message_id": getattr(event, "message_id", None),
+        "turn_id": getattr(event, "turn_id", None),
+        "model": model,
+        "provider": provider,
+        "evidence": (
+            {"origin": evidence.origin, "field": evidence.field, "record": evidence.record}
+            if evidence is not None else None
+        ),
+    }
+    return entry
+
+
+def _hook_message_items(iter_fn, snapshot, activity):
+    """Best-effort ``iter_message_models`` call; None on any shape mismatch."""
+    for args in ((snapshot, activity), (snapshot,)):
+        try:
+            result = iter_fn(*args)
+        except TypeError:
+            continue
+        except Exception:  # noqa: BLE001 — sibling helper is optional; always degrade
+            return None
+        try:
+            items = list(result)
+        except TypeError:
+            return None
+        normalized = []
+        for item in items:
+            if isinstance(item, dict):
+                normalized.append(item)
+                continue
+            if hasattr(item, "__dataclass_fields__"):
+                import dataclasses
+                try:
+                    normalized.append(dataclasses.asdict(item))
+                except (TypeError, ValueError):
+                    continue
+                continue
+            return None
+        return normalized
+    return None
+
+
+def _message_model_items(adapter, session, snapshot, usage_mod, *, turn_id=None, message_id=None, models=()):
+    """Per-message model attribution entries, newest-agnostic file order.
+
+    Primary source is the sibling ``iter_message_models`` usage helper when
+    this build provides one and it yields well-shaped dicts (the activity
+    snapshot rides along so message rows carry their event ``seq``);
+    otherwise the fallback groups the runtime's own activity events
+    (assistant/thinking) by their natively attributed ``Usage.model``.
+    Never raises for a missing helper: absence degrades to the activity
+    fallback, and an unreadable activity degrades to an empty list.
+    """
+    try:
+        runtime = getattr(adapter, "adapter", None) or adapter
+        activity = runtime.load_activity(session)
+    except Exception:  # noqa: BLE001 — introspection must not fail the usage page
+        activity = None
+    iter_fn = getattr(usage_mod, "iter_message_models", None)
+    if callable(iter_fn):
+        try:
+            hooked = _hook_message_items(iter_fn, snapshot, activity)
+        except Exception:  # noqa: BLE001 — sibling helper is optional; always degrade
+            hooked = None
+        if hooked:
+            if turn_id:
+                hooked = [i for i in hooked if i.get("turn_id") == turn_id]
+            elif message_id:
+                hooked = [i for i in hooked
+                         if i.get("message_id") == message_id or i.get("response_id") == message_id]
+            if models:
+                allowed = set(models)
+                hooked = [i for i in hooked if _hook_item_matches_model(i, allowed)]
+            return _enrich_hook_seq(hooked, activity)
+    events = getattr(activity, "events", None) or ()
+    items = [
+        _message_entry(event)
+        for event in events
+        if getattr(event, "type", None) in {"assistant_message", "thinking"}
+    ]
+    if turn_id:
+        items = [i for i in items if i.get("turn_id") == turn_id]
+    elif message_id:
+        items = [i for i in items if i.get("message_id") == message_id]
+    if models:
+        allowed = set(models)
+        items = [i for i in items if _hook_item_matches_model(i, allowed)]
+    return items
+
+
 def cmd_usage(args, registry: ParserRegistry) -> dict:
-    """Show preserved native usage: a bounded summary plus paged records/observations.
+    """Show preserved native usage: a bounded summary plus paged records/observations/messages.
 
     Read-only. Summaries never invent totals: unknown stays unknown, and a
     session rollup only ever sets ``complete_total``, never joins the
     additive sums. Detail pages carry an opaque generation-bound cursor.
+    ``--model`` is an exact-match native-model filter (model OR
+    requested_model), repeatable and orthogonal to
+    ``--turn-id``/``--message-id``; top-level ``models`` stays the
+    full-session model table and never narrows with selectors.
+    ``--detail messages`` lists one entry per assistant/thinking message
+    with its natively attributed model (null when the native record
+    carries none); messages items never carry ``native_subdivisions``,
+    so ``omitted_native_subdivisions`` stays 0 for messages.
     """
     from sesskit import usage as _usage
 
     detail = getattr(args, "detail", "summary") or "summary"
+    if detail not in {"summary", "records", "observations", "messages"}:
+        raise ApiError("usage_error", "--detail must be summary, records, observations or messages", EXIT_USAGE)
     raw_limit = getattr(args, "limit", None)
     cursor = getattr(args, "cursor", None)
     turn_id = getattr(args, "turn_id", None)
     message_id = getattr(args, "message_id", None)
+    raw_models = getattr(args, "model", None) or []
+    models = [m for m in raw_models if isinstance(m, str)]
     include_native = bool(getattr(args, "include_native", False))
     if detail == "summary" and (raw_limit is not None or cursor):
         raise ApiError("usage_error", "--limit/--cursor are only valid with --detail", EXIT_USAGE)
@@ -669,25 +978,58 @@ def cmd_usage(args, registry: ParserRegistry) -> dict:
         )
 
     payload = _usage.snapshot_to_dict(snapshot, include_native=include_native)
+    if "models" not in payload:
+        # Top-level ``models`` is the full-session model table and never
+        # narrows with selectors (--turn-id/--message-id/--model only scope
+        # ``summary``/``detail``); sibling ``snapshot_to_dict`` builds may
+        # already project it, otherwise derive it from the full summary's
+        # by_model slices.
+        try:
+            by_model = (payload.get("summary") or {}).get("by_model") or []
+            payload["models"] = [e.get("model") for e in by_model if e.get("model") is not None]
+        except (AttributeError, TypeError):
+            payload["models"] = []
     summary = snapshot.summary
     selectors: dict = {}
-    if turn_id or message_id:
-        selection = _usage.UsageSelection(
-            turn_ids=(turn_id,) if turn_id else (),
-            message_ids=(message_id,) if message_id else (),
-        )
-        summary = _usage.summarize_usage(snapshot, selection=selection)
+    if turn_id or message_id or models:
+        use_selection_models = bool(models) and _usage_selection_models_supported(_usage)
+        sel_kwargs: dict = {}
+        if turn_id:
+            sel_kwargs["turn_ids"] = (turn_id,)
+        elif message_id:
+            sel_kwargs["message_ids"] = (message_id,)
+        if use_selection_models:
+            sel_kwargs["models"] = tuple(models)
+        selection = _usage.UsageSelection(**sel_kwargs) if sel_kwargs else None
+        if selection is not None and (not models or use_selection_models):
+            summary = _usage.summarize_usage(snapshot, selection=selection)
+        else:
+            records = _filter_records_by_ids(snapshot.records, turn_id=turn_id, message_id=message_id)
+            records = _filter_records_by_model(records, models)
+            summary = _usage.summarize(
+                records,
+                session_ref=snapshot.session_ref,
+                runtime=snapshot.runtime,
+                history_view=snapshot.history_view,
+                observed_count=snapshot.observed_count,
+            )
         selectors = {k: v for k, v in {"turn_id": turn_id, "message_id": message_id}.items() if v}
-    assert summary is not None
-    payload["summary"] = _usage.summary_to_dict(summary)
-    if selectors:
+        if models:
+            selectors["models"] = list(models)
+        assert summary is not None
+        payload["summary"] = _usage.summary_to_dict(summary)
         payload["selectors"] = selectors
         full_summary = snapshot.summary
         assert full_summary is not None
         payload["matched_records"] = summary.record_count
         payload["unlinked_records"] = len(full_summary.ambiguous_ids)
-        if summary.record_count == 0:
+        if summary.record_count == 0 and detail != "messages":
+            # Messages mode judges match on attributed messages below;
+            # record counts stay zero for runtimes without token usage.
             payload.setdefault("diagnostics", []).append("selector_matched_zero")
+    else:
+        assert summary is not None
+        payload["summary"] = _usage.summary_to_dict(summary)
 
     if detail == "summary":
         return ok(payload)
@@ -703,12 +1045,45 @@ def cmd_usage(args, registry: ParserRegistry) -> dict:
     else:
         observations = list(snapshot.observations)
         records = list(snapshot.records)
-    items = (records if detail == "records" else observations)
+    observations = _filter_observations_by_model(observations, models)
+    records = _filter_records_by_model(records, models)
+    cursor_gen = snapshot.watermark
+    if detail == "messages":
+        runtime_adapter = registry.get(str(session.get("source") or ""))
+        items = _message_model_items(
+            runtime_adapter, session, snapshot, _usage,
+            turn_id=turn_id, message_id=message_id, models=models,
+        )
+        if cursor_gen is None:
+            # Usage-less runtimes (e.g. Cursor) carry no snapshot watermark;
+            # bind the page cursor to a fingerprint of the message list so
+            # a changed source still reads as stale instead of misaligned.
+            # The fingerprint joins seq/type/model with message/response ids
+            # so distinct messages sharing one seq/type/model never collide.
+            import hashlib
+            import json as _json
+
+            fingerprint = _json.dumps(
+                [(i.get("seq"), i.get("type"), i.get("model"),
+                  i.get("message_id"), i.get("response_id")) for i in items],
+                sort_keys=True, default=str,
+            )
+            cursor_gen = "messages:" + hashlib.sha256(fingerprint.encode()).hexdigest()[:32]
+        if selectors and not items:
+            payload.setdefault("diagnostics", []).append("selector_matched_zero")
+
+        def serialize(item, include_native=False):
+            # Messages detail intentionally carries no native_subdivisions
+            # even with --include-native: per-message attribution only.
+            return item
+    else:
+        items = (records if detail == "records" else observations)
+        serialize = _usage.record_to_dict if detail == "records" else _usage.observation_to_dict
     total = len(items)
     offset = 0
     if cursor:
         try:
-            offset = _usage.decode_usage_cursor(cursor, snapshot.watermark)
+            offset = _usage.decode_usage_cursor(cursor, cursor_gen)
         except ValueError as exc:
             if str(exc) == "stale":
                 raise ApiError(
@@ -722,25 +1097,32 @@ def cmd_usage(args, registry: ParserRegistry) -> dict:
         raise ApiError("usage_error", "cursor offset beyond available items", EXIT_USAGE)
     page = items[offset:offset + limit]
     has_more = offset + limit < total
-    serialize = _usage.record_to_dict if detail == "records" else _usage.observation_to_dict
+    if detail == "messages":
+        # Messages items carry no native_subdivisions by design, so the
+        # omitted count stays 0 in both modes -- the same caliber as
+        # records/observations (0 when included, else subdivided rows
+        # omitted), just with no subdivided message rows to omit.
+        omitted_native_subdivisions = 0
+    else:
+        omitted_native_subdivisions = (
+            0 if include_native else sum(1 for o in page
+                                         if getattr(o, "native_subdivisions", ()))
+        )
     payload["detail"] = {
         "kind": detail,
         "items": [serialize(item, include_native=include_native) for item in page],
         "returned": len(page),
         "total": total,
         "has_more": has_more,
-        "cursor": _usage.encode_usage_cursor(snapshot.watermark or "", offset + limit)
-        if has_more and snapshot.watermark else None,
+        "cursor": _usage.encode_usage_cursor(cursor_gen or "", offset + limit)
+        if has_more and cursor_gen else None,
         "read_coverage": {
             "entries_read": snapshot.entries_read,
             "observed": snapshot.observed_count,
             "records": len(snapshot.records),
         },
         "scope": {"history_view": snapshot.history_view, **selectors},
-        "omitted_native_subdivisions": (
-            0 if include_native else sum(1 for o in page
-                                         if getattr(o, "native_subdivisions", ()))
-        ),
+        "omitted_native_subdivisions": omitted_native_subdivisions,
     }
     return ok(payload)
 
@@ -823,22 +1205,23 @@ COMMANDS = [
     },
     {
         "name": "usage",
-        "help": "Show preserved native token/cost usage for one session (bounded summary plus paged records)",
+        "help": "Show preserved native token/cost usage for one session (bounded summary plus paged records/messages)",
         "handler": cmd_usage,
         "args": [
             {"flags": ["session"], "kwargs": {"help": "id, prefix, or runtime:id"}},
-            {"flags": ["--detail"], "kwargs": {"choices": ["summary", "records", "observations"], "default": "summary", "help": "summary (default) or one paged detail list"}},
+            {"flags": ["--detail"], "kwargs": {"choices": ["summary", "records", "observations", "messages"], "default": "summary", "help": "summary (default) or one paged detail list; messages shows one entry per assistant/thinking message with its natively attributed model (messages items never carry native_subdivisions; omitted_native_subdivisions stays 0 for messages)"}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": None, "help": "detail page size (detail mode only)"}},
             {"flags": ["--cursor"], "kwargs": {"help": "opaque page cursor from a previous detail page (detail mode only)"}},
             {"flags": ["--view"], "kwargs": {"choices": ["all-branches", "active-branch"], "default": "all-branches", "help": "accounting history view"}},
             {"flags": ["--turn-id"], "kwargs": {"help": "restrict to one native turn id (mutually exclusive with --message-id)"}},
             {"flags": ["--message-id"], "kwargs": {"help": "restrict to one native message/response id (mutually exclusive with --turn-id)"}},
-            {"flags": ["--include-native"], "kwargs": {"action": "store_true", "help": "include bounded native subdivisions and provider/cost-basis metadata"}},
+            {"flags": ["--model"], "kwargs": {"action": "append", "default": None, "help": "restrict to one native model (exact match over model OR requested_model); repeatable; orthogonal to --turn-id/--message-id; top-level models stays the full-session table and never narrows with selectors"}},
+            {"flags": ["--include-native"], "kwargs": {"action": "store_true", "help": "include bounded native subdivisions and provider/cost-basis metadata (messages detail still carries no native_subdivisions)"}},
             {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
             {"flags": ["--json"], "kwargs": {"action": "store_true", "help": "single-line JSON output (same as --compact)"}},
         ],
-        "returns": {"schema": "sesskit.usage/v1", "summary": "scoped totals with coverage", "detail": "optional paged records/observations"},
+        "returns": {"schema": "sesskit.usage/v1", "summary": "scoped totals with coverage", "detail": "optional paged records/observations/messages"},
     },
     {
         "name": "performance",
@@ -857,6 +1240,13 @@ COMMANDS = [
             {"flags": ["--json"], "kwargs": {"action": "store_true", "help": "single-line JSON output (same as --compact)"}},
         ],
         "returns": {"schema": "sesskit.performance/v1", "summary": "bounded timing/rate summary", "detail": "optional paged records"},
+    },
+    {
+        "name": "stats",
+        "help": "Show windowed active-time ledger per session or per project (read-only, 7-day default)",
+        "handler": cmd_stats,
+        "args": stats_args(),
+        "returns": {"schema": "sesskit.stats/v1", "by": "session|project", "totals": "bounded active-time sums"},
     },
     {
         "name": "share",

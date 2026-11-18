@@ -59,6 +59,7 @@ struct Row {
     data: String,
     /// v2 `seq` (ordering key of the reference); v1 rows use time order.
     seq: Option<i64>,
+    row_type: Option<String>,
 }
 
 /// `collect_opencode_observations` for one message row, reading only the
@@ -225,7 +226,14 @@ fn read_chunk(db: &Path, sessions: &[(String, Option<String>, bool)], since: i64
                 ids.iter().map(|s| rusqlite::types::Value::Text((*s).clone())).collect();
             params.push(rusqlite::types::Value::Integer(since));
             let mapped = stmt.query_map(rusqlite::params_from_iter(params), |r| {
-                Ok(Row { session: r.get(0)?, id: r.get(1)?, time_created: r.get(2)?, data: r.get(3)?, seq: r.get(4)? })
+                Ok(Row {
+                    session: r.get(0)?,
+                    id: r.get(1)?,
+                    time_created: r.get(2)?,
+                    data: r.get(3)?,
+                    seq: r.get(4)?,
+                    row_type: r.get(5)?,
+                })
             });
             if let Ok(it) = mapped {
                 rows.extend(it.flatten());
@@ -234,7 +242,7 @@ fn read_chunk(db: &Path, sessions: &[(String, Option<String>, bool)], since: i64
         let v1: Vec<&String> = sessions.iter().filter(|s| !s.2).map(|s| &s.0).collect();
         let v2: Vec<&String> = sessions.iter().filter(|s| s.2).map(|s| &s.0).collect();
         fetch(
-            "SELECT session_id, id, time_created, data, NULL FROM message WHERE session_id IN ({ids}) AND time_created >= ? \
+            "SELECT session_id, id, time_created, data, NULL, NULL FROM message WHERE session_id IN ({ids}) AND time_created >= ? \
              ORDER BY session_id, time_created ASC, id ASC",
             &v1,
             &mut rows,
@@ -242,7 +250,7 @@ fn read_chunk(db: &Path, sessions: &[(String, Option<String>, bool)], since: i64
         fetch(
             // Index order (session, time): sorting the large rows by `seq` in SQL
             // spills them into a temporary B-tree; order by `seq` below instead.
-            "SELECT session_id, id, time_created, data, seq FROM session_message WHERE session_id IN ({ids}) \
+            "SELECT session_id, id, time_created, data, seq, type FROM session_message WHERE session_id IN ({ids}) \
              AND time_created >= ? ORDER BY session_id, time_created ASC, id ASC",
             &v2,
             &mut rows,
@@ -259,19 +267,28 @@ fn read_chunk(db: &Path, sessions: &[(String, Option<String>, bool)], since: i64
     }
     sessions
         .iter()
-        .map(|(id, dir, _)| {
+        .map(|(id, dir, is_v2)| {
             let mut b = Builder::new(Runtime::Opencode, id.clone());
             b.cwd = dir.clone().filter(|d| !d.is_empty());
             b.excluded = cwd_exclusion(b.cwd.as_deref());
+            let mut loops = 0u64;
             if let Some(list) = by_session.get(id.as_str()) {
                 for row in list {
                     let ts = row.time_created.map(|ms| ms as f64 / 1000.0);
                     if let Some(t) = ts {
                         b.activity.push(t);
                     }
+                    if window.full && *is_v2 && row.row_type.as_deref() == Some("assistant")
+                        && crate::opencode_list::is_valid_assistant_raw(&row.data)
+                    {
+                        loops += 1;
+                    }
                     observe(row, ts, &mut b.observations);
                     b.examined += row.data.len() as u64;
                 }
+            }
+            if window.full && *is_v2 {
+                b.loop_count = Some(loops);
             }
             b.finish(window)
         })

@@ -31,7 +31,14 @@ ValueQuality = Literal["final", "provisional", "placeholder", "unknown"]
 
 @dataclass(frozen=True)
 class UsageObservation:
-    """One native usage reading, preserved with its correlation identity."""
+    """One native usage reading, preserved with its correlation identity.
+
+    Attribution extras (``requested_model``, ``api``, ``reasoning_level``,
+    ``service_tier``, ``model_variant``) are all optional: None means the
+    native record carries no such value. ``reasoning_level`` names a
+    configuration-side strength selector, strictly distinct from the
+    ``reasoning`` output-token count inside ``usage``.
+    """
 
     observation_id: str
     runtime: str
@@ -55,6 +62,14 @@ class UsageObservation:
     # (name, value) pairs. Never summed; surviving namespacing until a
     # verified unit/inclusion mapping exists.
     native_subdivisions: tuple[tuple[str, int], ...] = ()
+    # Attribution extras appended after the original fields so existing
+    # positional construction keeps working. Observation-level wins over
+    # the matching ``Usage``-level value; see ``_observation_labels``.
+    requested_model: str | None = None
+    api: str | None = None
+    reasoning_level: str | None = None
+    service_tier: str | None = None
+    model_variant: str | None = None
 
     def __post_init__(self) -> None:
         if not self.observation_id.strip():
@@ -114,6 +129,13 @@ def _int(value: object) -> int | None:
     return None
 
 
+def _native_str(value: object) -> str | None:
+    """Stripped native string; null/empty/non-string means absent (None)."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 # --- Claude ---
 
 def _claude_subdivisions(usage: dict) -> tuple[tuple[str, int], ...]:
@@ -166,6 +188,44 @@ def collect_claude_observations(rows: list[tuple[int, dict]], *,
     """
     observations: list[UsageObservation] = []
     seen: set[str] = set()
+
+    def emit_attribution_only(*, record: str, native_id: object,
+                              requested_model: str | None,
+                              reasoning_level: str | None,
+                              service_tier: str | None) -> None:
+        """Preserve an attribution-only row with no addable numbers.
+
+        Unknown scope/counter keeps it inspectable but out of every
+        additive sum; it reconciles into an independent record surfaced
+        via ``unscoped_excluded``, never into message sums.
+        """
+        observations.append(UsageObservation(
+            observation_id=_unique_observation_id(
+                seen, _observation_id("claude", record, len(observations),
+                                      session_id=session_id, field="attribution")),
+            runtime="claude",
+            record=record,
+            scope_kind="unknown",
+            counter_kind="unknown",
+            operation="model_call",
+            operation_detail="attribution",
+            usage=Usage(
+                _native_evidence(record, "usage"),
+                None,
+                requested_model=requested_model,
+                reasoning_level=reasoning_level,
+                service_tier=service_tier,
+            ),
+            evidence=_native_evidence(record, "usage"),
+            scope_id=str(native_id) if isinstance(native_id, str) and native_id else None,
+            response_id=str(native_id) if isinstance(native_id, str) and native_id else None,
+            message_id=str(native_id) if isinstance(native_id, str) and native_id else None,
+            requested_model=requested_model,
+            reasoning_level=reasoning_level,
+            service_tier=service_tier,
+            quality="unknown",
+        ))
+
     for lineno, entry in rows:
         if not isinstance(entry, dict):
             continue
@@ -178,10 +238,30 @@ def collect_claude_observations(rows: list[tuple[int, dict]], *,
             continue
         usage = message.get("usage")
         model = message.get("model")
-        if not isinstance(usage, dict) and not isinstance(model, str):
-            continue
         record = f"line:{lineno}"
         native_id = message.get("id")
+        # Attribution extras, all optional: entry-top requestedModel,
+        # perTurnEffort preferred over effort for the reasoning level, and
+        # service_tier carried inside message.usage. Null/empty stays None.
+        requested_model = _native_str(entry.get("requestedModel"))
+        reasoning_level = (
+            _native_str(entry.get("perTurnEffort"))
+            or _native_str(entry.get("effort"))
+        )
+        service_tier = (
+            _native_str(usage.get("service_tier"))
+            if isinstance(usage, dict) else None
+        )
+        if not isinstance(usage, dict) and not isinstance(model, str):
+            if (requested_model is None and reasoning_level is None
+                    and service_tier is None):
+                continue
+            emit_attribution_only(
+                record=record, native_id=native_id,
+                requested_model=requested_model,
+                reasoning_level=reasoning_level,
+                service_tier=service_tier)
+            continue
         fields = {
             "input_tokens": _int(usage.get("input_tokens")) if isinstance(usage, dict) else None,
             "output_tokens": _int(usage.get("output_tokens")) if isinstance(usage, dict) else None,
@@ -192,6 +272,14 @@ def collect_claude_observations(rows: list[tuple[int, dict]], *,
         subdivisions = _claude_subdivisions(usage) if isinstance(usage, dict) else ()
         if (all(value is None for value in fields.values()) and not subdivisions
                 and not isinstance(model, str)):
+            if (requested_model is None and reasoning_level is None
+                    and service_tier is None):
+                continue
+            emit_attribution_only(
+                record=record, native_id=native_id,
+                requested_model=requested_model,
+                reasoning_level=reasoning_level,
+                service_tier=service_tier)
             continue
         observations.append(UsageObservation(
             observation_id=_unique_observation_id(
@@ -205,12 +293,18 @@ def collect_claude_observations(rows: list[tuple[int, dict]], *,
             usage=Usage(
                 _native_evidence(record, "usage"),
                 model=model.strip() if isinstance(model, str) and model.strip() else None,
+                requested_model=requested_model,
+                reasoning_level=reasoning_level,
+                service_tier=service_tier,
                 **fields,  # type: ignore[arg-type]
             ),
             evidence=_native_evidence(record, "usage"),
             scope_id=str(native_id) if isinstance(native_id, str) and native_id else None,
             response_id=str(native_id) if isinstance(native_id, str) and native_id else None,
             message_id=str(native_id) if isinstance(native_id, str) and native_id else None,
+            requested_model=requested_model,
+            reasoning_level=reasoning_level,
+            service_tier=service_tier,
             quality="unknown",
             native_subdivisions=subdivisions,
         ))
@@ -294,6 +388,27 @@ def _codex_turn_id(payload: dict) -> str | None:
     return None
 
 
+def _codex_context_attribution(payload: dict) -> tuple[str | None, str | None]:
+    """Model/reasoning-level configured for one turn, from native context rows.
+
+    Reads ``payload.model`` / ``payload.effort`` / ``payload.reasoning_effort``
+    with ``collaboration_mode.settings.model`` /
+    ``collaboration_mode.settings.reasoning_effort`` as fallback. Only
+    stripped non-empty strings; absent stays None, never estimated.
+    """
+    model = _native_str(payload.get("model"))
+    reasoning = _native_str(payload.get("effort")) or _native_str(payload.get("reasoning_effort"))
+    collaboration = payload.get("collaboration_mode")
+    if isinstance(collaboration, dict):
+        settings = collaboration.get("settings")
+        if isinstance(settings, dict):
+            if model is None:
+                model = _native_str(settings.get("model"))
+            if reasoning is None:
+                reasoning = _native_str(settings.get("reasoning_effort"))
+    return model, reasoning
+
+
 def collect_codex_observations(rows: list[tuple[int, dict]], *,
                                session_id: str | None = None) -> list[UsageObservation]:
     """Preserve every usage-shaped Codex record without collapsing revisions.
@@ -303,7 +418,8 @@ def collect_codex_observations(rows: list[tuple[int, dict]], *,
     session-cumulative snapshots are each kept as separate observations in
     file order. Turn and thread snapshots carry no response linkage of
     their own: the turn snapshot stays turn-scoped, the thread snapshot is
-    session-scoped (the candidate session ``complete_total``), and a later
+    session-scoped (the candidate session ``complete_total``), strictly
+    isolated from turn-context backfill, and a later
     reconciliation stage selects the latest valid snapshot per counter
     epoch; this collector must not keep only the first (``setdefault``)
     or sum the revisions.
@@ -313,6 +429,36 @@ def collect_codex_observations(rows: list[tuple[int, dict]], *,
     observations: list[UsageObservation] = []
     seen: set[str] = set()
 
+    # First pass: turn-scoped model/reasoning configuration from native
+    # context rows. token_usage_record payloads carry no model of their own
+    # in observed histories, so turn/request usage blocks take the configured
+    # model into requested_model from the map of their own turn below; a
+    # native payload model always wins for Usage.model and suppresses the
+    # backfill. Session thread snapshots stay strictly isolated (no backfill
+    # of any kind) so multi-model threads never split one thread counter
+    # into per-model partitions.
+    turn_models: dict[str, str] = {}
+    turn_reasoning: dict[str, str] = {}
+    turn_model_source: dict[str, str] = {}
+    for lineno, entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type") or "") not in {
+                "turn_context", "session_meta", "thread_settings_applied"}:
+            continue
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        turn_id = _codex_turn_id(payload)
+        if turn_id is None:
+            continue
+        model, reasoning = _codex_context_attribution(payload)
+        if model is not None:
+            turn_models[turn_id] = model
+            turn_model_source[turn_id] = f"line:{lineno}"
+        if reasoning is not None:
+            turn_reasoning[turn_id] = reasoning
+
     def add(
         *, record: str, block: dict, payload: dict,
         scope_kind: ScopeKind, counter_kind: CounterKind,
@@ -320,7 +466,20 @@ def collect_codex_observations(rows: list[tuple[int, dict]], *,
         thread_id: str | None = None,
         counter_name: str | None = None,
         field: str | None = None,
+        requested_model_override: str | None = None,
+        reasoning_override: str | None = None,
+        turn_context_record: str | None = None,
     ) -> None:
+        """Collect one usage block with native-only model semantics.
+
+        ``requested_model_override``/``turn_context_record`` are the
+        provenance flag for turn-context backfill: they apply only when the
+        payload carries no native model, landing in ``requested_model`` on
+        both layers while ``Usage.model`` stays None. A natively present
+        payload model suppresses the backfill entirely. ``Usage.evidence``
+        cites the turn-context record when the model attribution comes
+        from there, keeping the numbers evidence on the payload record.
+        """
         fields = {
             "input_tokens": _int(block.get("input_tokens")),
             "output_tokens": _int(block.get("output_tokens")),
@@ -329,11 +488,24 @@ def collect_codex_observations(rows: list[tuple[int, dict]], *,
             "reasoning_tokens": _int(block.get("reasoning_output_tokens")),
             "total_tokens": _int(block.get("total_tokens")),
         }
-        model = payload.get("model")
-        if all(value is None for value in fields.values()) and not isinstance(model, str):
+        native_model = _native_str(payload.get("model"))
+        backfilled = native_model is None and requested_model_override is not None
+        requested_model = requested_model_override if backfilled else None
+        reasoning_level = (
+            _native_str(payload.get("effort"))
+            or _native_str(payload.get("reasoning_effort"))
+            or reasoning_override
+        )
+        # Native-only: an attribution-only backfill never rescues an
+        # otherwise empty block into a record.
+        if all(value is None for value in fields.values()) and native_model is None:
             return
         if counter_name is None:
             counter_name = "turn_token_usage" if counter_kind == "cumulative" else "usage"
+        usage_evidence = (
+            Evidence("native", field="turn_context", record=turn_context_record)
+            if backfilled else _native_evidence(record, "payload")
+        )
         observations.append(UsageObservation(
             observation_id=_unique_observation_id(
                 seen, _observation_id("codex", record, len(observations),
@@ -345,8 +517,10 @@ def collect_codex_observations(rows: list[tuple[int, dict]], *,
             counter_kind=counter_kind,
             operation="model_call",
             usage=Usage(
-                _native_evidence(record, "payload"),
-                model=model.strip() if isinstance(model, str) and model.strip() else None,
+                usage_evidence,
+                native_model,
+                requested_model=requested_model,
+                reasoning_level=reasoning_level,
                 **fields,  # type: ignore[arg-type]
             ),
             evidence=_native_evidence(record, "payload"),
@@ -354,6 +528,8 @@ def collect_codex_observations(rows: list[tuple[int, dict]], *,
             response_id=response_id,
             turn_id=turn_id,
             counter_name=counter_name,
+            requested_model=requested_model,
+            reasoning_level=reasoning_level,
             quality="unknown",
         ))
 
@@ -371,21 +547,34 @@ def collect_codex_observations(rows: list[tuple[int, dict]], *,
             thread_id = thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
             response_id = payload.get("response_id")
             response_id = response_id.strip() if isinstance(response_id, str) and response_id.strip() else None
+            model_override = turn_models.get(turn_id) if turn_id else None
+            reasoning_override = turn_reasoning.get(turn_id) if turn_id else None
+            turn_context_record = turn_model_source.get(turn_id) if turn_id else None
             turn_block = payload.get("turn_token_usage")
             if isinstance(turn_block, dict):
                 add(record=record, block=turn_block, payload=payload,
                     scope_kind="turn", counter_kind="cumulative",
-                    response_id=response_id, turn_id=turn_id)
+                    response_id=response_id, turn_id=turn_id,
+                    requested_model_override=model_override,
+                    reasoning_override=reasoning_override,
+                    turn_context_record=turn_context_record)
             request_block = payload.get("usage")
             if isinstance(request_block, dict):
                 add(record=record, block=request_block, payload=payload,
                     scope_kind="call", counter_kind="absolute",
-                    response_id=response_id, turn_id=turn_id)
+                    response_id=response_id, turn_id=turn_id,
+                    requested_model_override=model_override,
+                    reasoning_override=reasoning_override,
+                    turn_context_record=turn_context_record)
             thread_block = payload.get("thread_token_usage")
             if isinstance(thread_block, dict):
                 # Session-cumulative counter for the whole thread: the
                 # candidate session ``complete_total``. Kept separate from
-                # turn snapshots; reconciliation folds revisions to latest.
+                # turn snapshots and strictly isolated from turn-context
+                # backfill: the session rollup model stays None unless the
+                # payload natively carries one, so one thread counter never
+                # splits into per-model partitions that later sum together.
+                # Reconciliation folds revisions to latest.
                 add(record=record, block=thread_block, payload=payload,
                     scope_kind="session", counter_kind="cumulative",
                     response_id=None, turn_id=None, thread_id=thread_id,
@@ -396,8 +585,10 @@ def collect_codex_observations(rows: list[tuple[int, dict]], *,
             for key in ("last_token_usage", "last_usage", "total_token_usage", "total_usage"):
                 block = info.get(key)
                 if isinstance(block, dict):
+                    # Legacy totals carry no turn linkage of their own: keep
+                    # scope unknown rather than fabricating a turn.
                     add(record=record, block=block, payload={**payload, **info},
-                        scope_kind="turn" if key.startswith("total") else "call",
+                        scope_kind="unknown" if key.startswith("total") else "call",
                         counter_kind="cumulative" if key.startswith("total") else "absolute",
                         response_id=None, turn_id=_codex_turn_id(payload) or _codex_turn_id(info),
                         field=key)
@@ -447,6 +638,24 @@ def collect_opencode_observations(
             model = nested["id"].strip()
         return model.strip() if isinstance(model, str) and model.strip() else None
 
+    def provider_of(data: dict) -> str | None:
+        """Native provider: v1 top-level ``providerID``, v2 ``model.providerID``."""
+        provider = _native_str(data.get("providerID"))
+        if provider is not None:
+            return provider
+        nested = data.get("model")
+        if isinstance(nested, dict):
+            return _native_str(nested.get("providerID"))
+        return None
+
+    def variant_of(data: dict) -> str | None:
+        """Native model variant: v2 ``model.variant`` only. No reasoning-level
+        inference from variant/mode/agent: reasoning_level stays None."""
+        nested = data.get("model")
+        if isinstance(nested, dict):
+            return _native_str(nested.get("variant"))
+        return None
+
     def cost_of(data: dict) -> tuple[float | None, CostBasis]:
         cost = data.get("cost")
         if isinstance(cost, bool):
@@ -462,6 +671,8 @@ def collect_opencode_observations(
         fields = tokens_of(message)
         cost, basis = cost_of(message)
         model = model_of(message)
+        provider = provider_of(message)
+        model_variant = variant_of(message)
         if all(value is None for value in fields.values()) and cost is None and model is None:
             continue
         record = f"message:{mid}" if isinstance(mid, str) and mid else "message:unknown"
@@ -474,10 +685,14 @@ def collect_opencode_observations(
             scope_kind="message",
             counter_kind="absolute",
             operation="model_call",
-            usage=Usage(_native_evidence(record, "tokens"), model, cost=cost, **fields),  # type: ignore[arg-type]
+            usage=Usage(_native_evidence(record, "tokens"), model, cost=cost,
+                        provider=provider, model_variant=model_variant,
+                        **fields),  # type: ignore[arg-type]
             evidence=_native_evidence(record, "tokens"),
             scope_id=str(mid) if isinstance(mid, str) and mid else None,
             message_id=str(mid) if isinstance(mid, str) and mid else None,
+            provider=provider,
+            model_variant=model_variant,
             cost_basis=basis,
             quality="unknown",
         ))
@@ -488,6 +703,8 @@ def collect_opencode_observations(
         fields = tokens_of(step)
         cost, basis = cost_of(step)
         model = model_of(step)
+        provider = provider_of(step)
+        model_variant = variant_of(step)
         if all(value is None for value in fields.values()) and cost is None and model is None:
             continue
         record = f"step:{sid}" if isinstance(sid, str) and sid else "step:unknown"
@@ -504,9 +721,13 @@ def collect_opencode_observations(
             counter_kind="absolute",
             operation="model_call",
             operation_detail="step",
-            usage=Usage(_native_evidence(record, "tokens"), model, cost=cost, **fields),  # type: ignore[arg-type]
+            usage=Usage(_native_evidence(record, "tokens"), model, cost=cost,
+                        provider=provider, model_variant=model_variant,
+                        **fields),  # type: ignore[arg-type]
             evidence=_native_evidence(record, "tokens"),
             scope_id=str(sid) if isinstance(sid, str) and sid else None,
+            provider=provider,
+            model_variant=model_variant,
             cost_basis=basis,
             quality="unknown",
         ))
@@ -514,6 +735,8 @@ def collect_opencode_observations(
         fields = tokens_of(session_rollup)
         cost, basis = cost_of(session_rollup)
         model = model_of(session_rollup)
+        provider = provider_of(session_rollup)
+        model_variant = variant_of(session_rollup)
         if not (all(value is None for value in fields.values()) and cost is None and model is None):
             observations.append(UsageObservation(
                 observation_id=_unique_observation_id(
@@ -525,9 +748,13 @@ def collect_opencode_observations(
                 counter_kind="cumulative",
                 operation="model_call",
                 operation_detail="session_rollup",
-                usage=Usage(_native_evidence("session:rollup", "tokens"), model, cost=cost, **fields),  # type: ignore[arg-type]
+                usage=Usage(_native_evidence("session:rollup", "tokens"), model, cost=cost,
+                            provider=provider, model_variant=model_variant,
+                            **fields),  # type: ignore[arg-type]
                 evidence=_native_evidence("session:rollup", "tokens"),
                 scope_id="session",
+                provider=provider,
+                model_variant=model_variant,
                 cost_basis=basis,
                 quality="unknown",
             ))
@@ -566,6 +793,9 @@ def collect_pi_observations(entries: list[dict], *,
             "reasoning_tokens": _pi_int(usage.get("reasoning")) if isinstance(usage, dict) else None,
             "total_tokens": _pi_int(usage.get("totalTokens")) if isinstance(usage, dict) else None,
         }
+        provider = _native_str(data.get("provider"))
+        api = _native_str(data.get("api"))
+        reasoning_level = _native_str(data.get("thinkingLevel"))
         subdivisions: list[tuple[str, int]] = []
         if isinstance(usage, dict):
             for key, value in usage.items():
@@ -588,6 +818,9 @@ def collect_pi_observations(entries: list[dict], *,
             _native_evidence(record, "usage"),
             model.strip() if isinstance(model, str) and model.strip() else None,
             cost=cost,
+            provider=provider,
+            api=api,
+            reasoning_level=reasoning_level,
             **fields,  # type: ignore[arg-type]
         ), tuple(subdivisions)
 
@@ -602,7 +835,9 @@ def collect_pi_observations(entries: list[dict], *,
             parsed, subdivisions = usage_from(message, record)
             if parsed is None:
                 continue
-            provider = message.get("provider")
+            provider = _native_str(message.get("provider"))
+            api = _native_str(message.get("api"))
+            reasoning_level = _native_str(message.get("thinkingLevel"))
             response_id = message.get("responseId") or message.get("response_id")
             if role == "assistant":
                 operation: OperationKind = "model_call"
@@ -624,9 +859,52 @@ def collect_pi_observations(entries: list[dict], *,
                 scope_id=str(item.get("id")) if isinstance(item.get("id"), str) else None,
                 response_id=str(response_id) if isinstance(response_id, str) and response_id else None,
                 message_id=str(item.get("id")) if isinstance(item.get("id"), str) else None,
-                provider=str(provider) if isinstance(provider, str) and provider else None,
+                provider=provider,
+                api=api,
+                reasoning_level=reasoning_level,
                 quality="unknown",
                 native_subdivisions=subdivisions,
+            ))
+            continue
+        # Model/thinking-level changes carry no token counters: preserve them
+        # as unknown-scope, unknown-operation observations so later stages
+        # can interpret configuration changes. They hold no addable numbers
+        # and reconcile into independent records.
+        if entry_type in {"model_change", "thinking_level_change"}:
+            change_model = _native_str(item.get("modelId"))
+            change_provider = _native_str(item.get("provider"))
+            change_reasoning = _native_str(item.get("thinkingLevel"))
+            if change_model is None and change_provider is None and change_reasoning is None:
+                continue
+            # Native-only attribution: model_change carries the resolved
+            # modelId as request-time configuration (requested_model on both
+            # layers, Usage.model stays None); thinking_level_change keeps
+            # its reasoning_level. Unknown scope/counter keeps these rows
+            # out of every additive sum.
+            observations.append(UsageObservation(
+                observation_id=_unique_observation_id(
+                    seen, _observation_id("pi", record, len(observations),
+                                          session_id=session_id, field=entry_type)),
+                runtime="pi",
+                record=record,
+                scope_kind="unknown",
+                counter_kind="unknown",
+                operation="unknown",
+                operation_detail=entry_type,
+                usage=Usage(
+                    _native_evidence(record, entry_type),
+                    None,
+                    requested_model=change_model,
+                    provider=change_provider,
+                    reasoning_level=change_reasoning,
+                ),
+                evidence=_native_evidence(record, entry_type),
+                scope_id=str(item.get("id")) if isinstance(item.get("id"), str) else None,
+                message_id=str(item.get("id")) if isinstance(item.get("id"), str) else None,
+                requested_model=change_model,
+                provider=change_provider,
+                reasoning_level=change_reasoning,
+                quality="unknown",
             ))
             continue
         # Compaction / branch-summary / independent usage carriers.
@@ -659,6 +937,9 @@ def collect_pi_observations(entries: list[dict], *,
                 evidence=_native_evidence(record, "usage"),
                 scope_id=str(item.get("id")) if isinstance(item.get("id"), str) else None,
                 message_id=str(item.get("id")) if isinstance(item.get("id"), str) else None,
+                provider=parsed.provider,
+                api=parsed.api,
+                reasoning_level=parsed.reasoning_level,
                 quality="unknown",
                 native_subdivisions=subdivisions,
             ))
@@ -686,7 +967,59 @@ def collect_kimi_observations(rows: list[tuple[int, dict]], *,
     for lineno, entry in rows:
         if not isinstance(entry, dict):
             continue
-        if str(entry.get("type") or "") != "usage.record":
+        entry_type = str(entry.get("type") or "")
+        # Model-call configuration without token counters: llm.request carries
+        # the resolved model/alias, provider and thinking effort plus the
+        # turnStep clue; profile.bind carries the bound alias and effort.
+        # Unknown scope/counter keeps them inspectable but out of every
+        # additive sum; usage.record turn deltas stay the only addends.
+        if entry_type in {"llm.request", "profile.bind"}:
+            record = f"line:{lineno}"
+            if entry_type == "llm.request":
+                model = _native_str(entry.get("model")) or _native_str(entry.get("modelAlias"))
+                provider = _native_str(entry.get("provider"))
+                reasoning = _native_str(entry.get("thinkingEffort"))
+                request_id = _native_str(entry.get("turnStep"))
+                detail = "llm_request"
+            else:
+                model = _native_str(entry.get("modelAlias"))
+                provider = None
+                reasoning = _native_str(entry.get("thinkingEffort"))
+                request_id = None
+                detail = "profile_bind"
+            if model is None and provider is None and reasoning is None:
+                continue
+            # Native-only attribution: the resolved model/alias is
+            # request-time configuration, so it lands in requested_model on
+            # both layers while Usage.model stays None. Unknown scope/counter
+            # keeps these rows out of every additive sum.
+            observations.append(UsageObservation(
+                observation_id=_unique_observation_id(
+                    seen, _observation_id("kimi", record, len(observations),
+                                          session_id=session_id, field=detail)),
+                runtime="kimi",
+                record=record,
+                scope_kind="unknown",
+                counter_kind="unknown",
+                operation="model_call",
+                operation_detail=detail,
+                usage=Usage(
+                    _native_evidence(record, entry_type),
+                    None,
+                    requested_model=model,
+                    provider=provider,
+                    reasoning_level=reasoning,
+                ),
+                evidence=_native_evidence(record, entry_type),
+                scope_id=record,
+                request_id=request_id,
+                requested_model=model,
+                provider=provider,
+                reasoning_level=reasoning,
+                quality="unknown",
+            ))
+            continue
+        if entry_type != "usage.record":
             continue
         record = f"line:{lineno}"
         detail = entry.get("usage")
@@ -800,6 +1133,14 @@ class UsageRecord:
     counter_name: str | None = None
     native_subdivisions: tuple[tuple[str, int], ...] = ()
     diagnostics: tuple[str, ...] = ()
+    # Attribution extras, same contract as ``UsageObservation``: None means
+    # the native record carries no such value. Appended last so existing
+    # positional construction keeps working.
+    requested_model: str | None = None
+    api: str | None = None
+    reasoning_level: str | None = None
+    service_tier: str | None = None
+    model_variant: str | None = None
 
     def __post_init__(self) -> None:
         if not self.usage_id.strip():
@@ -934,7 +1275,18 @@ def _normalize_opencode(observation: UsageObservation) -> NormalizedUsage:
 def _normalize_codex(observation: UsageObservation) -> NormalizedUsage:
     # Cached input is a subset of reported input and reasoning may already be
     # included in the reported output: preserve every bucket, add none.
+    # Token payloads natively carry no model in observed histories, so a
+    # turn-linked requested_model resolved via the turn-context map is
+    # marked here for provenance. The marker fires only on a true backfill
+    # (turn-linked, no native model, requested attribution present): a
+    # natively present payload model is never mis-marked.
     usage = observation.usage
+    derivation = ["codex_no_additive_rollup", "total_native_reported_only"]
+    if (observation.turn_id is not None
+            and usage.model is None
+            and (observation.requested_model is not None
+                 or usage.requested_model is not None)):
+        derivation.append("model_from_turn_context")
     return NormalizedUsage(
         input_total=usage.input_tokens,
         input_uncached=None,
@@ -947,7 +1299,7 @@ def _normalize_codex(observation: UsageObservation) -> NormalizedUsage:
         cost=usage.cost,
         cost_basis=observation.cost_basis,
         gaps=(),
-        derivation=("codex_no_additive_rollup", "total_native_reported_only"),
+        derivation=tuple(derivation),
     )
 
 
@@ -1001,6 +1353,24 @@ def normalize_observation(observation: UsageObservation) -> NormalizedUsage:
     if normalizer is None:
         return NormalizedUsage(cost_basis=observation.cost_basis)
     return normalizer(observation)
+
+
+def _observation_labels(observation: UsageObservation) -> dict:
+    """Effective attribution for one observation (generic passthrough).
+
+    Observation-level values win; matching ``Usage``-level values fill
+    the gaps. Empty strings count as absent. No estimation: missing on
+    both levels stays None.
+    """
+    usage = observation.usage
+    return {
+        "requested_model": observation.requested_model or usage.requested_model,
+        "provider": observation.provider or usage.provider,
+        "api": observation.api or usage.api,
+        "reasoning_level": observation.reasoning_level or usage.reasoning_level,
+        "service_tier": observation.service_tier or usage.service_tier,
+        "model_variant": observation.model_variant or usage.model_variant,
+    }
 
 
 def _record_key(observation: UsageObservation) -> tuple:
@@ -1065,8 +1435,8 @@ def reconcile(observations: list[UsageObservation]) -> list[UsageRecord]:
             "message_id": first.message_id,
             "scope_id": first.scope_id,
             "model": first.usage.model,
-            "provider": first.provider,
             "counter_name": first.counter_name,
+            **_observation_labels(first),
         }
         if len(members) == 1:
             records.append(UsageRecord(
@@ -1108,7 +1478,8 @@ def reconcile(observations: list[UsageObservation]) -> list[UsageRecord]:
                 ),
                 **{**base,
                    "response_id": latest.response_id,
-                   "message_id": latest.message_id},
+                   "message_id": latest.message_id,
+                   **_observation_labels(latest)},
             ))
         else:
             for member, normal in zip(members, normals):
@@ -1130,7 +1501,7 @@ def reconcile(observations: list[UsageObservation]) -> list[UsageRecord]:
                        "message_id": member.message_id,
                        "scope_id": member.scope_id,
                        "model": member.usage.model,
-                       "provider": member.provider},
+                       **_observation_labels(member)},
                 ))
     return records
 
@@ -1852,13 +2223,16 @@ class UsageSelection:
     """Typed record selector: native identities only, never a predicate callback.
 
     ``turn_ids`` and ``message_ids`` are mutually exclusive. Message ids
-    match message- or response-linked records. SessKit never invents a
-    task, benchmark or attempt model on top of these identities.
+    match message- or response-linked records. ``models`` matches records
+    whose ``model`` or ``requested_model`` equals any entry exactly
+    (case-sensitive). SessKit never invents a task, benchmark or attempt
+    model on top of these identities.
     """
 
     turn_ids: tuple[str, ...] = ()
     message_ids: tuple[str, ...] = ()
     include_auxiliary: bool = True
+    models: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.turn_ids and self.message_ids:
@@ -2134,7 +2508,7 @@ def load_usage(session: dict, *, history_view: str = "all_branches") -> UsageSna
 
 def summarize_usage(snapshot: UsageSnapshot, *,
                     selection: UsageSelection | None = None) -> UsageSummary:
-    """Summarize a snapshot, optionally narrowed to native turn/message ids."""
+    """Summarize a snapshot, optionally narrowed to native turn/message/model ids."""
     if selection is None:
         assert snapshot.summary is not None
         return snapshot.summary
@@ -2142,13 +2516,71 @@ def summarize_usage(snapshot: UsageSnapshot, *,
     if selection.turn_ids:
         wanted = set(selection.turn_ids)
         records = [record for record in records if record.turn_id in wanted]
-    else:
+    elif selection.message_ids:
         wanted_messages = set(selection.message_ids)
         records = [record for record in records
                    if record.message_id in wanted_messages
                    or (record.response_id is not None and record.response_id in wanted_messages)]
+    if selection.models:
+        wanted_models = set(selection.models)
+        records = [record for record in records
+                   if record.model in wanted_models
+                   or record.requested_model in wanted_models]
     return summarize(records, session_ref=snapshot.session_ref, runtime=snapshot.runtime,
                      history_view=snapshot.history_view, observed_count=snapshot.observed_count)
+
+
+def iter_message_models(snapshot: UsageSnapshot,
+                        activity_snapshot: object | None = None) -> list[dict]:
+    """Per-record model attribution for CLI display, in record order.
+
+    One row per reconciled record: ``seq`` (activity event seq passed
+    through only when ``activity_snapshot`` is supplied, else None),
+    ``message_id``, ``response_id``, ``turn_id``, ``model``,
+    ``requested_model``, ``provider``, ``reasoning_level`` and
+    ``attribution`` (``message`` for message-scoped records, ``turn``
+    for call/turn-scoped ones, ``unknown`` otherwise). The
+    ``requested_model`` projection lets ``--model`` match rows whose only
+    native model identity is request-time (e.g. Codex turn-context
+    backfill, Kimi/Pi config rows).
+
+    Correlation uses native message/response identity only, never the event
+    ``seq``: usage records are independent of activity sequence numbers, so
+    no row is joined, ordered or filtered by ``seq``.
+    """
+    seq_by_message: dict[str, int] = {}
+    if activity_snapshot is not None:
+        for event in getattr(activity_snapshot, "events", ()):
+            message_id = getattr(event, "message_id", None)
+            if (isinstance(message_id, str) and message_id
+                    and message_id not in seq_by_message):
+                seq_by_message[message_id] = getattr(event, "seq", 0)
+    rows: list[dict] = []
+    for record in snapshot.records:
+        if record.scope_kind == "message":
+            attribution = "message"
+        elif record.scope_kind in ("call", "turn"):
+            attribution = "turn"
+        else:
+            attribution = "unknown"
+        seq: int | None = None
+        if activity_snapshot is not None:
+            for key in (record.message_id, record.response_id):
+                if isinstance(key, str) and key in seq_by_message:
+                    seq = seq_by_message[key]
+                    break
+        rows.append({
+            "seq": seq,
+            "message_id": record.message_id,
+            "response_id": record.response_id,
+            "turn_id": record.turn_id,
+            "model": record.model,
+            "requested_model": record.requested_model,
+            "provider": record.provider,
+            "reasoning_level": record.reasoning_level,
+            "attribution": attribution,
+        })
+    return rows
 
 
 def _usage_numbers(usage: Usage) -> dict:
@@ -2164,6 +2596,7 @@ def _usage_numbers(usage: Usage) -> dict:
 
 
 def observation_to_dict(observation: UsageObservation, *, include_native: bool = False) -> dict:
+    labels = _observation_labels(observation)
     payload: dict = {
         "observation_id": observation.observation_id,
         "runtime": observation.runtime,
@@ -2179,7 +2612,12 @@ def observation_to_dict(observation: UsageObservation, *, include_native: bool =
             "message_id": observation.message_id,
         },
         "model": observation.usage.model,
-        "provider": observation.provider,
+        "provider": labels["provider"],
+        "requested_model": labels["requested_model"],
+        "api": labels["api"],
+        "reasoning_level": labels["reasoning_level"],
+        "service_tier": labels["service_tier"],
+        "model_variant": labels["model_variant"],
         "usage": _usage_numbers(observation.usage),
         "cost_basis": observation.cost_basis,
         "quality": observation.quality,
@@ -2213,6 +2651,11 @@ def record_to_dict(record: UsageRecord, *, include_native: bool = False) -> dict
         },
         "model": record.model,
         "provider": record.provider,
+        "requested_model": record.requested_model,
+        "api": record.api,
+        "reasoning_level": record.reasoning_level,
+        "service_tier": record.service_tier,
+        "model_variant": record.model_variant,
         "standing": record.standing,
         "revision": record.revision,
         "normalized": {
@@ -2376,6 +2819,7 @@ __all__ = [
     "decode_usage_cursor",
     "describe_support",
     "encode_usage_cursor",
+    "iter_message_models",
     "load_usage",
     "metric_summary_to_dict",
     "normalize_observation",

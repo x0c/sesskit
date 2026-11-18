@@ -128,7 +128,8 @@ def _load_pi(session: dict) -> ActivitySnapshot:
         )
     entries = scan_pi.read_entries(path)
     branch = scan_pi.active_messages(entries)
-    events = _build_pi_events(branch, session_id, compactions=_pi_compactions(entries, branch))
+    events = _build_pi_events(branch, session_id, compactions=_pi_compactions(entries, branch),
+                               transitions=_pi_transitions(entries, branch))
     if not events:
         return ActivitySnapshot(
             state="empty",
@@ -181,7 +182,16 @@ def to_v1_dicts(snapshot: ActivitySnapshot) -> list[dict]:
             if event.raw_output is not None:
                 item["output"] = event.raw_output
         is_opencode = isinstance(event.message_id, str) and event.message_id.startswith("opencode:")
-        if event.message_id is not None and not is_opencode:
+        is_pi = isinstance(event.message_id, str) and event.message_id.startswith("pi:")
+        # Claude native message ids (msg_*) are typed-only: projecting them
+        # would change v1 bytes versus the pre-typed build, so only the Pi
+        # grouping ids (pi:...) project. opencode ids were already excluded.
+        # Parity 2026-11-04: transcript/opencode_v2/activity 51 passed;
+        # 20 live Pi + 10 live Claude sessions byte-equal
+        # (to_v1_dicts(load_activity(s)) == load_events(s); Claude typed
+        # carries msg_* e.g. 154 events in the largest session while v1
+        # projects 0, Pi v1 keeps its pi:... grouping ids).
+        if is_pi:
             item["message_id"] = event.message_id
         if event.type == "tool_result" and is_opencode and isinstance(item.get("output"), list):
             item["output"] = "\n\n".join(
@@ -196,6 +206,16 @@ def to_v1_dicts(snapshot: ActivitySnapshot) -> list[dict]:
     return projected
 
 
+# Identity and join contract (mirrors activity_opencode.py style):
+# activity ``message_id`` values are namespaced as
+# ``pi:{session_id}:entry:{native_id}`` (fallback
+# ``pi:{session_id}:message:{position}`` when the entry has no native id)
+# while event evidence ``record`` values stay native (``entry:{id}`` /
+# ``message:{position}``). The usage collector
+# (``usage.collect_pi_observations``) stores the bare native id in its
+# ``message_id``/``scope_id`` fields, so usage-side joins must strip the
+# ``pi:{session_id}:entry:`` prefix (or match on the evidence-record
+# suffix) instead of comparing full ids.
 def _message_id(session_id: str, entry_id: object, position: int) -> str:
     if isinstance(entry_id, str) and entry_id:
         return f"pi:{session_id}:entry:{entry_id}"
@@ -231,6 +251,55 @@ def _pi_compactions(entries: list[dict], branch: list[dict]) -> dict[str, dict]:
     return found
 
 
+def _pi_transitions(entries: list[dict], branch: list[dict]) -> dict[str, dict]:
+    """Model/thinking-level changes feeding into the active branch.
+
+    Like compactions, these link through ``parentId``: only entries whose
+    id is named as a parent by the active branch (or that head the chain)
+    are emitted, as typed-only ``lifecycle`` markers (v1 skips lifecycle,
+    so projection bytes stay identical).
+    """
+    on_path: set[str] = set()
+    for item in branch:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id:
+            on_path.add(item_id)
+        parent_id = item.get("parentId")
+        # Walk up through non-message ancestors is done at emit time;
+        # here just collect direct parents so head-of-chain transitions
+        # (whose child is the first branch message) are included.
+        if isinstance(parent_id, str) and parent_id:
+            on_path.add(parent_id)
+    # Include transitive non-message ancestors (model_change <->
+    # thinking_level_change chains at session start).
+    by_id = {str(e.get("id")): e for e in entries
+             if isinstance(e, dict) and isinstance(e.get("id"), str)}
+    expanded = set(on_path)
+    for pid in list(on_path):
+        node = by_id.get(pid)
+        while isinstance(node, dict) and node.get("type") in {"model_change", "thinking_level_change"}:
+            expanded.add(str(node.get("id")))
+            parent = node.get("parentId")
+            if not isinstance(parent, str) or not parent or parent in expanded:
+                if isinstance(parent, str) and parent:
+                    expanded.add(parent)
+                break
+            expanded.add(parent)
+            node = by_id.get(parent)
+    found: dict[str, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") not in {"model_change", "thinking_level_change"}:
+            continue
+        entry_id = entry.get("id")
+        if isinstance(entry_id, str) and entry_id and entry_id in expanded:
+            found.setdefault(entry_id, entry)
+    return found
+
+
 def _pi_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -242,7 +311,14 @@ def _pi_int(value: object) -> int | None:
 
 
 def _pi_usage(message: dict, record: str) -> Usage | None:
-    """Native per-message usage; None when the shape is absent or unparseable."""
+    """Native per-message usage; None when the shape is absent or unparseable.
+
+    ``model`` stays the reported/effective model. Attribution extras ride
+    alongside: ``provider``/``api`` from the message, ``reasoning_level``
+    from ``thinkingLevel`` (a configuration-side strength selector, never
+    the ``reasoning`` output-token count). Absent stays None; nothing is
+    estimated.
+    """
     usage = message.get("usage")
     model = message.get("model")
     if not isinstance(usage, dict) and not isinstance(model, str):
@@ -270,10 +346,16 @@ def _pi_usage(message: dict, record: str) -> Usage | None:
                 cost = float(total)
     if all(value is None for value in fields.values()) and cost is None and not isinstance(model, str):
         return None
+    provider = message.get("provider")
+    api = message.get("api")
+    thinking_level = message.get("thinkingLevel")
     return Usage(
         Evidence(_NATIVE, field="usage", record=record),
         model=model.strip() if isinstance(model, str) and model.strip() else None,
         cost=cost,
+        provider=provider.strip() if isinstance(provider, str) and provider.strip() else None,
+        api=api.strip() if isinstance(api, str) and api.strip() else None,
+        reasoning_level=thinking_level.strip() if isinstance(thinking_level, str) and thinking_level.strip() else None,
         **fields,  # type: ignore[arg-type]
     )
 
@@ -281,10 +363,19 @@ def _pi_usage(message: dict, record: str) -> Usage | None:
 def _build_pi_events(
     branch: list[dict], session_id: str, *, seq_start: int = 0, position_start: int = 0,
     compactions: dict[str, dict] | None = None,
+    transitions: dict[str, dict] | None = None,
 ) -> list[ActivityEvent]:
-    """Mirror ``transcript._parse_pi`` emission order, with typed evidence."""
+    """Mirror ``transcript._parse_pi`` emission order, with typed evidence.
+
+    Assistant ``Usage`` lives on ``ActivityEvent.usage``. Note for typed
+    consumers: ``as_typed`` exposes usage on ``Thinking`` but
+    ``AssistantMessage`` carries no usage field, so assistant usage must be
+    read back from ``ActivityEvent.usage`` (usage reconciliation collapses
+    text/thinking slices sharing one native record; nothing is merged here).
+    """
     events: list[ActivityEvent] = []
     pending_compactions = dict(compactions or {})
+    pending_transitions = dict(transitions or {})
 
     def add(event_type: str, ts: float | None, message_id: str,
             record: str, **fields: Any) -> None:
@@ -307,6 +398,52 @@ def _build_pi_events(
         if not isinstance(message, dict):
             continue
         parent_id = item.get("parentId")
+        # Emit head-of-chain / mid-session model transitions before the
+        # first message that follows them (oldest ancestor first). These
+        # are typed-only lifecycle markers; v1 skips lifecycle so
+        # projection bytes stay identical.
+        if isinstance(parent_id, str):
+            chain: list[str] = []
+            seen: set[str] = set()
+            cursor: str | None = parent_id
+            while isinstance(cursor, str) and cursor in pending_transitions and cursor not in seen:
+                seen.add(cursor)
+                chain.append(cursor)
+                parent = pending_transitions[cursor].get("parentId")
+                cursor = parent if isinstance(parent, str) and parent else None
+            for tid in reversed(chain):
+                entry = pending_transitions.pop(tid)
+                kind = str(entry.get("type") or "")
+                trecord = f"entry:{tid}"
+                tts = parse_timestamp(entry.get("timestamp"))
+                tmid = _message_id(session_id, tid, position)
+                if kind == "model_change":
+                    model_id = entry.get("modelId")
+                    provider = entry.get("provider")
+                    label = str(model_id).strip() if isinstance(model_id, str) and model_id.strip() else kind
+                    if isinstance(provider, str) and provider.strip():
+                        label = f"{kind}: {provider.strip()}/{label}" if label != kind else f"{kind}: {provider.strip()}"
+                    else:
+                        label = f"{kind}: {label}" if label != kind else kind
+                    events.append(ActivityEvent(
+                        seq=seq_start + len(events) + 1,
+                        type="lifecycle",
+                        evidence=Evidence(_NATIVE, record=trecord),
+                        ts=tts,
+                        message_id=tmid,
+                        text=label,
+                    ))
+                elif kind == "thinking_level_change":
+                    level = entry.get("thinkingLevel")
+                    label = f"{kind}: {level}".strip() if isinstance(level, str) and level.strip() else kind
+                    events.append(ActivityEvent(
+                        seq=seq_start + len(events) + 1,
+                        type="lifecycle",
+                        evidence=Evidence(_NATIVE, record=trecord),
+                        ts=tts,
+                        message_id=tmid,
+                        text=label,
+                    ))
         if isinstance(parent_id, str) and parent_id in pending_compactions:
             entry = pending_compactions.pop(parent_id)
             summary = entry.get("summary") if isinstance(entry.get("summary"), str) else ""
@@ -331,7 +468,7 @@ def _build_pi_events(
         usage = _pi_usage(message, record)
         if role == "user":
             add("user_message", ts, message_id, record,
-                text=scan_pi.message_text(message.get("content")),
+                text=scan_pi.user_message_text(message.get("content")),
                 origin="human")
             continue
         if role == "toolResult":
@@ -375,12 +512,15 @@ def _build_pi_events(
             )
         emitted = False
         surfaced_error = False
+        has_text_event = False
+        has_tool_call = False
         if isinstance(content, str):
             text = content.strip()
             if text:
                 add("assistant_message", ts, message_id, record, text=text, usage=usage,
                     stop_reason=message_stop, error=message_error)
                 emitted = True
+                has_text_event = True
                 surfaced_error = message_error is not None
         elif isinstance(content, list):
             for part in content:
@@ -391,14 +531,16 @@ def _build_pi_events(
                     thinking = str(part.get("thinking") or part.get("text") or "").strip()
                     if thinking:
                         add("thinking", ts, message_id, record, text=thinking,
-                            stop_reason=message_stop)
+                            stop_reason=message_stop, usage=usage)
                         emitted = True
+                        has_text_event = True
                 elif part_type == "text":
                     text = str(part.get("text") or "").strip()
                     if text:
                         add("assistant_message", ts, message_id, record, text=text, usage=usage,
                             stop_reason=message_stop, error=message_error)
                         emitted = True
+                        has_text_event = True
                         surfaced_error = message_error is not None
                 elif part_type == "toolCall":
                     raw = part.get("arguments") if part.get("arguments") is not None else part.get("input")
@@ -407,6 +549,7 @@ def _build_pi_events(
                         call_id=str(part.get("id") or ""),
                         raw_input=_coerce_input(raw))
                     emitted = True
+                    has_tool_call = True
         if message_error is not None and emitted and not surfaced_error:
             # Thinking-only (or tool-call-only) error turn: the thinking
             # event carries the stop reason but no error text, so the
@@ -415,6 +558,15 @@ def _build_pi_events(
             # bytes stay identical).
             add("lifecycle", ts, message_id, record, text=message_error_text,
                 stop_reason=message_stop, error=message_error)
+        if usage is not None and has_tool_call and not has_text_event and message_error is None:
+            # Tool-only assistant turn (toolCall parts, no text/thinking):
+            # usage would otherwise vanish from typed activity since it
+            # only hangs off text/thinking events. Emit one typed-only
+            # lifecycle carrier for the usage (v1 skips lifecycle, so
+            # projection bytes stay identical). Dedup across slices stays
+            # in usage reconciliation, never merged here.
+            add("lifecycle", ts, message_id, record, text="tool_calls_only",
+                stop_reason=message_stop, usage=usage)
         if not emitted:
             stop_reason = str(message.get("stopReason") or "").strip()
             error_text = str(message.get("errorMessage") or "").strip()
@@ -583,11 +735,29 @@ def _claude_int(value: object) -> int | None:
     return None
 
 
-def _claude_usage(message: dict, record: str) -> Usage | None:
-    """Native per-message model/usage; None when absent or unparseable."""
+def _claude_clean_label(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _claude_usage(message: dict, record: str, entry: dict | None = None) -> Usage | None:
+    """Native per-message model/usage; None when absent or unparseable.
+
+    ``model`` stays the reported/effective ``message.model``. Attribution
+    extras ride alongside from the entry/usage record: ``requested_model``
+    from ``entry.requestedModel``, ``reasoning_level`` from
+    ``perTurnEffort`` (else ``effort``), ``service_tier`` from
+    ``usage.service_tier``. Absent stays None; nothing is estimated.
+    """
     usage = message.get("usage")
     model = message.get("model")
-    if not isinstance(usage, dict) and not isinstance(model, str):
+    entry = entry if isinstance(entry, dict) else {}
+    requested_model = _claude_clean_label(entry.get("requestedModel"))
+    reasoning_level = _claude_clean_label(entry.get("perTurnEffort")) or _claude_clean_label(entry.get("effort"))
+    service_tier = _claude_clean_label(usage.get("service_tier")) if isinstance(usage, dict) else None
+    if (not isinstance(usage, dict) and not isinstance(model, str)
+            and requested_model is None and reasoning_level is None and service_tier is None):
         return None
     fields: dict[str, int | None] = {
         "input_tokens": None,
@@ -605,11 +775,15 @@ def _claude_usage(message: dict, record: str) -> Usage | None:
         details = usage.get("output_tokens_details")
         if isinstance(details, dict):
             fields["reasoning_tokens"] = _claude_int(details.get("thinking_tokens"))
-    if all(value is None for value in fields.values()) and not isinstance(model, str):
+    if (all(value is None for value in fields.values()) and not isinstance(model, str)
+            and requested_model is None and reasoning_level is None and service_tier is None):
         return None
     return Usage(
         Evidence(_NATIVE, field="usage", record=record),
         model=model.strip() if isinstance(model, str) and model.strip() else None,
+        requested_model=requested_model,
+        reasoning_level=reasoning_level,
+        service_tier=service_tier,
         **fields,  # type: ignore[arg-type]
     )
 
@@ -654,6 +828,10 @@ class _ClaudeFeed:
             not isinstance(text, str) or not text.strip()
         ):
             return None
+        # Claude has no native turn id: turn_id stays None (the ActivityEvent
+        # default). Callers pass message_id=message.id for assistant/thinking
+        # slices; usage dedup across those slices stays in usage
+        # reconciliation, never merged here.
         self.events.append(ActivityEvent(
             seq=self._seq_start + len(self.events) + 1,
             type=event_type,  # type: ignore[arg-type]
@@ -757,7 +935,9 @@ class _ClaudeFeed:
                 continue
             if entry_type != "assistant" or not isinstance(content, list):
                 continue
-            usage = _claude_usage(message, record)
+            usage = _claude_usage(message, record, entry)
+            native_msg_id = message.get("id")
+            native_msg_id = native_msg_id.strip() if isinstance(native_msg_id, str) and native_msg_id.strip() else None
             for part in content:
                 if not isinstance(part, dict):
                     continue
@@ -765,12 +945,13 @@ class _ClaudeFeed:
                 if part_type == "thinking":
                     self._add("thinking", ts, record,
                               text=str(part.get("thinking") or part.get("text") or "").strip(),
-                              usage=usage)
+                              usage=usage, message_id=native_msg_id)
                 elif part_type == "text":
                     text = str(part.get("text") or "").strip()
                     if text:
                         self.pending_error = None
-                    self._add("assistant_message", ts, record, text=text, usage=usage)
+                    self._add("assistant_message", ts, record, text=text, usage=usage,
+                              message_id=native_msg_id)
                 elif part_type == "tool_use":
                     call_id = str(part.get("id") or "")
                     name = str(part.get("name") or "tool")
@@ -1112,12 +1293,66 @@ def _codex_int(value: object) -> int | None:
     return None
 
 
-def _codex_usage_from_record(payload: dict, record: str) -> Usage | None:
-    """Native per-turn usage from a ``token_usage_record`` payload."""
-    block = payload.get("turn_token_usage")
-    if not isinstance(block, dict):
-        block = payload.get("usage")
-    if not isinstance(block, dict):
+def _codex_clean_label(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _codex_turn_model(payload: dict) -> str | None:
+    """Model label from a ``turn_context`` payload; None when absent."""
+    return _codex_clean_label(payload.get("model"))
+
+
+def _codex_turn_effort(payload: dict) -> str | None:
+    """Reasoning-level label from a ``turn_context`` payload; else None.
+
+    Prefers the top-level ``effort`` selector, falling back to
+    ``collaboration_mode.settings.reasoning_effort``. Both name a
+    configuration-side strength selector, never a token count.
+    """
+    effort = _codex_clean_label(payload.get("effort"))
+    if effort is not None:
+        return effort
+    collab = payload.get("collaboration_mode")
+    if isinstance(collab, dict):
+        settings = collab.get("settings")
+        if isinstance(settings, dict):
+            return _codex_clean_label(settings.get("reasoning_effort"))
+    return None
+
+
+def _codex_usage_from_record(
+    payload: dict, record: str,
+    turn_models: dict[str, str] | None = None,
+    turn_efforts: dict[str, str] | None = None,
+) -> Usage | None:
+    """Native per-turn usage from a ``token_usage_record`` payload.
+
+    Block priority is ``turn_token_usage`` (turn-cumulative, the per-turn
+    attach scope), then ``usage`` (request-level absolute), then
+    ``thread_token_usage`` (session-cumulative, last resort only): the
+    Evidence ``field`` names the block actually hit, never a hardcoded
+    name. All three blocks share the same counter-key layout.
+
+    ``model`` prefers the record's own ``payload.model`` and falls back to
+    the ``turn_context`` model for the same ``turn_id``; ``reasoning_level``
+    comes from the ``turn_context`` effort selector for that turn (same
+    rule as ``usage.collect_codex_observations``: native payload wins,
+    turn map fills the gap). When this file carries no mapping, the turn
+    id is still propagated and ``model`` stays None (honest): never guess.
+    Per the ``Usage`` contract ``model`` stays the reported/effective
+    model, never a request-time guess.
+    """
+    block_name: str | None = None
+    block: dict | None = None
+    for name in ("turn_token_usage", "usage", "thread_token_usage"):
+        candidate = payload.get(name)
+        if isinstance(candidate, dict):
+            block = candidate
+            block_name = name
+            break
+    if block is None or block_name is None:
         return None
     fields = {
         "input_tokens": _codex_int(block.get("input_tokens")),
@@ -1127,12 +1362,19 @@ def _codex_usage_from_record(payload: dict, record: str) -> Usage | None:
         "reasoning_tokens": _codex_int(block.get("reasoning_output_tokens")),
         "total_tokens": _codex_int(block.get("total_tokens")),
     }
-    model = payload.get("model")
-    if all(value is None for value in fields.values()) and not isinstance(model, str):
+    turn_id = _codex_turn_id(payload)
+    model = _codex_clean_label(payload.get("model"))
+    if model is None and turn_id is not None and turn_models:
+        model = turn_models.get(turn_id)
+    reasoning_level: str | None = None
+    if turn_id is not None and turn_efforts:
+        reasoning_level = turn_efforts.get(turn_id)
+    if all(value is None for value in fields.values()) and model is None:
         return None
     return Usage(
-        Evidence(_NATIVE, field="turn_token_usage", record=record),
-        model=model.strip() if isinstance(model, str) and model.strip() else None,
+        Evidence(_NATIVE, field=block_name, record=record),
+        model=model,
+        reasoning_level=reasoning_level,
         **fields,  # type: ignore[arg-type]
     )
 
@@ -1157,7 +1399,10 @@ def _codex_injected_user_text(entry: dict) -> str | None:
         if isinstance(part, dict) and part.get("type") == "input_text"
     ]
     text = "\n".join(part for part in parts if part).strip()
-    if text.startswith(("# AGENTS.md instructions", "<environment_context>")):
+    if (
+        text.startswith(("# AGENTS.md instructions", "<environment_context>"))
+        or scan_codex.is_skill_context_text(text)
+    ):
         return text or None
     return None
 
@@ -1186,6 +1431,15 @@ class _CodexFeed:
         # usage records carry turn_id; rows are chronological, so the last id
         # seen stamps every following event until the next native turn starts.
         self.current_turn: str | None = None
+        # turn_id -> model / reasoning-level labels from native
+        # turn_context rows (source: turn_context payload.model/effort
+        # plus collaboration_mode.settings fallbacks, same rule as
+        # usage.collect_codex_observations: native payload wins, turn map
+        # fills the gap). Per the Usage contract model stays the
+        # reported/effective model, never a request-time guess; absent
+        # stays None, never guessed.
+        self.turn_models: dict[str, str] = {}
+        self.turn_efforts: dict[str, str] = {}
 
     def _add(self, event_type: str, ts: float | None, record: str, **fields: Any) -> int | None:
         text = fields.get("text")
@@ -1210,24 +1464,50 @@ class _CodexFeed:
         # Match the legacy adjacent-event rule. Non-text events break adjacency.
         if self.events and self.events[-1].type == event_type and self.events[-1].text == text:
             return
+        # Codex has no per-message native id: per-message granularity stops
+        # at the turn. Keep message_id None explicitly; turn linkage carries
+        # the identity (explicit turn first, else the open native turn).
+        effective_turn = turn_id if turn_id is not None else self.current_turn
         if error is None:
-            index = self._add(event_type, ts, record, text=text, origin=origin)  # type: ignore[arg-type]
+            index = self._add(event_type, ts, record, text=text, origin=origin,  # type: ignore[arg-type]
+                              message_id=None, turn_id=effective_turn)
         else:
-            index = self._add(event_type, ts, record, text=text, error=error,
-                              origin=origin)  # type: ignore[arg-type]
+            index = self._add(event_type, ts, record, text=text, error=error,  # type: ignore[arg-type]
+                              origin=origin, message_id=None, turn_id=effective_turn)
         if index is not None and turn_id is not None and event_type == "assistant_message":
             self.turn_event_index[turn_id] = index
 
     def feed(self, rows: list[tuple[int, dict]]) -> list[ActivityEvent]:
         """Interpret one batch of ``(lineno, entry)`` rows, appending events."""
         before = len(self.events)
+        # First pass: turn_context labels (model/effort per turn, source:
+        # native turn_context rows) so usage records in this same batch
+        # resolve identically to a full-file feed regardless of row order
+        # within the batch.
+        for _lineno, entry in rows:
+            if str(entry.get("type")) != "turn_context":
+                continue
+            payload = entry.get("payload")
+            if not isinstance(payload, dict):
+                # Some writers put turn_context fields at entry level.
+                payload = entry
+            turn_id = _codex_turn_id(payload) or _codex_clean_label(entry.get("turn_id"))
+            if turn_id is None:
+                continue
+            model = _codex_turn_model(payload)
+            if model is not None:
+                self.turn_models.setdefault(turn_id, model)
+            effort = _codex_turn_effort(payload)
+            if effort is not None:
+                self.turn_efforts.setdefault(turn_id, effort)
         for lineno, entry in rows:
             payload = entry.get("payload")
             if not isinstance(payload, dict):
                 continue
             if str(entry.get("type")) == "token_usage_record":
                 turn_id = _codex_turn_id(payload)
-                usage = _codex_usage_from_record(payload, _codex_record(lineno))
+                usage = _codex_usage_from_record(payload, _codex_record(lineno),
+                                                 self.turn_models, self.turn_efforts)
                 if turn_id is not None and usage is not None:
                     self.usages.setdefault(turn_id, usage)
         for lineno, entry in rows:
@@ -1370,14 +1650,37 @@ class _CodexFeed:
         Idempotent: re-running over the full materialized maps only fills
         linkage whose row arrived after the linked event was emitted. The
         delivered poll stream is never rewritten; the materialized list
-        converges toward the snapshot over the same bytes.
+        converges toward the snapshot over the same bytes. Turn-context
+        labels (source: native turn_context rows, same rule as
+        usage.collect_codex_observations) arriving after their usage row
+        backfill the stored usage (model/reasoning_level only; token
+        counts never change here).
         """
-        for turn_id, usage in self.usages.items():
+        for turn_id, usage in list(self.usages.items()):
+            enriched = usage
+            if enriched.model is None and turn_id in self.turn_models:
+                enriched = replace(enriched, model=self.turn_models[turn_id])
+            if enriched.reasoning_level is None and turn_id in self.turn_efforts:
+                enriched = replace(enriched, reasoning_level=self.turn_efforts[turn_id])
+            if enriched is not usage:
+                self.usages[turn_id] = enriched
+                usage = enriched
             index = self.turn_event_index.get(turn_id)
             if index is None:
                 continue
             event = self.events[index]
             if event.usage is not None:
+                # Refresh a previously attached usage that missed its
+                # turn-context labels (source: turn_context rows; same
+                # record, labels arrived late).
+                current = event.usage
+                refreshed = current
+                if refreshed.model is None and usage.model is not None:
+                    refreshed = replace(refreshed, model=usage.model)
+                if refreshed.reasoning_level is None and usage.reasoning_level is not None:
+                    refreshed = replace(refreshed, reasoning_level=usage.reasoning_level)
+                if refreshed is not current:
+                    self.events[index] = replace(event, usage=refreshed)
                 continue
             self.events[index] = replace(event, usage=usage)
         _attach_codex_interactions(self.events, self.calls, self.results, self.verified)

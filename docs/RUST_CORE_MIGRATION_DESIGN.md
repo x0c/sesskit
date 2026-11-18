@@ -146,6 +146,25 @@ existing Rust core:
   --pure --sdist` builds the local native wheel, an explicit setuptools-built
   compatibility wheel and the source distribution. Build release artifacts
   from the accepted committed-source archive, not unrelated working edits.
+- **The universal2 wheel needs rustup's toolchain (2026-11-15).** A `cargo` /
+  `rustc` installed by a system package manager can shadow rustup and cannot see
+  the `x86_64-apple-darwin` standard library, so
+  `maturin build --target universal2-apple-darwin` fails with
+  `error[E0463]: can't find crate for 'core'`. Check
+  `rustup target list --installed`, then build with rustup's toolchain first on
+  `PATH`; when that is unavailable, publish the wheel the local build actually
+  produced and state the covered platforms instead of assuming universal2.
+- **Version sync and the local release asset set (2026-11-15).** Besides
+  `pyproject.toml`, `src/sesskit/__init__.py`, `README.md`, `README.zh-CN.md`,
+  `docs/INTEGRATION_GUIDE.md` and `tests/test_examples.py`, the version also
+  lives in `Cargo.toml`, the root `Cargo.lock` (`sesskit-python`) and `uv.lock`.
+  `scripts/build_release.py --out dist --pure --sdist` builds the wheels and the
+  sdist from the clean archive, `--index-only` rewrites `wheels.html` after a
+  wheel built to another `--out` is swapped in, and a GitHub release also carries
+  `SHA256SUMS` (the three artifacts) and `source-commit.txt`. When the checkout
+  carries another agent's uncommitted work, make the release commit in an
+  isolated clone of `HEAD` and push from there; the working checkout stays behind
+  and needs a later pull.
 - Linux cross-builds use the same command with `--target <triple> --zig` and
   a manylinux_2_17 floor; no local container runtime is needed.
 - `.github/workflows/native-wheels.yml` builds and runs installed-wheel tests
@@ -241,3 +260,29 @@ GitHub release installation route.
 Native statistics interpretation and existing parity evidence remain owned by
 [NATIVE_STATS_ENGINE_DESIGN.md](NATIVE_STATS_ENGINE_DESIGN.md); session compatibility
 and runtime acceptance remain owned by [CONTRACT.md](CONTRACT.md).
+
+## Third replacement (cross-runtime `loop_count`)
+
+Add `loop_count: int | None` (model-decision iteration count) across all six active
+runtimes (`claude`, `codex`, `opencode`, `pi`, `antigravity`, `cursor`) using the shared
+Rust core and PyO3 bindings, with exact `SESSKIT_NATIVE=0` Python fallback parity:
+
+- **`crates/sesskit-stats/src/loops.rs`**: streaming/Serde `IgnoredAny` counters for
+  `claude`, `codex`, `pi`, `antigravity`, and `cursor` (`store.db` WAL-visible `mode=ro`
+  connection, never `immutable=1`). Non-JSON-object/malformed/trailing-partial lines
+  are skipped identically to Python; rows containing non-standard Python JSON tokens
+  (`NaN`, `Infinity`, lone surrogates) fall back per file to the Python decoder.
+  `count_many` runs files/stores in parallel via `rayon`.
+- **`crates/sesskit-stats/src/opencode_list.rs`**: adds `loop_count` directly to
+  `SessionAggregate` inside the existing single-batch OpenCode v2 SQLite query.
+  OpenCode v1 computes the matching `loop_count` subquery in `_SCAN_SELECT` / `_SESSION_SQL`.
+- **`crates/sesskit-python/src/lib.rs`**: exposes `count_loops_many(items)` releasing
+  the GIL via `py.detach` and bumps `PROTOCOL_VERSION` to `2` so older native binaries
+  without `loop_count` fall back cleanly to Python.
+- **Listing & cache wiring**: `scan_sessions` in `claude`, `codex`, and `cursor`
+  filters to the surviving `<= limit` sessions first and calls `count_loops_many` in one
+  parallel batch for uncached entries before writing to `session_cache` (records missing
+  `loop_count` or carrying pre-`loop-v1` versions reparse automatically). `refresh_session`
+  populates the exact same `loop_count`. `pi` and `antigravity` reuse their already-parsed
+  in-memory rows on the Python listing path while sharing exact parity with Rust `loops.rs`
+  and `SessionStats.loop_count` (`--full`).

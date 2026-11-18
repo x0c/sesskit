@@ -49,7 +49,19 @@ def extract_text(content) -> str | None:
         command_args = re.search(r"<command-args>(.*?)</command-args>", t, re.DOTALL)
         if command_args:
             args = command_args.group(1).strip()
-            return args or None
+            if args:
+                return args
+            # A prompt-based skill has both native command fields. Preserve
+            # command-only invocation, but not unrelated local-command echoes.
+            name = re.search(r"<command-name>(/[^<>\s]+)</command-name>", t)
+            message = re.search(r"<command-message>([^<>]+)</command-message>", t)
+            if (
+                t.startswith(("<command-name>", "<command-message>"))
+                and name and message
+                and name.group(1).lstrip("/") == message.group(1).strip().lstrip("/")
+            ):
+                return name.group(1)
+            return None
         if t.startswith(_SKIP_PREFIXES):
             return None
         if re.match(r"^<\w+>.*</\w+>$", t, re.DOTALL):
@@ -64,7 +76,10 @@ def extract_text(content) -> str | None:
                 t = (part.get("text") or "").strip()
                 if t:
                     texts.append(t)
-        return " ".join(texts) if texts else None
+        joined = " ".join(texts)
+        if joined.startswith(("<command-name>", "<command-message>")):
+            return extract_text(joined)
+        return joined or None
     return None
 
 
@@ -453,10 +468,64 @@ def _continued_after(entries: list[dict], idx: int | None) -> bool:
     return False
 
 
+def count_loops_from_path(path: str) -> int | None:
+    """Count Claude assistant model-decision iterations from a JSONL file.
+
+    Merges fragmented streaming rows sharing the same non-empty ``message.id``
+    into 1 loop and excludes ``isMeta``, ``isSidechain``,
+    ``isApiErrorMessage``, ``<synthetic>``, and empty-content stubs.
+    """
+    seen_ids: set[str] = set()
+    count = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("isMeta") or entry.get("isSidechain"):
+                    continue
+                if entry.get("type") != "assistant":
+                    continue
+                if entry.get("isApiErrorMessage") is True:
+                    continue
+                message = entry.get("message")
+                if not isinstance(message, dict):
+                    continue
+                model = message.get("model")
+                if isinstance(model, str) and model.strip() == "<synthetic>":
+                    continue
+                content = message.get("content")
+                has_content = (isinstance(content, str) and bool(content.strip())) or (
+                    isinstance(content, list) and len(content) > 0
+                )
+                if not has_content:
+                    continue
+                mid = message.get("id")
+                if isinstance(mid, str) and mid.strip():
+                    key = mid.strip()
+                    if key not in seen_ids:
+                        seen_ids.add(key)
+                        count += 1
+                else:
+                    count += 1
+    except OSError:
+        return None
+    return count
+
+
 def _build_session_info(
     fpath: str,
     proj: str,
     host: HostExtension | None = None,
+    *,
+    compute_loop_count: bool = True,
 ) -> dict | None:
     session_id = os.path.basename(fpath).replace(".jsonl", "")
     head_entries = _read_head(fpath)
@@ -634,6 +703,11 @@ def _build_session_info(
         wider_user, wider_agent = _backfill_excerpts(fpath)
         last_user_msg = last_user_msg or wider_user
         last_agent_msg = last_agent_msg or wider_agent
+    extra: dict[str, object] = dict(terminal_error)
+    if compute_loop_count:
+        from sesskit.native_projection import count_loops
+
+        extra["loop_count"] = count_loops("claude", fpath)
     return make_session_info(
         source="claude",
         id=session_id,
@@ -656,7 +730,7 @@ def _build_session_info(
             anchor=id_anchor,
             tail_text=tail_text,
         ),
-        **terminal_error,
+        **extra,
     )
 
 
@@ -820,6 +894,9 @@ def _cached_session_info(
     host: HostExtension | None,
     cache,
     cache_tag: str,
+    *,
+    compute_loop_count: bool = True,
+    cache_put: bool = True,
 ) -> dict | None:
     """One history file's list record through the derived cache (no list filters)."""
     if cache_tag:
@@ -827,7 +904,8 @@ def _cached_session_info(
     else:
         info = cache.get_session("claude", fpath)
     if info is not None and (
-        (
+        "loop_count" not in info
+        or (
             info.get("fallback_title") == "(仅本地命令)"
             and _IMAGE_TITLE_PREFIX.match(str(info.get("first_user_msg") or ""))
         )
@@ -836,12 +914,12 @@ def _cached_session_info(
             and str(info.get("last_agent_msg") or "").startswith(_SESSION_LIMIT_PREFIX)
         )
     ):
-        # Reparse older cached image-first sessions and quota endings.
+        # Reparse older cached image-first sessions, quota endings, and pre-loop entries.
         info = None
     if info is not None:
         return info
     try:
-        info = _build_session_info(fpath, proj, host)
+        info = _build_session_info(fpath, proj, host, compute_loop_count=compute_loop_count)
     except OSError:
         return None
     if info is None:
@@ -859,10 +937,11 @@ def _cached_session_info(
         and os.path.isfile(os.path.join(os.path.dirname(fpath), target + ".jsonl"))
     ):
         info["superseded_by"] = target
-    if cache_tag:
-        cache.put_session("claude", fpath, info, cache_tag)
-    else:
-        cache.put_session("claude", fpath, info)
+    if cache_put:
+        if cache_tag:
+            cache.put_session("claude", fpath, info, cache_tag)
+        else:
+            cache.put_session("claude", fpath, info)
     return info
 
 
@@ -940,7 +1019,10 @@ def scan_sessions(
         if peek_cwd and not include_missing_cwd and not cached_isdir(peek_cwd):
             continue  # 廉价探测已确认 cwd 不存在，跳过整文件解析
 
-        info = _cached_session_info(fpath, proj, host, session_cache, cache_tag)
+        info = _cached_session_info(
+            fpath, proj, host, session_cache, cache_tag,
+            compute_loop_count=False, cache_put=False,
+        )
         if info is None:
             continue
         if not info["first_user_msg"] or info["fallback_title"] == "(仅本地命令)":
@@ -958,7 +1040,20 @@ def scan_sessions(
         results.append(info)
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
-    return results[:limit]
+    results = results[:limit]
+    missing_loops = [item for item in results if "loop_count" not in item]
+    if missing_loops:
+        from sesskit.native_projection import count_loops_many
+
+        counts = count_loops_many([("claude", str(item["path"])) for item in missing_loops])
+        for item, count in zip(missing_loops, counts, strict=True):
+            item["loop_count"] = count
+            cached_payload = {**item, "live": False, "pid": None}
+            if cache_tag:
+                session_cache.put_session("claude", str(item["path"]), cached_payload, cache_tag)
+            else:
+                session_cache.put_session("claude", str(item["path"]), cached_payload)
+    return results
 
 
 def refresh_session(

@@ -1,4 +1,29 @@
-"""Standalone typed activity adapter for OpenCode's SQLite histories."""
+"""Standalone typed activity adapter for OpenCode's SQLite histories.
+
+Identity and join contract: activity ``message_id`` values are namespaced
+as ``opencode:{session_id}:message:{native_id}`` while event evidence
+``record`` values stay native (``message:{id}`` for v1,
+``session_message:{id}`` for v2) so native-row joins never break. The
+usage collector (``usage.collect_opencode_observations``) stores the bare
+native id in its ``message_id``/``scope_id`` fields, so usage-side joins
+must strip the ``opencode:{session_id}:message:`` prefix (or match on the
+evidence-record suffix) instead of comparing full ids.
+
+v1 duplication warning: every text and reasoning part of one assistant
+message carries the same message-level ``Usage`` object (native counters
+live on the message, not the part), so sibling ``assistant_message`` and
+``thinking`` events under one ``message_id`` repeat identical usage by
+identity. Never sum ``event.usage`` across events; additive totals must
+go through ``usage.reconcile``. Event splitting is intentionally
+unchanged (one event per text/reasoning part).
+
+Steps diagnostic (``steps_not_wired``): this adapter carries no step-level
+usage. The mapping between step-start events and messages is unverified,
+so the usage collector's ``steps`` argument stays explicitly empty rather
+than silently ``None``; the ``operation_detail="step"`` branch in
+``usage.collect_opencode_observations`` is retained for when that mapping
+is verified.
+"""
 
 from __future__ import annotations
 
@@ -434,18 +459,44 @@ def _int(value: object) -> int | None:
 
 
 def _opencode_usage(data: dict, record: str) -> Usage | None:
-    """Native per-message model/token/cost; None when absent or unparseable.
+    """Native per-message model/token/cost/attribution; None when absent.
 
-    Accepts both the v2 assistant shape (``model`` object plus ``tokens``
-    with a nested ``cache`` object) and the legacy v1 shape (``modelID``
-    plus the same ``tokens`` layout).
+    Accepts both the v2 assistant shape (``model`` object with ``id``,
+    ``providerID`` and ``variant``) and the legacy v1 shape (top-level
+    ``modelID``/``providerID`` plus the same ``tokens`` layout).
+
+    ``provider`` comes from the v1 top-level ``providerID``, falling back
+    to the nested ``model.providerID`` when only that is present (v2 keeps
+    it exclusively nested; the two v1 sources never co-occur with
+    conflicting values). ``model_variant`` comes only from the v2
+    ``model.variant`` object field; the v1 top-level ``variant`` label is
+    deliberately unmapped until its semantics are verified against it.
+    ``reasoning_level`` is always None: the native record carries no such
+    field, and it must never be inferred from
+    ``variant``/``mode``/``agent``. ``model`` keeps the existing
+    precedence (``modelID``, overridden by ``model.id`` when present).
+
+    ``record`` stays the native evidence record (``message:{mid}`` /
+    ``session_message:{mid}``); the usage collector stores the bare native
+    id, so joins must strip the activity ``message_id`` prefix.
     """
     tokens = data.get("tokens")
     model = data.get("modelID")
-    if isinstance(data.get("model"), dict):
-        raw_id = data["model"].get("id")
+    provider = data.get("providerID")
+    variant: str | None = None
+    nested = data.get("model")
+    if isinstance(nested, dict):
+        raw_id = nested.get("id")
         if isinstance(raw_id, str) and raw_id.strip():
             model = raw_id.strip()
+        if not (isinstance(provider, str) and provider.strip()):
+            raw_provider = nested.get("providerID")
+            if isinstance(raw_provider, str) and raw_provider.strip():
+                provider = raw_provider.strip()
+        raw_variant = nested.get("variant")
+        if isinstance(raw_variant, str) and raw_variant.strip():
+            variant = raw_variant.strip()
+    provider = provider.strip() if isinstance(provider, str) and provider.strip() else None
     if not isinstance(tokens, dict) and not isinstance(model, str):
         return None
     cache = tokens.get("cache") if isinstance(tokens, dict) else None
@@ -469,6 +520,9 @@ def _opencode_usage(data: dict, record: str) -> Usage | None:
         Evidence(_NATIVE, field="data.tokens", record=record),
         model=model.strip() if isinstance(model, str) and model.strip() else None,
         cost=cost_value,
+        provider=provider,
+        reasoning_level=None,
+        model_variant=variant,
         **fields,  # type: ignore[arg-type]
     )
 
@@ -476,6 +530,7 @@ def _opencode_usage(data: dict, record: str) -> Usage | None:
 def _v1_part(
     row: sqlite3.Row, message: dict, session_id: str,
     events: list[ActivityEvent], assistant_text_seen: set[str],
+    message_usage: Usage | None = None,
 ) -> tuple[str | None, str | None]:
     part = _object(row["part_data"])
     if not part or part.get("synthetic") in (True, 1):
@@ -496,13 +551,13 @@ def _v1_part(
             error = _error(message, f"message:{mid}", "message.data.error")
             index = _add(events, "assistant_message", ts, msg_key, record,
                          "part.data", text=text, error=error,
-                         usage=_opencode_usage(message, f"message:{mid}"))
+                         usage=message_usage)
             if text:
                 assistant_text_seen.add(mid)
             return None, str(index) if index is not None else None
     elif kind == "reasoning":
         _add(events, "thinking", ts, msg_key, record, "part.data",
-             text=str(part.get("text") or "").strip())
+             text=str(part.get("text") or "").strip(), usage=message_usage)
     elif kind == "compaction":
         state = part.get("state") if isinstance(part.get("state"), dict) else {}
         text = str(part.get("text") or state.get("summary") or state.get("text") or "").strip()
@@ -589,6 +644,22 @@ class _V1Feed:
         self.resolved_in_turn: set[str] = set()
         self.open_risk: set[str] = set()
         self.flushed_total = 0
+        # Per-message Usage cache: one native message carries one
+        # message-level Usage object shared by identity across its text
+        # and reasoning shards (no merge, no sum). Keyed by raw msg_data
+        # so an in-place message update recomputes instead of reusing
+        # stale usage.
+        self._message_usage: dict[str, tuple[str, Usage | None]] = {}
+
+    def _usage_for(self, mid: str, message: dict, raw: object) -> Usage | None:
+        key = raw if isinstance(raw, str) else json.dumps(
+            message, sort_keys=True, default=str)
+        cached = self._message_usage.get(mid)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        usage = _opencode_usage(message, f"message:{mid}")
+        self._message_usage[mid] = (key, usage)
+        return usage
 
     def feed(self, rows: list) -> list[ActivityEvent]:
         """Interpret one batch of message/part rows, appending events.
@@ -633,7 +704,10 @@ class _V1Feed:
                         self.open_risk.add(mid)
                 continue
             call_id, tool_status = _v1_part(
-                row, message, self._session_id, self.events, self.assistant_text_seen)
+                row, message, self._session_id, self.events,
+                self.assistant_text_seen,
+                self._usage_for(mid, message, row["msg_data"])
+                if role == "assistant" else None)
             if role == "assistant" and call_id:
                 self.calls_in_turn.add(call_id)
                 if tool_status in {"completed", "error"}:

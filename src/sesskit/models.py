@@ -56,6 +56,10 @@ class SessionInfo(_SessionInfoRequired, total=False):
     # terminal ones). Absent means unknown; never fabricate.
     terminal_error_kind: str
     terminal_error_retryable: bool | None
+    # Count of assistant model-decision iterations (parallel tool calls and
+    # fragmented streaming rows of one response merge into 1; None when
+    # unavailable/unreliable).
+    loop_count: int | None
 
 
 @dataclass(frozen=True)
@@ -238,6 +242,13 @@ class Usage:
 
     Every numeric field is populated only from a native record; nothing
     is estimated. Absent fields stay None.
+
+    ``model`` is the reported/effective model that produced the usage,
+    never a request-time guess. The attribution extras below are all
+    optional: None means the native record carries no such value.
+    ``reasoning_level`` names a configuration-side strength selector
+    (for example a thinking-level label); it is strictly distinct from
+    ``reasoning_tokens``, which counts output tokens spent on reasoning.
     """
 
     evidence: Evidence
@@ -249,6 +260,12 @@ class Usage:
     reasoning_tokens: int | None = None
     total_tokens: int | None = None
     cost: float | None = None
+    requested_model: str | None = None
+    provider: str | None = None
+    api: str | None = None
+    reasoning_level: str | None = None
+    service_tier: str | None = None
+    model_variant: str | None = None
 
 
 @dataclass(frozen=True)

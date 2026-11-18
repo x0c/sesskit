@@ -205,5 +205,8 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
     if b.excluded.is_none() && !has_prompt {
         b.excluded = Some("empty_history");
     }
+    if window.full {
+        b.loop_count = crate::loops::claude_from_bytes(&bytes).ok().flatten();
+    }
     Some(b.finish(window))
 }

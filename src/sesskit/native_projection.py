@@ -19,7 +19,7 @@ def _backend() -> ModuleType | None:
         module = importlib.import_module("sesskit._native")
     except (ImportError, OSError):
         return None
-    return module if getattr(module, "PROTOCOL_VERSION", None) == 1 else None
+    return module if getattr(module, "PROTOCOL_VERSION", None) == 2 else None
 
 
 def native_available() -> bool:
@@ -61,3 +61,58 @@ def project_opencode_sessions(db_path: str, session_ids: list[str]) -> dict | No
     except (AttributeError, RuntimeError, UnicodeError, TypeError, ValueError):
         return None
     return result if isinstance(result, dict) else None
+
+
+def _python_count_loops(runtime: str, path: str) -> int | None:
+    if runtime == "claude":
+        from sesskit.parsers.claude import count_loops_from_path
+
+        return count_loops_from_path(path)
+    if runtime == "codex":
+        from sesskit.parsers.codex import count_loops_from_path
+
+        return count_loops_from_path(path)
+    if runtime == "pi":
+        from sesskit.parsers.pi import count_loops_from_path
+
+        return count_loops_from_path(path)
+    if runtime == "antigravity":
+        from sesskit.parsers.antigravity import count_loops_from_path
+
+        return count_loops_from_path(path)
+    if runtime == "cursor":
+        from sesskit.parsers.cursor import count_store_loops
+
+        return count_store_loops(path)
+    return None
+
+
+def count_loops_many(items: list[tuple[str, str]]) -> list[int | None]:
+    """Count assistant model-decision loops for ``(runtime, path)`` pairs.
+
+    Uses the parallel Rust backend (GIL-detached) when enabled, falling back
+    per-file on non-standard JSON or for all items when ``SESSKIT_NATIVE=0``.
+    """
+    if not items:
+        return []
+    backend = _backend()
+    if backend is not None:
+        try:
+            raw_results = backend.count_loops_many(items)
+            if isinstance(raw_results, list) and len(raw_results) == len(items):
+                resolved: list[int | None] = []
+                for (runtime, path), item in zip(items, raw_results, strict=True):
+                    ok, count = item
+                    if ok:
+                        resolved.append(int(count) if count is not None else None)
+                    else:
+                        resolved.append(_python_count_loops(runtime, path))
+                return resolved
+        except (AttributeError, RuntimeError, UnicodeError, TypeError, ValueError):
+            pass
+    return [_python_count_loops(runtime, path) for runtime, path in items]
+
+
+def count_loops(runtime: str, path: str) -> int | None:
+    """Count assistant model-decision loops for one ``(runtime, path)``."""
+    return count_loops_many([(runtime, path)])[0]

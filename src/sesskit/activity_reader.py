@@ -50,7 +50,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from sesskit.activity import _build_pi_events, _pi_compactions, _pi_outcome
+from sesskit.activity import _build_pi_events, _pi_compactions, _pi_outcome, _pi_transitions
 from sesskit.models import ActivityEvent, Evidence, LoadState, SessionOutcome
 from sesskit.parsers import pi as scan_pi
 
@@ -462,8 +462,12 @@ class PiActivityReader(ActivityReader):
         # Same compaction linkage as the snapshot loader: the first branch
         # message naming a compaction id as its parent emits a standalone
         # ``compaction`` event first. Omitting this desyncs every later seq.
-        events = _build_pi_events(branch, self._session_id,
-                                  compactions=_pi_compactions(entries, branch))
+        events = _build_pi_events(
+            branch,
+            self._session_id,
+            compactions=_pi_compactions(entries, branch),
+            transitions=_pi_transitions(entries, branch),
+        )
         self._all_entries = entries
         self._by_id = {str(item["id"]): item for item in entries if isinstance(item.get("id"), str)}
         self._branch = branch
@@ -532,11 +536,16 @@ class PiActivityReader(ActivityReader):
         if not self._branch_keys and not branch:
             self._rebuild(stat, reason="branch")
             return
+        all_entries = self._all_entries + entries
         added = _build_pi_events(
-            fresh, self._session_id, seq_start=len(self._events), position_start=len(self._branch),
-            compactions=_pi_compactions(self._all_entries + entries, branch),
+            fresh,
+            self._session_id,
+            seq_start=len(self._events),
+            position_start=len(self._branch),
+            compactions=_pi_compactions(all_entries, branch),
+            transitions=_pi_transitions(all_entries, fresh),
         )
-        self._all_entries = self._all_entries + entries
+        self._all_entries = all_entries
         self._by_id = extended
         self._branch = branch
         self._branch_keys = keys

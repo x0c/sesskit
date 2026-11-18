@@ -29,6 +29,9 @@ For each session with activity inside `[start, end]`:
   excluded, as in the activity projection);
 - reconciled usage records with the **timestamp of the native record that
   carries them**, so in-window tokens are attributed by time.
+- `loop_count`: optional total count of assistant model-decision iterations over the
+  examined history (`Some(n)` in `--full` mode; `None` when pruned or unavailable),
+  following the per-runtime rules in `docs/CONTRACT.md`.
 
 Aggregates derived from it (sessions per runtime, in-window token total,
 active intervals, hour-by-weekday histogram) are pure functions over this

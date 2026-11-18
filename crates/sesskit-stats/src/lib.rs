@@ -8,6 +8,7 @@ pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod jsonl;
+pub mod loops;
 pub mod opencode;
 pub mod opencode_list;
 pub mod pi;

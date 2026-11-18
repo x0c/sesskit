@@ -94,7 +94,20 @@ SELECT
        AND json_extract(m.data, '$.role') = 'assistant'
      ORDER BY m.time_created DESC, m.id DESC, p.id DESC LIMIT 1)   AS last_agent_text,
   (SELECT COALESCE(SUM(LENGTH(p.data)), 0) FROM part p
-     WHERE p.session_id = s.id)                                     AS content_bytes
+     WHERE p.session_id = s.id)                                     AS content_bytes,
+  (SELECT COUNT(*) FROM message m
+     WHERE m.session_id = s.id
+       AND json_extract(m.data, '$.role') = 'assistant'
+       AND (
+         EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id
+                 AND json_extract(p.data, '$.synthetic') IS NOT 1)
+         OR (
+           json_extract(m.data, '$.finish') IS NOT NULL
+           AND json_extract(m.data, '$.finish') != ''
+           AND json_extract(m.data, '$.finish') != 'error'
+           AND json_extract(m.data, '$.error') IS NULL
+         )
+       ))                                                           AS loop_count
 FROM session s
 WHERE s.parent_id IS NULL
   AND s.time_archived IS NULL
@@ -678,6 +691,11 @@ def _build_session_info(
         f"{str(row['last_user_text'] or '')[:120]}\n"
         f"{last_agent_text[:120]}"
     )
+    try:
+        raw_loops = row["loop_count"]
+    except (IndexError, KeyError):
+        raw_loops = None
+    loop_count = int(raw_loops) if raw_loops is not None else None
     return make_session_info(
         source="opencode",
         id=session_id,
@@ -688,6 +706,7 @@ def _build_session_info(
         event_time=mtime,
         file_mtime=mtime,
         size_bytes=size_bytes,
+        loop_count=loop_count,
         native_title=native_title,
         fallback_title=fallback,
         status_tag=status,
@@ -790,6 +809,19 @@ def _v2_text_content_fact(data: dict) -> dict:
     ]}
 
 
+def _v2_is_valid_assistant_loop(data: dict) -> bool:
+    content = data.get("content")
+    if isinstance(content, list) and len(content) > 0:
+        return True
+    finish = data.get("finish")
+    return (
+        isinstance(finish, str)
+        and bool(finish.strip())
+        and finish.strip() != "error"
+        and not data.get("error")
+    )
+
+
 def _v2_list_facts(msg_rows: list[sqlite3.Row]) -> dict:
     """Reduce Python SQL rows to the compact facts shared with the Rust path."""
     from sesskit.native_projection import project_records
@@ -800,6 +832,7 @@ def _v2_list_facts(msg_rows: list[sqlite3.Row]) -> dict:
     goal_rows: list[dict] = []
     assistant_datas: list[dict] = []
     last_anchor = ""
+    loop_count = 0
     for msg_row, raw in zip(msg_rows, projected, strict=True):
         data = _v2_json_dict(raw)
         row_type = str(msg_row["type"] or "")
@@ -808,6 +841,8 @@ def _v2_list_facts(msg_rows: list[sqlite3.Row]) -> dict:
             user_texts.append(_v2_user_text(data))
         elif row_type == "assistant":
             assistant_datas.append(data)
+            if _v2_is_valid_assistant_loop(data):
+                loop_count += 1
             # 原生轮次锚点：同文本不同轮次靠消息 id/seq 区分。
             last_anchor = f"{msg_row['id']}:{msg_row['seq']}"
         elif row_type == "synthetic":
@@ -834,6 +869,7 @@ def _v2_list_facts(msg_rows: list[sqlite3.Row]) -> dict:
         "status_rows": typed_rows[status_start:],
         "assistant_errors": [{"error": data["error"]} for data in assistant_datas if data.get("error")],
         "last_anchor": last_anchor,
+        "loop_count": loop_count,
     }
 
 
@@ -889,6 +925,12 @@ def _session_info_from_v2_facts(
     from sesskit.models import completion_id_for
 
     tail_text = f"{last_user[:120]}\n{last_agent_text[:120]}"
+    raw_loops = facts.get("loop_count")
+    loop_count = (
+        int(raw_loops)
+        if isinstance(raw_loops, int) and not isinstance(raw_loops, bool)
+        else None
+    )
     return make_session_info(
         source="opencode",
         id=session_id,
@@ -899,6 +941,7 @@ def _session_info_from_v2_facts(
         event_time=mtime,
         file_mtime=mtime,
         size_bytes=int(facts["size_bytes"]),
+        loop_count=loop_count,
         native_title=native_title,
         fallback_title=fallback,
         status_tag=status,

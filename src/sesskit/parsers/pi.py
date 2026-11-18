@@ -77,6 +77,31 @@ def message_text(content: object) -> str:
     return "\n\n".join(parts)
 
 
+_PI_SKILL_BLOCK_RE = re.compile(
+    r'\A<skill name="(?P<name>[a-z0-9]+(?:-[a-z0-9]+)*)" location="[^"\r\n]+">'
+    r'(?P<instructions>[\s\S]*)</skill>(?P<arguments>[\s\S]*)\Z'
+)
+
+
+def user_message_text(content: object) -> str:
+    """Human request from a Pi user turn, excluding native skill instructions.
+
+    Pi persists an explicit ``/skill:name arguments`` command as one complete
+    ``<skill …>…</skill>`` block followed by its arguments. Only that exact
+    native shape is unwrapped; assistant examples and malformed lookalikes
+    remain verbatim. A no-argument call retains its concise invocation marker.
+    """
+    text = message_text(content)
+    match = _PI_SKILL_BLOCK_RE.fullmatch(text)
+    if match is None:
+        return text
+    name = match.group("name")
+    if len(name) > 64:
+        return text
+    arguments = match.group("arguments").strip()
+    return arguments or f"/skill:{name}"
+
+
 def read_entries(path: str) -> list[dict]:
     entries: list[dict] = []
     try:
@@ -435,6 +460,44 @@ def active_messages(entries: list[dict]) -> list[dict]:
     return [item for item in path if item.get("type") == "message" and isinstance(item.get("message"), dict)]
 
 
+def _has_assistant_output(content: object) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if not isinstance(part_type, str) or not part_type.strip():
+            continue
+        ptype = part_type.strip()
+        if ptype in ("text", "thinking"):
+            if str(part.get("text") or part.get("thinking") or "").strip():
+                return True
+        else:
+            return True
+    return False
+
+
+def count_loops_from_branch(branch: list[dict]) -> int:
+    """Count assistant model-decision iterations on a reconstructed Pi branch."""
+    count = 0
+    for item in branch:
+        message = item.get("message")
+        if isinstance(message, dict) and message.get("role") == "assistant" and _has_assistant_output(message.get("content")):
+            count += 1
+    return count
+
+
+def count_loops_from_path(path: str) -> int | None:
+    """Count Pi assistant model-decision iterations from a JSONL file."""
+    entries = read_entries(path)
+    if not entries or entries[0].get("type") != "session" or not str(entries[0].get("id") or ""):
+        return None
+    return count_loops_from_branch(active_messages(entries))
+
+
 # 以下旧私有名保留别名：transcript 等核心层已改用公共名，模块内部仍引用。
 _text = message_text
 _read_entries = read_entries
@@ -486,7 +549,7 @@ def _build_session_info_from_entries(
     for position, item in enumerate(branch):
         message = item["message"]
         role = message.get("role")
-        text = _text(message.get("content"))
+        text = user_message_text(message.get("content")) if role == "user" else _text(message.get("content"))
         timestamp = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
         if timestamp is not None:
             event_time = timestamp
@@ -557,10 +620,11 @@ def _build_session_info_from_entries(
 
     # 尾指纹：分支叶子 id + stopReason。同一轮重扫不变，新一轮必变。
     tail_text = f"{leaf_id or ''}:{(last_stop_reason or '')}:{(last_agent or '')[:120]}"
+    loop_count = count_loops_from_branch(branch)
     info = make_session_info(
         source="pi", id=session_id, short_id=session_id[:12], cwd=cwd, mtime=mtime,
         time_source=time_source, event_time=event_time, file_mtime=stat.st_mtime,
-        size_bytes=stat.st_size, native_title=native_title,
+        size_bytes=stat.st_size, loop_count=loop_count, native_title=native_title,
         fallback_title=(native_title or first_user)[:60], status_tag=status, path=path,
         first_user_msg=preprocess_excerpt(first_user, host),
         last_user_msg=preprocess_excerpt(last_user, host),
@@ -720,7 +784,7 @@ def load_conversation(path: str, *, include_errors: bool = False) -> list[Conver
     for item in _active_messages(_read_entries(path)):
         message = item["message"]
         role = message.get("role")
-        text = _text(message.get("content"))
+        text = user_message_text(message.get("content")) if role == "user" else _text(message.get("content"))
         if role == "assistant" and not text and include_errors:
             stop_reason = str(message.get("stopReason") or "").strip()
             error_text = str(message.get("errorMessage") or "").strip()

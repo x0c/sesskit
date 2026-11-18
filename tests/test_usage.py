@@ -412,7 +412,15 @@ class KimiTests(unittest.TestCase):
             (32, {"type": "llm.request", "agentId": "main", "kind": "loop",
                   "provider": "openai", "model": "qwen3.5-9b"}),
         ]
-        self.assertEqual(collect_kimi_observations(rows), [])
+        observations = collect_kimi_observations(rows)
+        # token_counting.* are local context-size measurements, never billed
+        # usage; llm.request is a config-only model-call observation (no tokens).
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].operation_detail, "llm_request")
+        self.assertEqual(observations[0].usage.requested_model, "qwen3.5-9b")
+        self.assertEqual(observations[0].requested_model, "qwen3.5-9b")
+        self.assertIsNone(observations[0].usage.model)
+        self.assertIsNone(normalize_observation(observations[0]).total)
 
     def test_turn_deltas_sum_across_source_positions(self) -> None:
         rows = [

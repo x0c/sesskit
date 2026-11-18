@@ -58,6 +58,8 @@ pub struct SessionStats {
     pub untimed_tokens: i64,
     /// `known_total` over every record read (the whole session in full mode).
     pub known_total: Option<i64>,
+    /// Model-decision iterations counted over the whole history in full mode.
+    pub loop_count: Option<u64>,
     /// Bytes or rows of history examined.
     pub examined: u64,
 }
@@ -69,12 +71,22 @@ pub struct Builder {
     pub excluded: Option<&'static str>,
     pub activity: Vec<f64>,
     pub observations: Vec<Observation>,
+    pub loop_count: Option<u64>,
     pub examined: u64,
 }
 
 impl Builder {
     pub fn new(runtime: Runtime, id: String) -> Self {
-        Builder { runtime, id, cwd: None, excluded: None, activity: Vec::new(), observations: Vec::new(), examined: 0 }
+        Builder {
+            runtime,
+            id,
+            cwd: None,
+            excluded: None,
+            activity: Vec::new(),
+            observations: Vec::new(),
+            loop_count: None,
+            examined: 0,
+        }
     }
 
     pub fn finish(mut self, window: &Window) -> SessionStats {
@@ -112,6 +124,7 @@ impl Builder {
             },
             untimed_tokens: untimed,
             known_total: known,
+            loop_count: self.loop_count,
             examined: self.examined,
         }
     }

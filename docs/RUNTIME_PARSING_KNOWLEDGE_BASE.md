@@ -273,6 +273,23 @@ native-history fields each parser reads, with types and change notes.
 | Pi `compaction` entries | `src/sesskit/activity.py` compaction events | Boundary with `summary`, `tokensBefore`, and `usage` | Emitted only when feeding the active branch; typed-only in v1 |
 | Pi `subagents:record` custom entries | `src/sesskit/relations.py` pi relations | Child-agent records with native child ids | Target is the record id; status text is not parsed |
 
+### Model attribution sources for usage (index only)
+
+Authoritative interpretation lives in
+`docs/NATIVE_USAGE_DATA_DESIGN.md` §2.1; this table only indexes the native
+field spellings and their code entry points. `reasoning_level` is always the
+configuration-side strength selector, strictly distinct from the `reasoning`
+output-token count; absent stays `null`, never estimated.
+
+| Native attribution source | Code entry | Business meaning | Change notes |
+|---|---|---|---|
+| Claude entry-top `requestedModel`, `perTurnEffort` (preferred) / `effort`, `message.usage.service_tier` | `src/sesskit/usage.py` `collect_claude_observations` | Request-time model, reasoning strength, service tier beside per-message `model`/`usage` | Null/empty stays `None`; `perTurnEffort` wins over `effort`; tier lives inside `message.usage` |
+| Codex `turn_context` / `session_meta` / `thread_settings_applied` payload `model` / `effort` / `reasoning_effort`, plus `collaboration_mode.settings.model` / `settings.reasoning_effort` fallback | `src/sesskit/usage.py` `_codex_context_attribution`, turn-model backfill map | Turn-scoped configured model/reasoning backfilled onto `token_usage_record` payloads that carry no model of their own | Native payload value always wins; absent stays `None`; never invent a model |
+| OpenCode `providerID`, `model.providerID`, `model.variant` | `src/sesskit/usage.py` `provider_of` / `variant_of` | Native provider and model variant beside `modelID` | v1 top-level `providerID`, v2 `model.providerID`; `variant` is version evidence only, never a reasoning-level inference |
+| Pi `provider`, `api`, `thinkingLevel` | `src/sesskit/usage.py` `usage_from` (`collect_pi_observations`) | Reported/effective provider, API surface and thinking-level configuration beside per-message `model`/`usage` | Pi history carries no `requested_*`/`reported_*` keys; `thinkingLevel` is config, not token count |
+| Kimi `llm.request` (`model`/`modelAlias`/`provider`/`thinkingEffort`/`turnStep`), `profile.bind` (`modelAlias`/`thinkingEffort`) | `src/sesskit/usage.py` `collect_kimi_observations` | Pure-configuration rows with unknown scope/counter; inspectable but never addends | Only `usage.record` turn deltas add; config-only histories stay `available` with per-metric `unknown`, never zero |
+| Cursor `content[].providerOptions.cursor.modelName` verbatim | `src/sesskit/parsers/cursor.py` `model_name_from_blob`, `src/sesskit/activity_cursor.py` assistant parts | Per-blob model attribution reused for every event derived from that blob | Verbatim string (`-high`/`-fast` kept, never stripped); no native provider key, caller keeps `provider=None`; evidence field `content[].providerOptions.cursor.modelName` |
+
 ## §5 This domain's flow / component / job / MQ entry index
 
 No message queues, cron jobs, or flow engines exist here. This section indexes

@@ -185,6 +185,33 @@ def _is_antigravity_record(item: object) -> bool:
     return isinstance(item, dict) and "step_index" in item and isinstance(item.get("type"), str)
 
 
+def _is_valid_planner_loop(row: dict) -> bool:
+    if not _is_antigravity_record(row) or row.get("type") != "PLANNER_RESPONSE":
+        return False
+    content = row.get("content")
+    if isinstance(content, str):
+        stripped = content.strip()
+        if stripped and stripped != "None":
+            return True
+    thinking = row.get("thinking")
+    if isinstance(thinking, str) and thinking.strip():
+        return True
+    tool_calls = row.get("tool_calls")
+    if isinstance(tool_calls, list) and any(isinstance(c, dict) for c in tool_calls):
+        return True
+    return bool(normalize_media(row.get("media")))
+
+
+def count_loops_from_path(path: str) -> int | None:
+    """Count Antigravity PLANNER_RESPONSE model-decision loops from a transcript JSONL."""
+    if not path or not path.endswith(".jsonl"):
+        return None
+    rows = _iter_transcript_rows(path)
+    if not rows:
+        return None
+    return sum(1 for row in rows if _is_valid_planner_loop(row))
+
+
 def _iter_transcript_rows(path: str) -> list[dict]:
     rows: list[dict] = []
     try:
@@ -1197,6 +1224,7 @@ def _build_session_info(
         completion_id = completion_id_for(
             status_tag=status_tag, anchor=anchor, tail_text=id_tail
         )
+        loop_count = sum(1 for r in rows if _is_valid_planner_loop(r))
         return make_session_info(
             source="antigravity",
             id=cid,
@@ -1207,6 +1235,7 @@ def _build_session_info(
             event_time=event_time,
             file_mtime=file_mtime,
             size_bytes=size_bytes,
+            loop_count=loop_count,
             native_title=native_title,
             fallback_title=fallback_title,
             status_tag=status_tag,
@@ -1276,6 +1305,7 @@ def _build_session_info(
             event_time=event_time,
             file_mtime=file_mtime,
             size_bytes=size_bytes,
+            loop_count=None,
             native_title=native_title,
             fallback_title=fb,
             status_tag=status_tag,

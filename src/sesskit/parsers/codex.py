@@ -166,6 +166,17 @@ def _terminal_fingerprint(kind: str, entry: dict, payload: dict, text: str) -> s
     return ""
 
 
+_SKILL_CONTEXT_RE = re.compile(
+    r"\A<skill>\s*<name>[^<>\r\n]+</name>\s*<path>[^<>\r\n]+</path>"
+    r"[\s\S]*</skill>\Z"
+)
+
+
+def is_skill_context_text(text: str) -> bool:
+    """A complete Codex-injected skill fragment, not an ordinary $skill prompt."""
+    return _SKILL_CONTEXT_RE.fullmatch(text.strip()) is not None
+
+
 def _response_message_text(payload: dict, role: str) -> str:
     """提取新版 response_item message 的指定角色文本，忽略框架注入上下文。"""
     if payload.get("type") != "message" or payload.get("role") != role:
@@ -180,6 +191,8 @@ def _response_message_text(payload: dict, role: str) -> str:
     ]
     text = "\n".join(part for part in parts if part)
     if text.startswith(("# AGENTS.md instructions", "<environment_context>")):
+        return ""
+    if role == "user" and is_skill_context_text(text):
         return ""
     return text
 
@@ -398,10 +411,96 @@ def task_complete_error_text(payload: dict) -> str:
 _task_complete_error_text = task_complete_error_text
 
 
+_CODEX_ASSISTANT_RESPONSE_TYPES = frozenset({
+    "reasoning",
+    "function_call",
+    "custom_tool_call",
+    "web_search_call",
+    "local_shell_call",
+})
+_CODEX_BOUNDARY_RESPONSE_TYPES = frozenset({
+    "function_call_output",
+    "custom_tool_call_output",
+})
+_CODEX_BOUNDARY_EVENT_TYPES = frozenset({
+    "token_count",
+    "user_message",
+    "task_started",
+    "task_complete",
+    "turn_aborted",
+})
+
+
+def count_loops_from_path(path: str) -> int | None:
+    """Count Codex assistant model-decision iterations from a rollout JSONL file.
+
+    Groups contiguous assistant-side ``response_item`` outputs (merging parallel
+    tool calls and interleaved ``item_completed`` / metadata rows into 1 loop),
+    falling back to legacy ``event_msg`` turns when no assistant
+    ``response_item`` rows exist.
+    """
+    ri_loops = 0
+    in_step = False
+    legacy_loops = 0
+    turn_has_agent_msg = False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                kind = entry.get("type")
+                if kind in ("token_usage_record", "compacted"):
+                    in_step = False
+                    continue
+                payload = entry.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                pt = payload.get("type")
+                if kind == "response_item":
+                    role = payload.get("role")
+                    if pt in _CODEX_ASSISTANT_RESPONSE_TYPES or (
+                        pt == "message" and role == "assistant"
+                    ):
+                        if not in_step:
+                            ri_loops += 1
+                            in_step = True
+                    elif pt in _CODEX_BOUNDARY_RESPONSE_TYPES or (
+                        pt == "message" and role == "user"
+                    ):
+                        in_step = False
+                elif kind == "event_msg":
+                    if pt in _CODEX_BOUNDARY_EVENT_TYPES:
+                        in_step = False
+                    if pt in ("user_message", "task_started", "turn_aborted"):
+                        turn_has_agent_msg = False
+                    elif pt == "agent_message":
+                        msg = payload.get("message")
+                        if isinstance(msg, str) and msg.strip():
+                            legacy_loops += 1
+                            turn_has_agent_msg = True
+                    elif pt == "task_complete":
+                        msg = payload.get("last_agent_message")
+                        if not turn_has_agent_msg and isinstance(msg, str) and msg.strip():
+                            legacy_loops += 1
+                        turn_has_agent_msg = False
+    except OSError:
+        return None
+    return ri_loops if ri_loops > 0 else legacy_loops
+
+
 def _build_session_info(
     path: str,
     index: dict[str, str],
     host: HostExtension | None = None,
+    *,
+    compute_loop_count: bool = True,
 ) -> dict | None:
     """从一个 session 文件中提取统一结构。"""
     uuid = _extract_uuid_from_filename(path)
@@ -603,6 +702,12 @@ def _build_session_info(
         last_agent_msg = last_agent_msg or wider_agent
     from sesskit.models import completion_id_for
 
+    extra: dict[str, object] = dict(terminal_error)
+    if compute_loop_count:
+        from sesskit.native_projection import count_loops
+
+        extra["loop_count"] = count_loops("codex", path)
+
     return make_session_info(
         source="codex",
         id=uuid,
@@ -628,7 +733,7 @@ def _build_session_info(
             anchor=tail_fingerprint,
             tail_text=tail_fingerprint,
         ),
-        **terminal_error,
+        **extra,
     )
 
 
@@ -726,7 +831,7 @@ def scan_signature() -> tuple | None:
 def _cache_version(host: HostExtension | None) -> str:
     # 新版记录把真实消息放进 response_item；提升解析缓存版本，让旧版误判为
     # “新会话”的派生结果自动重读，而不必让用户手动清缓存。
-    index_version = repr((file_signature(SESSION_INDEX), "response-item-v2", "question-reply-v1"))
+    index_version = repr((file_signature(SESSION_INDEX), "response-item-v2", "question-reply-v1", "loop-v1"))
     return index_version + host_cache_tag(host)
 
 
@@ -786,13 +891,13 @@ def scan_sessions(
     for _, path in candidates:
         cache = session_cache
         info = cache.get_session("codex", path, cache_version)
+        if info is not None and "loop_count" not in info:
+            info = None
         if info is None:
             try:
-                info = _build_session_info(path, index, host)
+                info = _build_session_info(path, index, host, compute_loop_count=False)
             except OSError:
                 continue
-            if info is not None:
-                cache.put_session("codex", path, info, cache_version)
         if info is None:
             continue
         if info["thread_source"] == "subagent":
@@ -818,7 +923,18 @@ def scan_sessions(
             break
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
-    return results[:limit]
+    results = results[:limit]
+    missing_loops = [item for item in results if "loop_count" not in item]
+    if missing_loops:
+        from sesskit.native_projection import count_loops_many
+
+        counts = count_loops_many([("codex", str(item["path"])) for item in missing_loops])
+        for item, count in zip(missing_loops, counts, strict=True):
+            item["loop_count"] = count
+            session_cache.put_session(
+                "codex", str(item["path"]), {**item, "live": False, "pid": None}, cache_version,
+            )
+    return results
 
 
 def refresh_session(
@@ -838,6 +954,8 @@ def refresh_session(
     cache = host.cache if (host is not None and host.cache is not None) else get_cache()
     cache_version = _cache_version(host)
     info = cache.get_session("codex", path, cache_version)
+    if info is not None and "loop_count" not in info:
+        info = None
     if info is None:
         try:
             info = _build_session_info(path, _load_index(), host)

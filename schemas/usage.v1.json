@@ -23,11 +23,19 @@
     },
     "entries_read": { "type": "integer", "minimum": 0 },
     "summary": { "$ref": "#/$defs/usageSummary" },
+    "models": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
     "selectors": {
       "type": "object",
       "properties": {
         "turn_id": { "type": "string" },
-        "message_id": { "type": "string" }
+        "message_id": { "type": "string" },
+        "models": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
       },
       "additionalProperties": false
     },
@@ -132,12 +140,87 @@
         "diagnostics": { "type": "array", "items": { "type": "string" } }
       }
     },
+    "usageObservation": {
+      "type": "object",
+      "required": ["observation_id", "runtime", "record", "scope", "counter", "operation", "correlation", "usage", "cost_basis", "quality", "evidence"],
+      "properties": {
+        "observation_id": { "type": "string" },
+        "runtime": { "type": "string" },
+        "record": { "type": "string" },
+        "scope": { "type": "object" },
+        "counter": { "type": "object" },
+        "operation": { "type": "string" },
+        "operation_detail": { "type": ["string", "null"] },
+        "correlation": { "type": "object" },
+        "model": { "type": ["string", "null"] },
+        "provider": { "type": ["string", "null"] },
+        "requested_model": { "type": ["string", "null"] },
+        "api": { "type": ["string", "null"] },
+        "reasoning_level": { "type": ["string", "null"] },
+        "service_tier": { "type": ["string", "null"] },
+        "model_variant": { "type": ["string", "null"] },
+        "usage": { "type": "object" },
+        "cost_basis": { "type": "string" },
+        "quality": { "type": "string" },
+        "evidence": { "type": "object" },
+        "native_subdivisions": { "type": "array" }
+      }
+    },
+    "usageRecord": {
+      "type": "object",
+      "required": ["usage_id", "runtime", "observation_ids", "scope", "counter", "operation", "correlation", "standing", "revision", "normalized", "diagnostics"],
+      "properties": {
+        "usage_id": { "type": "string" },
+        "runtime": { "type": "string" },
+        "observation_ids": { "type": "array", "items": { "type": "string" } },
+        "scope": { "type": "object" },
+        "counter": { "type": "object" },
+        "operation": { "type": "string" },
+        "correlation": { "type": "object" },
+        "model": { "type": ["string", "null"] },
+        "provider": { "type": ["string", "null"] },
+        "requested_model": { "type": ["string", "null"] },
+        "api": { "type": ["string", "null"] },
+        "reasoning_level": { "type": ["string", "null"] },
+        "service_tier": { "type": ["string", "null"] },
+        "model_variant": { "type": ["string", "null"] },
+        "standing": { "type": "string" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "normalized": { "type": "object" },
+        "diagnostics": { "type": "array", "items": { "type": "string" } },
+        "native_subdivisions": { "type": "array" }
+      }
+    },
+    "messageItem": {
+      "type": "object",
+      "properties": {
+        "seq": { "type": ["integer", "null"] },
+        "message_id": { "type": ["string", "null"] },
+        "response_id": { "type": ["string", "null"] },
+        "turn_id": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "provider": { "type": ["string", "null"] },
+        "reasoning_level": { "type": ["string", "null"] },
+        "attribution": { "type": ["string", "null"] },
+        "type": { "type": ["string", "null"] },
+        "evidence": { "type": ["object", "null"] }
+      }
+    },
     "usageDetail": {
       "type": "object",
       "required": ["kind", "items", "returned", "total", "has_more"],
       "properties": {
-        "kind": { "type": "string", "enum": ["records", "observations"] },
-        "items": { "type": "array", "items": { "type": "object" } },
+        "kind": { "type": "string", "enum": ["records", "observations", "messages"] },
+        "items": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              { "$ref": "#/$defs/usageObservation" },
+              { "$ref": "#/$defs/usageRecord" },
+              { "$ref": "#/$defs/messageItem" }
+            ]
+          }
+        },
         "returned": { "type": "integer", "minimum": 0 },
         "total": { "type": "integer", "minimum": 0 },
         "has_more": { "type": "boolean" },

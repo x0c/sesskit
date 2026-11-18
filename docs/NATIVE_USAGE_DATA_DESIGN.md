@@ -58,7 +58,7 @@ also have native-format fixtures and source-version evidence.
 | Claude Code | Assistant `message.id`, `message.usage`, model, request/parent linkage where recorded; `cost-state`/per-model rollups in observed history variants | Deduplicate a model response split into multiple messages. The SDK explicitly warns that per-step output counters can be placeholders, while result `modelUsage`/cost can include earlier resumed-session spend, subagents and auxiliary calls. Do not transfer SDK finality assumptions blindly to every JSONL version. Preserve per-field quality and the rollup's actual scope. [C1] |
 | Codex | `token_usage_record.payload.usage` with `response_id`; `turn_token_usage`, `thread_token_usage`, turn/root-turn/thread ids; legacy `event_msg/token_count.info.last_token_usage` and `total_token_usage`; model context and compaction linkage | Separate request values from turn/thread counters. New and legacy records can describe the same request. Counts alone or adjacency alone do not prove identity. Keep unlinked legacy observations when a request-level association cannot be established. Official `exec --json` also returns turn usage, but a live JSON stream is not a stored-history contract. [X1], [X2] |
 | OpenCode | Assistant message `tokens`, recorded cost, model/provider, retry and created/streamed/completed timestamps; step/usage events and session aggregates in supported store versions | The inspected upstream mapping stores **non-cached input** and **visible output** separately from cache and reasoning. Step/message values and session aggregates must not both enter the same sum. Verify each supported v1/v2 store layout; newer event shapes do not imply an installed database migration. [O1] |
-| Pi | Assistant `usage`, provider/API/model/response ids, requested and reported model/reasoning metadata; tool-result `usage`; independent `usage` entries; compaction and branch-summary usage; tree/fork/context-edit metadata | Tool-only assistant responses still consume tokens. Tool-result usage is nested model work, not a second main-loop response. Unknown independent usage kinds are valid. `reasoning` is already included in `output`; one-hour cache writes are a subset of cache writes. Context edits change future context, not past accounting. [P1], [P2] |
+| Pi | Assistant `message.model` (reported/effective), `provider`, `api`, `thinkingLevel`, `responseId`/`responseModel` where recorded; `usage` token buckets including `reasoning` (subset of output); tool-result `usage`; independent `usage` entries; compaction and branch-summary usage; tree/fork/context-edit metadata | Tool-only assistant responses still consume tokens. Tool-result usage is nested model work, not a second main-loop response. Unknown independent usage kinds are valid. `reasoning` is already included in `output`; one-hour cache writes are a subset of cache writes. Context edits change future context, not past accounting. Native Pi history carries no `requested_*`/`reported_*` keys: only the reported model plus the `thinkingLevel` configuration label. [P1], [P2] |
 | Cursor | The inspected official CLI output documents model-call ids, terminal results and timing; the currently supported local-store interpreter has no verified message-usage mapping | Keep usage unsupported until a native source is demonstrated. Billing dashboards or an undocumented private endpoint are not substitutes for local message attribution. Documented `duration_api_ms` currently equals total duration; it is not independently measured model latency. [R1] |
 | Kimi | Existing legacy history support; typed usage adaptation is deferred | Preserve that boundary. This design does not enable a new adapter or claim usage coverage. |
 
@@ -310,7 +310,7 @@ tests rather than speculative universal workflow abstractions.
 | Measurement | `counter_kind`: `absolute`, `delta`, `cumulative`, `unknown`; cumulative counter identity and reset epoch only where supported |
 | Operation | `model_call`, `compaction`, `branch_summary`, `cache_warm`, `tool_nested`, or `unknown`; preserve the native operation string for unfamiliar kinds |
 | Correlation | Native response/request/message/turn/tool ids, branch entry, root turn, parent/origin session and their individual evidence; each optional |
-| Attribution | Requested model, reported/actual model, provider/API, requested/reported reasoning level, service tier and safe native configuration where present; never replace a request's model using a later selection |
+| Attribution | `requested_model` (request-time, only where native records it), `model` (reported/effective, never replaced using a later selection), `provider`/`api`, `reasoning_level` (configuration-side strength selector, strictly distinct from the `reasoning` output-token count), `service_tier`, `model_variant` and safe native configuration where present; every field optional, absent stays None |
 | Values | Native metric names and numeric values, native monetary amounts, units, inclusion relationships and per-field quality; absent differs from zero |
 | Scope coverage | Whether child sessions, auxiliary calls or inherited history are included: `true`, `false`, or unknown; aggregate counters can cover more than one local session |
 | Time | Recorded timestamp plus its meaning; normalized UTC timestamp and duration unit; start/end/duration only if natively recorded or explicitly derived from compatible endpoints |
@@ -519,7 +519,7 @@ an unbounded dump of native payloads:
 
 | Data | Useful meaning | Boundary |
 |---|---|---|
-| Requested/reported model, provider/API, reasoning level, service tier, context limit and native sampling configuration | Distinguish different model execution conditions and explain counters | No inference from aliases/current UI selection; never export auth/config files |
+| `requested_model` (request-time) / `model` (reported/effective), `provider`/`api`, `reasoning_level` (configuration strength, never the `reasoning` output-token count), `service_tier`, `model_variant`, context limit and native sampling configuration | Distinguish different model execution conditions and explain counters; `reasoning_level` vs `reasoning` confusion is a known miscount hazard | No inference from aliases/current UI selection; never export auth/config files |
 | Native request/response ids, turn boundaries, stop reason, error kind/code, retry/attempt linkage | Trace which operation produced a result or failed | Completion is not task correctness; only explicit retry evidence establishes a retry |
 | Call/tool start/end, response-stream end, native durations | Attribute recorded time to operations | Preserve endpoint meaning; no guessed TTFT or model latency from message gaps; parallel durations are not additive wall time |
 | Subagent/fork/continuation relations and compaction/context-edit markers | Explain changed context and nested work | History accounting differs from the context currently sent to a model |
@@ -593,10 +593,17 @@ Proposed read-only command:
 sesskit usage SESSION_REF
 sesskit usage SESSION_REF --detail records --limit 100
 sesskit usage SESSION_REF --detail observations --limit 100
+sesskit usage SESSION_REF --detail messages --limit 100
 sesskit usage SESSION_REF --view active-branch
 sesskit usage SESSION_REF --turn-id TURN_ID
 sesskit usage SESSION_REF --message-id MESSAGE_ID
+sesskit usage SESSION_REF --model MODEL [--model MODEL...]
 ```
+
+Implemented: `--detail messages` plus `--model` (see `src/sesskit/cli.py`
+`cmd_usage`, `--model` at `action="append"`; verified live: top-level `models`
+is `string[]`, `selectors.models` is `string[]`, `detail.scope.models` is
+`string[]`, `detail.kind` is `"messages"`).
 
 Use the existing ref resolver, offline adapter registry and JSON-first CLI
 contract. Do not add a human TUI, a different envelope, interactive prompts,
@@ -615,6 +622,45 @@ network dependencies or implicit file writes for this feature.
   selectors are mutually exclusive and report matched and unlinked-record counts.
   Unknown attribution is not a zero-token message; report unavailable coverage.
   Unsupported filters/options fail; they are not accepted and ignored.
+- `--detail messages` lists one entry per assistant/thinking message with its
+  natively attributed model (`null` when the native record carries none). Items
+  follow `messageItem` (`seq`/`message_id`/`response_id`/`turn_id`/`model`/
+  `provider`/`reasoning_level`/`attribution`/`type`/`evidence`, all optional,
+  nullable like observations/records). Hook rows (`iter_message_models`) carry
+  `seq`/`message_id`/`response_id`/`turn_id`/`model`/`provider`/
+  `reasoning_level`/`attribution`; activity-fallback rows carry `seq`/`type`/
+  `message_id`/`turn_id`/`model`/`provider`/`evidence`.
+- `--model` is lowercase, repeatable (`--model a --model b`), exact
+  case-sensitive native-model match, and orthogonal to `--turn-id`/
+  `--message-id` (AND). On `records`/`observations` it matches `model` OR
+  `requested_model`. On `messages` the activity fallback matches `model` only;
+  hook rows match `model` today and also match `requested_model` when a sibling
+  build provides it (see `_hook_item_matches_model`); this model-only
+  difference is intentional until hook rows carry `requested_model`.
+- Selector combination: `--turn-id` with `--message-id` is a usage error;
+  either may combine with one or more `--model` (AND). Active selectors appear
+  as top-level `selectors` (`turn_id`/`message_id`/`models`) and as
+  `detail.scope` (`history_view` plus the same selectors); top-level `models`
+  always lists the distinct native models from the unfiltered summary. A
+  record-path zero match reports `selector_matched_zero`; the messages path
+  judges the match on attributed message items instead of record counts and
+  reports `selector_matched_zero` when selectors yield no message items.
+- Token-less runtimes (for example Cursor, `unsupported`): no
+  records/observations, metric coverage `unsupported`, never estimated tokens.
+  `messages` still lists per-message model attribution from activity
+  (`content[].providerOptions.cursor.modelName` verbatim, `-high`/`-fast`
+  suffixes kept, provider stays `null`, native evidence
+  `content[].providerOptions.cursor.modelName` / `rowid:N`). Summary stays
+  `unsupported`; messages stay inspectable.
+- Empty-watermark paging: when the snapshot carries no watermark (usage-less
+  runtimes such as Cursor), messages paging binds its cursor to a fingerprint
+  of the message list (`seq`/`type`/`model` hash, `messages:<sha256[:32]>`).
+  A changed source then reads as stale, never misaligned.
+- Config-only without tokens (Kimi `llm.request`/`profile.bind`, Pi
+  `model_change`/`thinking_level_change`): the snapshot is `available`
+  (observations non-empty) with per-metric coverage `unknown` (overall may read
+  `partial` with `unscoped_excluded`); never `empty`/`not_recorded` and never
+  zero. Only `usage.record` turn deltas (Kimi) and token-carrying rows add.
 - Native numeric metric names/evidence are core observations, not hidden behind
   `--include-native`. That option adds bounded metadata: numeric usage breakdowns
   and explicitly mapped scalars such as service tier, inference geography, speed,

@@ -30,7 +30,13 @@ def section_text(readme: Path, heading: str) -> str:
     start = text.index(heading)
     rest = text[start:]
     nxt = rest.find("\n## ", 1)
-    return rest[:nxt] if nxt != -1 else rest
+    section = rest[:nxt] if nxt != -1 else rest
+    # The README may route maintenance commands to their canonical document.
+    if "(docs/MAINTENANCE.md)" in section:
+        maintenance = REPO / "docs" / "MAINTENANCE.md"
+        assert maintenance.is_file(), "README maintenance link must resolve"
+        section += "\n" + maintenance.read_text(encoding="utf-8")
+    return section
 
 
 def bash_blocks(section: str) -> list[str]:
@@ -105,7 +111,7 @@ def test_maintainer_oidc_wording_is_accurate():
     zh = section_text(README_ZH, ZH_HEADING)
     assert "no stored API token" in en
     assert "— no tokens." not in en and "(no tokens)" not in en
-    assert "无预存 API" in zh
+    assert "无预存 API" in zh or "no stored API token" in zh
     assert "无令牌" not in zh
 
 

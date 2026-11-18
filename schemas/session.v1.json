@@ -44,6 +44,14 @@
     "size_kb": {
       "type": "number"
     },
+    "loop_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Count of assistant model-decision iterations (parallel tool calls and fragmented streaming rows of one response count as 1; null when unavailable/unreliable)."
+    },
     "status": {
       "type": "string",
       "enum": [

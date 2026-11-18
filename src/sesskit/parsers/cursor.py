@@ -202,10 +202,58 @@ def _chat_size_bytes(chat_dir: str) -> int:
     return total
 
 
+def count_store_loops(store_path: str) -> int | None:
+    """Count Cursor assistant model-decision blobs in ``store.db``.
+
+    Reads only JSON object blobs (``substr(data, 1, 1) = X'7B'``) on a
+    WAL-visible read-only connection. Returns ``None`` when ``store.db`` is
+    missing, unreadable, or contains zero valid JSON message blobs (e.g.
+    prompt-history-only sessions).
+    """
+    if not store_path or not os.path.isfile(store_path):
+        return None
+    conn = connect_store_ro(store_path)
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT data FROM blobs WHERE substr(data, 1, 1) = X'7B'"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    has_json_blob = False
+    loops = 0
+    for (data,) in rows:
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            continue
+        raw = bytes(data)
+        if not raw.startswith(b"{"):
+            continue
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        has_json_blob = True
+        if obj.get("role") == "assistant":
+            content = obj.get("content")
+            if (isinstance(content, str) and content.strip()) or (
+                isinstance(content, list) and len(content) > 0
+            ):
+                loops += 1
+    return loops if has_json_blob else None
+
+
 def _build_session_info(
     chat_dir: str,
     chat_id: str,
     host: HostExtension | None = None,
+    *,
+    compute_loop_count: bool = True,
 ) -> dict | None:
     meta = _read_json(os.path.join(chat_dir, "meta.json"))
     if not isinstance(meta, dict):
@@ -270,6 +318,14 @@ def _build_session_info(
         if (store_only and not native_title)
         else _fallback_title(native_title, first_user_msg, last_user_msg)
     )
+    extra: dict[str, object] = {}
+    if compute_loop_count:
+        if os.path.isfile(store_db):
+            from sesskit.native_projection import count_loops
+
+            extra["loop_count"] = count_loops("cursor", store_db)
+        else:
+            extra["loop_count"] = None
     return make_session_info(
         source="cursor",
         id=chat_id,
@@ -288,6 +344,7 @@ def _build_session_info(
         last_user_msg=preprocess_excerpt(last_user_msg, host),
         # Cursor 历史里没有独立的「助手最终答复」字段可提取，保持空串。
         completion_id=completion_id,
+        **extra,
     )
 
 
@@ -320,25 +377,37 @@ def scan_signature() -> tuple | None:
     return (stat_signature(paths), live_pid_snapshot("agent"))
 
 
+def _cursor_cache_extra_version(chat_dir: str, host: HostExtension | None) -> str:
+    store_db = os.path.join(chat_dir, "store.db")
+    return repr((
+        file_signature(os.path.join(chat_dir, "prompt_history.json")),
+        file_signature(store_db),
+        # WAL 里的未 checkpoint 写入不会 bump 主库 mtime；签名必须带上。
+        file_signature(store_db + "-wal"),
+        "loop-v1",
+    )) + host_cache_tag(host)
+
+
 def _cached_session_info(
     chat_dir: str,
     chat_id: str,
     host: HostExtension | None,
     cache,
+    *,
+    compute_loop_count: bool = True,
+    cache_put: bool = True,
 ) -> dict | None:
     """One chat's list record through the derived cache (no list filters)."""
     meta_path = os.path.join(chat_dir, "meta.json")
-    store_db = os.path.join(chat_dir, "store.db")
-    extra_version = repr((
-        file_signature(os.path.join(chat_dir, "prompt_history.json")),
-        file_signature(store_db),
-        # WAL 里的未 checkpoint 写入不会 bump 主库 mtime；签名必须带上。
-        file_signature(store_db + "-wal"),
-    )) + host_cache_tag(host)
+    extra_version = _cursor_cache_extra_version(chat_dir, host)
     info = cache.get_session("cursor", meta_path, extra_version)
+    if info is not None and "loop_count" not in info:
+        info = None
     if info is None:
-        info = _build_session_info(chat_dir, chat_id, host)
-        if info is not None:
+        info = _build_session_info(
+            chat_dir, chat_id, host, compute_loop_count=compute_loop_count,
+        )
+        if info is not None and cache_put:
             cache.put_session("cursor", meta_path, info, extra_version)
     return info
 
@@ -390,13 +459,17 @@ def scan_sessions(
         return cached
 
     results: list[dict] = []
+    pending_cache: dict[str, tuple[str, str]] = {}
     host_marker = host.title_prompt_marker if host is not None else None
     host_prefixes = ephemeral_prefixes_for(host)
     session_cache = host.cache if (host is not None and host.cache is not None) else get_cache()
     for _, chat_dir, chat_id in candidates:
         if len(results) >= limit:
             break
-        info = _cached_session_info(chat_dir, chat_id, host, session_cache)
+        info = _cached_session_info(
+            chat_dir, chat_id, host, session_cache,
+            compute_loop_count=False, cache_put=False,
+        )
         if info is None:
             continue
         # 标题生成用 `agent -p` 会落盘会话；用宿主标记拦掉自产噪音。
@@ -415,12 +488,38 @@ def scan_sessions(
             continue
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue
+        if "loop_count" not in info:
+            pending_cache[chat_id] = (
+                os.path.join(chat_dir, "meta.json"),
+                _cursor_cache_extra_version(chat_dir, host),
+            )
         results.append(info)
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
     results = results[:limit]
     if not results:
         return results
+
+    missing_loops = [item for item in results if "loop_count" not in item]
+    if missing_loops:
+        store_items = [
+            item for item in missing_loops if str(item.get("path") or "").endswith("store.db")
+        ]
+        if store_items:
+            from sesskit.native_projection import count_loops_many
+
+            counts = count_loops_many(
+                [("cursor", str(item["path"])) for item in store_items]
+            )
+            for item, count in zip(store_items, counts, strict=True):
+                item["loop_count"] = count
+        for item in missing_loops:
+            if "loop_count" not in item:
+                item["loop_count"] = None
+            cache_entry = pending_cache.get(str(item.get("id") or ""))
+            if cache_entry is not None:
+                meta_path, extra_version = cache_entry
+                session_cache.put_session("cursor", meta_path, item, extra_version)
 
     _apply_live_flags(results, host)
     return results
@@ -678,6 +777,33 @@ def _apply_live_flags(
         if not _resume_id_from_cmdline(cmdlines.get(pid) or ""):
             continue
         bind_pid(pid, allow_resume=True)
+
+
+def model_name_from_blob(obj: dict) -> str | None:
+    """Blob 级 Cursor 模型归因：``content[].providerOptions.cursor.modelName``。
+
+    原生 modelName 只落在（通常空文本、会被跳过的）reasoning 分片上，
+    存活的 text 分片没有；因此按 assistant blob 整体读一次，供该 blob
+    派生的每个存活事件共用。返回值一律是原生verbatim字符串（``-high`` /
+    ``-fast`` 后缀属于模型名本身，绝不解析剥离）；无值时返回 None。
+    Cursor 本地历史里没有显式的 provider 键位，调用方保持 provider=None。
+    """
+    content = obj.get("content") if isinstance(obj, dict) else None
+    if not isinstance(content, list):
+        return None
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        provider_options = part.get("providerOptions")
+        if not isinstance(provider_options, dict):
+            continue
+        cursor_options = provider_options.get("cursor")
+        if not isinstance(cursor_options, dict):
+            continue
+        name = cursor_options.get("modelName")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
 
 
 def _text_from_content(content) -> str:

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/x0c/sesskit/schemas/stats.v1.json",
+  "title": "SessKit Stats Ledger (sesskit.stats/v1)",
+  "description": "Windowed active-time ledger per session or per project (full cwd grouping): bounded numbers, identifiers, and computation evidence only. Never message text, history paths, or credentials. Only load_activity event timestamps inside [since, until] seed intervals (out-of-window records are dropped, never clipped in); intervals merge within active_gap, extend event_tail past each range end, clip to the window, and truncate live sessions at now. Totals cover the full window set before any --top trim; missing stays missing (null), never a fabricated zero.",
+  "type": "object",
+  "required": ["schema", "backend", "window", "by", "totals"],
+  "properties": {
+    "schema": {
+      "const": "sesskit.stats/v1",
+      "description": "Dataset version; the CLI envelope version is separate"
+    },
+    "backend": {
+      "type": "string",
+      "enum": ["real", "stub-degraded"],
+      "description": "Whether aggregation ran on the locked sesskit.stats core (real) or a degraded CLI-local stub (stub-degraded)"
+    },
+    "window": {
+      "type": "object",
+      "required": ["since", "until"],
+      "properties": {
+        "since": { "type": "number", "description": "Requested window start as unix timestamp" },
+        "until": { "type": "number", "description": "Requested window end as unix timestamp" },
+        "since_display": { "type": ["string", "null"] },
+        "until_display": { "type": ["string", "null"] }
+      }
+    },
+    "params": {
+      "type": "object",
+      "description": "Computation evidence: interval-merge inputs actually applied",
+      "properties": {
+        "active_gap": { "type": "number", "minimum": 0 },
+        "event_tail": { "type": "number", "minimum": 0 }
+      }
+    },
+    "by": { "type": "string", "enum": ["session", "project"] },
+    "sessions": {
+      "type": "array",
+      "description": "Present when by is session, sorted by active_seconds descending",
+      "items": { "$ref": "#/$defs/sessionEntry" }
+    },
+    "projects": {
+      "type": "array",
+      "description": "Present when by is project, sorted by active_seconds_sum descending; empty cwd groups under __missing_cwd__",
+      "items": { "$ref": "#/$defs/projectEntry" }
+    },
+    "totals": {
+      "type": "object",
+      "required": ["session_count", "active_seconds_sum", "active_seconds_union"],
+      "description": "Totals cover the full window set, before any --top trim",
+      "properties": {
+        "session_count": { "type": "integer", "minimum": 0 },
+        "active_seconds_sum": { "type": "number", "minimum": 0 },
+        "active_seconds_union": { "type": "number", "minimum": 0 }
+      }
+    },
+    "load_errors": {
+      "type": "array",
+      "description": "Unreadable histories only; readable histories with zero window activity are simply absent",
+      "items": {
+        "type": "object",
+        "required": ["id", "runtime", "error"],
+        "properties": {
+          "id": { "type": "string" },
+          "runtime": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      }
+    },
+    "scan_errors": {
+      "type": "object",
+      "description": "Per-runtime scan failures, if any",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "sessionEntry": {
+      "type": "object",
+      "required": ["runtime", "id", "cwd", "activity_count", "interval_count", "active_seconds"],
+      "properties": {
+        "runtime": { "type": "string" },
+        "id": { "type": "string" },
+        "short_id": { "type": "string" },
+        "cwd": { "type": "string", "description": "Full project working directory (ledger grouping key; never a history path)" },
+        "cwd_display": { "type": "string" },
+        "live": { "type": "boolean" },
+        "activity_count": { "type": "integer", "minimum": 0, "description": "Activity events inside the window" },
+        "interval_count": { "type": "integer", "minimum": 0 },
+        "active_seconds": { "type": "number", "minimum": 0 },
+        "first_at": { "type": ["number", "null"] },
+        "last_at": { "type": ["number", "null"] },
+        "excluded": { "type": ["string", "null"] },
+        "coverage": { "type": "string" }
+      }
+    },
+    "projectEntry": {
+      "type": "object",
+      "required": ["cwd", "session_count", "active_seconds_sum", "active_seconds_union", "peak_concurrency"],
+      "properties": {
+        "cwd": { "type": "string", "description": "Full project working directory (ledger grouping key; never a history path)" },
+        "cwd_display": { "type": ["string", "null"] },
+        "session_count": { "type": "integer", "minimum": 0 },
+        "runtimes": { "type": "array", "items": { "type": "string" } },
+        "active_seconds_sum": { "type": "number", "minimum": 0 },
+        "active_seconds_union": { "type": "number", "minimum": 0 },
+        "peak_concurrency": { "type": "integer", "minimum": 0 },
+        "peak_at": { "type": ["number", "null"] }
+      }
+    }
+  }
+}

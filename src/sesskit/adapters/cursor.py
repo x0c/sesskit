@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from sesskit.adapters.base import (
@@ -16,13 +17,27 @@ from sesskit.models import ActivitySnapshot, Evidence, SessionOutcome
 from sesskit.parsers import cursor as _parser
 
 
+@dataclass(frozen=True)
+class CursorCapabilities(Capabilities):
+    """Cursor capability set: adds per-message model attribution.
+
+    Assistant/thinking activity events carry a natively attributed
+    ``Usage.model`` read verbatim from
+    ``content[].providerOptions.cursor.modelName`` (never parsed, never
+    estimated). Token/cost usage stays unsupported: ``usage_data`` is
+    False and ``load_usage`` keeps the base ``unsupported`` behavior.
+    """
+
+    message_model_attribution: bool = False
+
+
 class CursorAdapter(RuntimeAdapter):
     id = "cursor"
     display_name = "Cursor Agent"
     # Stored rows carry no reliable turn-completion marker (outcome stays
     # unknown) and no native tool-result status; question shapes are
     # normalized where present.
-    capabilities = Capabilities(
+    capabilities = CursorCapabilities(
         typed_activity=True,
         incremental_reading=True,
         structured_questions=True,
@@ -33,6 +48,7 @@ class CursorAdapter(RuntimeAdapter):
         usage_data=False,
         compaction_markers=False,
         message_origin=True,
+        message_model_attribution=True,
     )
 
     def scan(self, limit: int = 50, keep_ids: set[str] | None = None,

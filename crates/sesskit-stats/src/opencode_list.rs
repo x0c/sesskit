@@ -32,6 +32,7 @@ struct SessionAggregate {
     assistant_errors: Vec<Value>,
     last_anchor: String,
     size_bytes: i64,
+    loop_count: u64,
 }
 
 impl SessionAggregate {
@@ -46,6 +47,7 @@ impl SessionAggregate {
             assistant_errors: Vec::new(),
             last_anchor: String::new(),
             size_bytes: 0,
+            loop_count: 0,
         }
     }
 
@@ -63,6 +65,9 @@ impl SessionAggregate {
             }
             "assistant" => {
                 self.last_anchor = format!("{}:{}", row.id, row.seq);
+                if is_valid_assistant_loop(&data) {
+                    self.loop_count += 1;
+                }
                 if let Some(content) = last_text_content(&data) {
                     self.last_agent_message = content;
                 }
@@ -117,6 +122,26 @@ fn string_value(data: &Value, key: &str) -> Value {
         .filter(|value| value.is_string())
         .cloned()
         .unwrap_or(Value::Null)
+}
+
+pub fn is_valid_assistant_raw(raw: &str) -> bool {
+    parse_compact(raw)
+        .map(|data| is_valid_assistant_loop(&data))
+        .unwrap_or(false)
+}
+
+fn is_valid_assistant_loop(data: &Value) -> bool {
+    let has_content = data
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
+    let has_non_error_finish = data
+        .get("finish")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|finish| !finish.is_empty() && finish != "error")
+        && !json_truthy(data.get("error"));
+    has_content || has_non_error_finish
 }
 
 fn json_truthy(value: Option<&Value>) -> bool {
@@ -286,6 +311,7 @@ mod tests {
         assert_eq!(value["last_anchor"], "m3:3");
         assert_eq!(value["status_rows"].as_array().unwrap().len(), 2);
         assert_eq!(value["assistant_errors"][0]["error"]["status"], 429);
+        assert_eq!(value["loop_count"], 2);
         let encoded = value.to_string();
         assert!(!encoded.contains("large"));
         assert!(!encoded.contains("secret"));
