@@ -282,6 +282,131 @@ class PiIncrementalParityTests(_PiBase):
         self.assertIsNone(_refresh(self.path))
         self.assertEqual(pi._entry_cache_stats()["files"], 0)
 
+    def test_compact_cache_drops_tool_and_thinking_payloads_with_full_parity(self) -> None:
+        huge_stdout = "stdout-line-" * 2000
+        huge_thinking = "deep-thought-" * 1000
+        huge_skill = (
+            '<skill name="demo-skill" location="/tmp/demo/SKILL.md">\n'
+            + ("skill-instructions-" * 500)
+            + "\n</skill>\nactual prompt"
+        )
+        rows = [
+            _header("pi-heavy", str(self.root)),
+            _user("u1", None, huge_skill, 1),
+            {
+                "type": "message",
+                "id": "a1",
+                "parentId": "u1",
+                "timestamp": "2026-10-25T04:00:02.000Z",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "toolUse",
+                    "content": [
+                        {"type": "thinking", "thinking": huge_thinking},
+                        {
+                            "type": "toolCall",
+                            "id": "tc1",
+                            "name": "bash",
+                            "arguments": {"command": huge_stdout},
+                        },
+                    ],
+                },
+            },
+            {
+                "type": "message",
+                "id": "tr1",
+                "parentId": "a1",
+                "timestamp": "2026-10-25T04:00:03.000Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "tc1",
+                    "toolName": "bash",
+                    "content": [{"type": "text", "text": huge_stdout}],
+                },
+            },
+            _assistant("a2", "tr1", "done after tool", second=4),
+        ]
+        _write_rows(self.path, rows)
+        refreshed = self.assertParity()
+        self.assertEqual(refreshed["first_user_msg"], "actual prompt")
+        self.assertEqual(refreshed["last_agent_msg"], "done after tool")
+        self.assertEqual(refreshed["loop_count"], 2)
+        self.assertEqual(refreshed["status_tag"], titles.STATUS_DONE)
+
+        state = pi._entry_cache_get(str(self.path))
+        self.assertIsNotNone(state)
+        assert state is not None
+        for entry in state.entries:
+            message = entry.get("message")
+            if isinstance(message, dict):
+                self.assertNotIn("content", message)
+        serialized_cache = json.dumps(list(state.entries))
+        self.assertNotIn("stdout-line-", serialized_cache)
+        self.assertNotIn("deep-thought-", serialized_cache)
+        self.assertNotIn("skill-instructions-", serialized_cache)
+
+        # Verify incremental append after streaming >4096 bytes also matches uncached.
+        _append_rows(self.path, [
+            _user("u2", "a2", "follow up", 5),
+            _assistant("a3", "u2", "final reply", second=6),
+        ])
+        again = self.assertParity()
+        self.assertEqual(again["loop_count"], 3)
+        self.assertEqual(again["last_agent_msg"], "final reply")
+        self.assertGreaterEqual(pi._entry_cache_stats()["append_reads"], 1)
+
+    def test_scan_sessions_caches_only_recent_files(self) -> None:
+        sessions_dir = self.root / "scan-root"
+        sessions_dir.mkdir()
+        stale = sessions_dir / "2026-01-01T00-00-00-000Z_stale-sess.jsonl"
+        fresh = sessions_dir / "2026-10-25T04-00-00-000Z_fresh-sess.jsonl"
+        _write_rows(stale, [
+            _header("stale-sess", str(self.root)),
+            _user("u1", None, "old ask", 1),
+            _assistant("a1", "u1", "old reply", second=2),
+        ])
+        _write_rows(fresh, [
+            _header("fresh-sess", str(self.root)),
+            _user("u1", None, "new ask", 1),
+            _assistant("a1", "u1", "new reply", second=2),
+        ])
+        old_ts = 1_700_000_000.0
+        os.utime(stale, (old_ts, old_ts))
+
+        with mock.patch.object(pi, "SESSIONS_DIR", str(sessions_dir)), \
+                mock.patch.object(pi, "live_processes", return_value=[]):
+            listed = {item["id"]: item for item in pi.scan_sessions(limit=10)}
+        self.assertEqual(set(listed), {"stale-sess", "fresh-sess"})
+        self.assertIsNone(pi._entry_cache_get(str(stale)))
+        self.assertIsNotNone(pi._entry_cache_get(str(fresh)))
+        # Unchanged stale file stays satisfied by _LIST_MEMO without populating _ENTRY_CACHE.
+        self.assertEqual(_refresh(stale), _uncached(stale))
+        self.assertIsNone(pi._entry_cache_get(str(stale)))
+        # Once the stale file appends and is polled via refresh_session, it enters _ENTRY_CACHE.
+        _append_rows(stale, [_user("u2", "a1", "revived ask", 3)])
+        refreshed = _refresh(stale)
+        self.assertEqual(refreshed, _uncached(stale))
+        self.assertIsNotNone(pi._entry_cache_get(str(stale)))
+
+    def test_bare_cr_and_blank_lines_match_uncached(self) -> None:
+        cr_path = self.root / "2026-10-25T04-00-00-000Z_cr-test.jsonl"
+        rows = [
+            _header("cr-test", str(self.root)),
+            _user("u1", None, "cr ask", 1),
+            _assistant("a1", "u1", "cr answer", second=2),
+        ]
+        cr_path.write_bytes(
+            json.dumps(rows[0]).encode()
+            + b"\r"
+            + json.dumps(rows[1]).encode()
+            + b"\n\n"
+            + json.dumps(rows[2]).encode()
+            + b"\n"
+        )
+        refreshed = _refresh(cr_path)
+        self.assertEqual(refreshed, _uncached(cr_path))
+        self.assertIsNone(pi._entry_cache_get(str(cr_path)))
+
 
 _OC_SCHEMA = """
 CREATE TABLE session (

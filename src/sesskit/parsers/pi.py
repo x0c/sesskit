@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -151,25 +152,56 @@ def read_entries(path: str) -> list[dict]:
     return entries
 
 
-# Full Pi entries are large dicts, but the list builder reads only a small
-# stable projection. Keep that projection in the append cache so a hot session
-# does not retain parser-only fields.
+# Full Pi entries are large dicts (tool results, tool arguments, thinking
+# blocks, skill instructions, inline images), but the list builder only reads
+# tree links, timestamps, status fields, user/assistant text and whether an
+# assistant turn produced output. Project only those fields so cached entries
+# never retain raw content payloads.
 _ENTRY_FIELDS = ("type", "id", "parentId", "timestamp", "name", "cwd")
-_MESSAGE_FIELDS = ("role", "content", "stopReason", "errorMessage", "timestamp")
+_MESSAGE_FIELDS = ("role", "stopReason", "errorMessage", "timestamp")
 _ENTRY_HEAD_BYTES = 4096
-_ENTRY_CACHE_MAX_BYTES = 64 * 1024 * 1024
-_ENTRY_CACHE_MAX_FILES = 64
+_ENTRY_CACHE_MAX_BYTES = 8 * 1024 * 1024
+_ENTRY_CACHE_MAX_FILES = 16
+# During broad scan_sessions() passes, only recently active files are admitted
+# into _ENTRY_CACHE; cold historical files stream compact entries once and rely
+# on _LIST_MEMO while refresh_session() continues caching hot polled files.
+_ENTRY_CACHE_SCAN_FRESH_SECONDS = 900.0
 
 
 def _compact_entry(item: dict) -> dict:
-    """Projection used by the list builder and branch walk."""
+    """Minimal projection used by the list builder and branch walk."""
     compact = {key: item[key] for key in _ENTRY_FIELDS if key in item}
     message = item.get("message")
     if isinstance(message, dict):
-        compact["message"] = {
+        compact_msg: dict[str, object] = {
             key: message[key] for key in _MESSAGE_FIELDS if key in message
         }
+        role = message.get("role")
+        content = message.get("content")
+        if role == "user":
+            compact_msg["_user_text"] = user_message_text(content)
+        elif role == "assistant":
+            compact_msg["_assistant_text"] = message_text(content)
+            compact_msg["_has_output"] = _has_assistant_output(content)
+        compact["message"] = compact_msg
     return compact
+
+
+def _read_compact_entries(path: str) -> list[dict]:
+    """Stream-read and compact Pi JSONL entries without retaining raw payloads."""
+    entries: list[dict] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as file:
+            for line in file:
+                try:
+                    item = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(item, dict):
+                    entries.append(_compact_entry(item))
+    except OSError:
+        pass
+    return entries
 
 
 def _parse_entry_lines(lines: list[bytes]) -> tuple[dict, ...]:
@@ -300,54 +332,80 @@ def _entry_stamp(info: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def _build_entry_state(data: bytes, stat: os.stat_result) -> _PiEntryCache | None:
-    last_newline = data.rfind(b"\n")
-    if last_newline >= 0:
-        committed = last_newline + 1
-        raw_lines = data[:committed].split(b"\n")[:-1]
-        tail_raw = data[committed:]
-    else:
-        committed = 0
-        raw_lines = []
-        tail_raw = data
-    head_len = min(_ENTRY_HEAD_BYTES, len(data))
-    return _PiEntryCache(
-        dev=stat.st_dev,
-        ino=stat.st_ino,
-        size=len(data),
-        mtime_ns=stat.st_mtime_ns,
-        ctime_ns=stat.st_ctime_ns,
-        committed=committed,
-        last_line_start=committed - len(raw_lines[-1]) - 1 if raw_lines else committed,
-        head_len=head_len,
-        head_digest=hashlib.sha256(data[:head_len]).digest(),
-        boundary=hashlib.sha256(
-            (raw_lines[-1] + b"\n") if raw_lines else b""
-        ).digest(),
-        entries=_parse_entry_lines(raw_lines),
-        tail=_parse_entry_tail(tail_raw),
-        source_bytes=len(data),
-    )
-
-
 def _read_incremental_entries(path: str) -> tuple[_PiEntryCache | None, list[dict]]:
-    """Read one full state; return the parsed entries for the builder."""
+    """Stream-read one full state; return the projected entries for the builder."""
     global _ENTRY_BYTES_READ, _ENTRY_FULL_PARSES
+    committed = 0
+    last_line_start = 0
+    last_committed_line = b""
+    head_chunks: list[bytes] = []
+    head_len = 0
+    total_bytes = 0
+    entries: list[dict] = []
+    tail_raw = b""
+    has_cr = False
     try:
         before = os.stat(path)
         with open(path, "rb") as handle:
-            data = handle.read()
+            while True:
+                line = handle.readline()
+                if not line:
+                    break
+                line_len = len(line)
+                if head_len < _ENTRY_HEAD_BYTES:
+                    need = _ENTRY_HEAD_BYTES - head_len
+                    chunk = line[:need]
+                    head_chunks.append(chunk)
+                    head_len += len(chunk)
+                if b"\r" in line:
+                    total_bytes += line_len
+                    has_cr = True
+                    break
+                if line.endswith(b"\n"):
+                    last_line_start = committed
+                    last_committed_line = line
+                    committed += line_len
+                    total_bytes += line_len
+                    raw_body = line[:-1]
+                    if raw_body:
+                        try:
+                            item = json.loads(raw_body.decode("utf-8", errors="replace"))
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        else:
+                            if isinstance(item, dict):
+                                entries.append(_compact_entry(item))
+                else:
+                    tail_raw = line
+                    total_bytes += line_len
+                    break
         after = os.stat(path)
     except OSError:
-        return None, read_entries(path)
-    _ENTRY_BYTES_READ += len(data)
-    _ENTRY_FULL_PARSES += 1
-    if b"\r" in data or _entry_stamp(before) != _entry_stamp(after):
+        return None, _read_compact_entries(path)
+    with _ENTRY_CACHE_LOCK:
+        _ENTRY_BYTES_READ += total_bytes
+        _ENTRY_FULL_PARSES += 1
+    if has_cr or _entry_stamp(before) != _entry_stamp(after):
         # Text mode treats bare CR as a line break; the append cache only
         # commits LF boundaries. A racing rewrite is also not cacheable.
-        return None, read_entries(path)
-    state = _build_entry_state(data, after)
-    return state, _state_entries(state) if state is not None else read_entries(path)
+        return None, _read_compact_entries(path)
+    head_bytes = b"".join(head_chunks)
+    state = _PiEntryCache(
+        dev=after.st_dev,
+        ino=after.st_ino,
+        size=total_bytes,
+        mtime_ns=after.st_mtime_ns,
+        ctime_ns=after.st_ctime_ns,
+        committed=committed,
+        last_line_start=last_line_start,
+        head_len=len(head_bytes),
+        head_digest=hashlib.sha256(head_bytes).digest(),
+        boundary=hashlib.sha256(last_committed_line).digest(),
+        entries=tuple(entries),
+        tail=_parse_entry_tail(tail_raw),
+        source_bytes=total_bytes,
+    )
+    return state, _state_entries(state)
 
 
 def _append_entry_state(path: str, stat: os.stat_result, state: _PiEntryCache) -> _PiEntryCache | None:
@@ -366,7 +424,8 @@ def _append_entry_state(path: str, stat: os.stat_result, state: _PiEntryCache) -
         after = os.stat(path)
     except OSError:
         return None
-    _ENTRY_BYTES_READ += len(head) + len(boundary_line) + len(chunk)
+    with _ENTRY_CACHE_LOCK:
+        _ENTRY_BYTES_READ += len(head) + len(boundary_line) + len(chunk)
     if _entry_stamp(after) != _entry_stamp(stat):
         return None
     if hashlib.sha256(head).digest() != state.head_digest:
@@ -375,7 +434,8 @@ def _append_entry_state(path: str, stat: os.stat_result, state: _PiEntryCache) -
         return None
     if len(chunk) != expected or b"\r" in chunk:
         return None
-    _ENTRY_APPEND_READS += 1
+    with _ENTRY_CACHE_LOCK:
+        _ENTRY_APPEND_READS += 1
     last_newline = chunk.rfind(b"\n")
     if last_newline < 0:
         committed = state.committed
@@ -413,20 +473,25 @@ def _append_entry_state(path: str, stat: os.stat_result, state: _PiEntryCache) -
     )
 
 
-def _read_session_entries(path: str) -> list[dict]:
+def _read_session_entries(path: str, *, cache_entries: bool = True) -> list[dict]:
     """Entries for the list builder, reusing a verified appended prefix.
 
     The path lock serializes concurrent refresh/scan calls for one history.
     A state is reused only while the whole-file stamp matches; growth is
     accepted only after the frozen head and last committed line still match.
     Any uncertainty drops the cache and rebuilds from the file.
+
+    When ``cache_entries`` is False (cold historical files during
+    ``scan_sessions``), an already-cached state is still reused if present,
+    while cache misses stream compact entries without admitting the file into
+    ``_ENTRY_CACHE``.
     """
     with _entry_path_lock(path):
         try:
             stat = os.stat(path)
         except OSError:
             _entry_cache_drop(path)
-            return read_entries(path)
+            return _read_compact_entries(path)
         state = _entry_cache_get(path)
         if (
             state is not None
@@ -444,8 +509,12 @@ def _read_session_entries(path: str) -> list[dict]:
                 if appended is not None:
                     _entry_cache_put(path, appended)
                     return _state_entries(appended)
+        if (not cache_entries and state is None) or stat.st_size > _ENTRY_CACHE_MAX_BYTES:
+            if state is not None:
+                _entry_cache_drop(path)
+            return _read_compact_entries(path)
         state, entries = _read_incremental_entries(path)
-        if state is None:
+        if state is None or not cache_entries:
             _entry_cache_drop(path)
         else:
             _entry_cache_put(path, state)
@@ -518,14 +587,19 @@ def count_loops_from_branch(branch: list[dict]) -> int:
     count = 0
     for item in branch:
         message = item.get("message")
-        if isinstance(message, dict) and message.get("role") == "assistant" and _has_assistant_output(message.get("content")):
-            count += 1
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            if "_has_output" in message and "content" not in message:
+                has_output = bool(message["_has_output"])
+            else:
+                has_output = _has_assistant_output(message.get("content"))
+            if has_output:
+                count += 1
     return count
 
 
 def count_loops_from_path(path: str) -> int | None:
     """Count Pi assistant model-decision iterations from a JSONL file."""
-    entries = read_entries(path)
+    entries = _read_compact_entries(path)
     if not entries or entries[0].get("type") != "session" or not str(entries[0].get("id") or ""):
         return None
     return count_loops_from_branch(active_messages(entries))
@@ -540,8 +614,14 @@ _active_messages = active_messages
 def _build_session_info(
     path: str,
     host: HostExtension | None = None,
+    *,
+    cache_entries: bool = True,
 ) -> tuple[SessionInfo, float] | None:
-    return _build_session_info_from_entries(path, _read_session_entries(path), host)
+    return _build_session_info_from_entries(
+        path,
+        _read_session_entries(path, cache_entries=cache_entries),
+        host,
+    )
 
 
 def _build_session_info_from_entries(
@@ -582,7 +662,18 @@ def _build_session_info_from_entries(
     for position, item in enumerate(branch):
         message = item["message"]
         role = message.get("role")
-        text = user_message_text(message.get("content")) if role == "user" else _text(message.get("content"))
+        if role == "user":
+            if "_user_text" in message and "content" not in message:
+                text = str(message["_user_text"] or "")
+            else:
+                text = user_message_text(message.get("content"))
+        elif role == "assistant":
+            if "_assistant_text" in message and "content" not in message:
+                text = str(message["_assistant_text"] or "")
+            else:
+                text = _text(message.get("content"))
+        else:
+            text = ""
         timestamp = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
         if timestamp is not None:
             event_time = timestamp
@@ -696,6 +787,8 @@ def _memoized_session_info(
     path: str,
     stamp: tuple[int, int, int, int],
     host: HostExtension | None,
+    *,
+    cache_entries: bool = True,
 ) -> tuple[SessionInfo, float] | None:
     """``_build_session_info`` reused while the file stamp and host inputs match.
 
@@ -706,7 +799,7 @@ def _memoized_session_info(
     cached = _LIST_MEMO.get(path, version)
     if cached is not MEMO_MISS:
         return cached  # type: ignore[return-value]
-    built = _build_session_info(path, host)
+    built = _build_session_info(path, host, cache_entries=cache_entries)
     _LIST_MEMO.put(path, version, built)
     return built
 
@@ -743,7 +836,8 @@ def scan_sessions(
     heap_kept = 0
     isolated_kept = 0
     seen_ids: set[str] = set()
-    for _mtime, path, stamp in sorted(candidates, reverse=True):
+    now = time.time()
+    for file_mtime, path, stamp in sorted(candidates, reverse=True):
         isolated = bool(is_isolation_dir(os.path.dirname(path)))
         over_quota = isolated_kept >= limit if isolated else heap_kept >= limit
         file_id = _session_id_from_path(path) or ""
@@ -751,7 +845,8 @@ def scan_sessions(
             if heap_kept >= limit and isolated_kept >= limit and not keep_ids:
                 break
             continue
-        built = _memoized_session_info(path, stamp, host)
+        cache_entries = (now - file_mtime) <= _ENTRY_CACHE_SCAN_FRESH_SECONDS
+        built = _memoized_session_info(path, stamp, host, cache_entries=cache_entries)
         if built is None:
             continue
         info, created = built
