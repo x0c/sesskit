@@ -37,8 +37,22 @@ fn is_matched_skill_command(text: &str) -> bool {
     clean_name == clean_msg || bare_name == bare_msg
 }
 
+/// Non-empty `<command-args>` inside a leading `<command-name>/...</command-name>` wrapper
+/// carries a real human prompt even when `<command-message>` is absent (`parsers/claude.py`).
+fn has_command_wrapper_args(text: &str) -> bool {
+    if !(text.starts_with("<command-name>") || text.starts_with("<command-message>")) {
+        return false;
+    }
+    let Some(name) = extract_tag(text, "<command-name>", "</command-name>") else { return false };
+    if !name.starts_with('/') || name.len() <= 1 || name.chars().any(char::is_whitespace) {
+        return false;
+    }
+    extract_tag(text, "<command-args>", "</command-args>").is_some_and(|args| !args.is_empty())
+}
+
 /// A real human prompt: non-meta user row with text outside local-command wrappers
-/// (matched `<command-name>` + `<command-message>` skill commands count as prompts).
+/// (matched `<command-name>` + `<command-message>` skill commands and command wrappers
+/// with non-empty `<command-args>` count as prompts).
 fn is_user_prompt(entry: &Value) -> bool {
     if entry.get("type").and_then(Value::as_str) != Some("user") || truthy(entry.get("isMeta")) {
         return false;
@@ -47,7 +61,7 @@ fn is_user_prompt(entry: &Value) -> bool {
     if text.is_empty() || text.starts_with("Base directory for this skill:") {
         return false;
     }
-    if is_matched_skill_command(&text) {
+    if is_matched_skill_command(&text) || has_command_wrapper_args(&text) {
         return true;
     }
     !SKIP_PREFIXES.iter().any(|p| text.starts_with(p))
@@ -253,6 +267,12 @@ mod tests {
         )
         .unwrap();
         assert!(is_user_prompt(&skill_cmd));
+
+        let plan_with_args: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/plan</command-name>\n<command-args>add upload support</command-args>"}}"#,
+        )
+        .unwrap();
+        assert!(is_user_prompt(&plan_with_args));
 
         let local_cmd: Value = serde_json::from_str(
             r#"{"type":"user","message":{"role":"user","content":"<command-name>/cost</command-name>"}}"#,

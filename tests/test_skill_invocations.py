@@ -128,6 +128,13 @@ def test_claude_explicit_builtin_passive_and_is_meta_list_exclusion(tmp_path):
     assert claude.extract_text("Also check <command-args>literal</command-args> and docs") == (
         "Also check <command-args>literal</command-args> and docs"
     )
+    # Leading <command-name> + non-empty <command-args> without <command-message>
+    # preserves user task text while emitting no skill invocation.
+    wrapper_without_msg = "<command-name>/plan</command-name>\n<command-args>@app add upload support</command-args>"
+    assert claude.parse_user_skill_command(wrapper_without_msg) is None
+    assert claude.extract_text(wrapper_without_msg) == "@app add upload support"
+    assert claude.extract_text("<command-name>/cost</command-name>") is None
+    assert claude.extract_text("<command-name>/cost</command-name>\n<command-args></command-args>") is None
     # Non-isMeta Base directory expansion must NOT look like human input.
     assert claude.extract_text("Base directory for this skill: /skills/x\nBody") is None
 

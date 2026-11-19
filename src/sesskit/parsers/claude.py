@@ -138,12 +138,35 @@ def parse_skill_listing(entry: object) -> list[str]:
     return names
 
 
+def _extract_command_wrapper_args(content) -> str | None:
+    """Extract non-empty ``<command-args>`` from a leading ``<command-name>`` wrapper.
+
+    Handles Claude slash-command records such as ``/plan`` that carry
+    ``<command-name>`` + ``<command-args>`` without ``<command-message>``:
+    ordinary prose containing ``<command-args>`` never starts with a command
+    tag, and bare local-command echoes have no non-empty arguments.
+    """
+    t = _join_content_text(content)
+    if not t or not t.startswith(("<command-name>", "<command-message>")):
+        return None
+    if not re.search(r"<command-name>/[^<>\s]+</command-name>", t):
+        return None
+    args_m = re.search(r"<command-args>(.*?)</command-args>", t, re.DOTALL)
+    if not args_m:
+        return None
+    args = args_m.group(1).strip()
+    return args or None
+
+
 def extract_text(content) -> str | None:
     """从消息 content 中提取纯文本，跳过本地命令回显与注入技能正文。"""
     parsed_cmd = parse_user_skill_command(content)
     if parsed_cmd is not None:
         cmd_name, args = parsed_cmd
         return args or f"/{cmd_name}"
+    wrapper_args = _extract_command_wrapper_args(content)
+    if wrapper_args is not None:
+        return wrapper_args
     if isinstance(content, str):
         t = content.strip()
         if not t:
