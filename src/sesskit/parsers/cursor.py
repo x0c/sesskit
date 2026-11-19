@@ -39,6 +39,7 @@ from sesskit.parsers.common import (
     is_ephemeral_agent_cwd,
     live_pid_snapshot,
     live_processes,
+    make_ephemeral_checker,
     preprocess_excerpt,
     process_command_line,
     process_environ,
@@ -395,6 +396,36 @@ def _cursor_cache_extra_version(chat_dir: str, host: HostExtension | None) -> st
     )) + host_cache_tag(host)
 
 
+def _load_or_build_session_info(
+    chat_dir: str,
+    chat_id: str,
+    host: HostExtension | None,
+    cache,
+    *,
+    compute_loop_count: bool = True,
+    require_loop_count: bool = True,
+    cache_put: bool = True,
+) -> tuple[dict | None, bool, str, str]:
+    """One chat's list record through the derived cache (returns ``(info, built_fresh, meta_path, extra_version)``)."""
+    meta_path = os.path.join(chat_dir, "meta.json")
+    extra_version = _cursor_cache_extra_version(chat_dir, host)
+    info = cache.get_session("cursor", meta_path, extra_version) if cache is not None else None
+    if isinstance(info, dict) and info.get("_empty"):
+        return None, False, meta_path, extra_version
+    if info is not None and require_loop_count and "loop_count" not in info:
+        info = None
+    built_fresh = False
+    if info is None:
+        info = _build_session_info(
+            chat_dir, chat_id, host, compute_loop_count=compute_loop_count,
+        )
+        built_fresh = True
+        if cache is not None and (cache_put or info is None):
+            payload = {"_empty": True} if info is None else {**info, "live": False, "pid": None}
+            cache.put_session("cursor", meta_path, payload, extra_version)
+    return info, built_fresh, meta_path, extra_version
+
+
 def _cached_session_info(
     chat_dir: str,
     chat_id: str,
@@ -405,17 +436,15 @@ def _cached_session_info(
     cache_put: bool = True,
 ) -> dict | None:
     """One chat's list record through the derived cache (no list filters)."""
-    meta_path = os.path.join(chat_dir, "meta.json")
-    extra_version = _cursor_cache_extra_version(chat_dir, host)
-    info = cache.get_session("cursor", meta_path, extra_version)
-    if info is not None and "loop_count" not in info:
-        info = None
-    if info is None:
-        info = _build_session_info(
-            chat_dir, chat_id, host, compute_loop_count=compute_loop_count,
-        )
-        if info is not None and cache_put:
-            cache.put_session("cursor", meta_path, info, extra_version)
+    info, _built_fresh, _meta_path, _extra_version = _load_or_build_session_info(
+        chat_dir,
+        chat_id,
+        host,
+        cache,
+        compute_loop_count=compute_loop_count,
+        require_loop_count=True,
+        cache_put=cache_put,
+    )
     return info
 
 
@@ -468,14 +497,19 @@ def scan_sessions(
     results: list[dict] = []
     pending_cache: dict[str, tuple[str, str]] = {}
     host_marker = host.title_prompt_marker if host is not None else None
-    host_prefixes = ephemeral_prefixes_for(host)
+    ephemeral_check = make_ephemeral_checker(ephemeral_prefixes_for(host), fn=is_ephemeral_agent_cwd)
     session_cache = host.cache if (host is not None and host.cache is not None) else get_cache()
     for _, chat_dir, chat_id in candidates:
         if len(results) >= limit:
             break
-        info = _cached_session_info(
-            chat_dir, chat_id, host, session_cache,
-            compute_loop_count=False, cache_put=False,
+        info, built_fresh, meta_path, extra_version = _load_or_build_session_info(
+            chat_dir,
+            chat_id,
+            host,
+            session_cache,
+            compute_loop_count=False,
+            require_loop_count=False,
+            cache_put=False,
         )
         if info is None:
             continue
@@ -483,23 +517,22 @@ def scan_sessions(
         first_user = str(info.get("first_user_msg") or "")
         fallback = str(info.get("fallback_title") or "")
         native = str(info.get("native_title") or "")
-        if (
+        filtered = (
             titles.is_title_generation_prompt(first_user, marker=host_marker)
             or titles.is_title_generation_prompt(fallback, marker=host_marker)
             or titles.is_title_generation_prompt(native, marker=host_marker)
-        ):
-            continue
-        if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
-            continue  # 宿主声明的临时 cwd，目录复活会刷屏
-        if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
-            continue
-        if cwd_filter and not info["cwd"].startswith(cwd_filter):
+            or ephemeral_check(info["cwd"])
+            or bool(info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]))
+            or bool(cwd_filter and not info["cwd"].startswith(cwd_filter))
+        )
+        if filtered:
+            if built_fresh:
+                session_cache.put_session(
+                    "cursor", meta_path, {**info, "live": False, "pid": None}, extra_version,
+                )
             continue
         if "loop_count" not in info:
-            pending_cache[chat_id] = (
-                os.path.join(chat_dir, "meta.json"),
-                _cursor_cache_extra_version(chat_dir, host),
-            )
+            pending_cache[chat_id] = (meta_path, extra_version)
         results.append(info)
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
@@ -526,7 +559,9 @@ def scan_sessions(
             cache_entry = pending_cache.get(str(item.get("id") or ""))
             if cache_entry is not None:
                 meta_path, extra_version = cache_entry
-                session_cache.put_session("cursor", meta_path, item, extra_version)
+                session_cache.put_session(
+                    "cursor", meta_path, {**item, "live": False, "pid": None}, extra_version,
+                )
 
     _apply_live_flags(results, host)
     return results
@@ -549,7 +584,26 @@ def refresh_session(
         return None
     chat_id = str(session.get("id") or "") or os.path.basename(chat_dir)
     cache = host.cache if (host is not None and host.cache is not None) else get_cache()
-    return _cached_session_info(chat_dir, chat_id, host, cache)
+    info, built_fresh, meta_path, extra_version = _load_or_build_session_info(
+        chat_dir,
+        chat_id,
+        host,
+        cache,
+        compute_loop_count=True,
+        require_loop_count=False,
+        cache_put=True,
+    )
+    if info is not None and not built_fresh and "loop_count" not in info:
+        if str(info.get("path") or "").endswith("store.db"):
+            from sesskit.native_projection import count_loops
+
+            info["loop_count"] = count_loops("cursor", str(info["path"]))
+        else:
+            info["loop_count"] = None
+        cache.put_session(
+            "cursor", meta_path, {**info, "live": False, "pid": None}, extra_version,
+        )
+    return info
 
 
 def _resume_id_from_cmdline(cmdline: str) -> str | None:

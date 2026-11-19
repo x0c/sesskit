@@ -7,9 +7,219 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+struct Sha256 {
+    state: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_len: u64,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+            ],
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_len: 0,
+        }
+    }
+
+    fn compress(state: &mut [u32; 8], block: &[u8]) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            let j = i * 4;
+            w[i] = u32::from_be_bytes([block[j], block[j + 1], block[j + 2], block[j + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len == 64 {
+                Self::compress(&mut self.state, &self.buf);
+                self.buf_len = 0;
+            }
+        }
+        while data.len() >= 64 {
+            Self::compress(&mut self.state, &data[..64]);
+            data = &data[64..];
+        }
+        if !data.is_empty() {
+            self.buf[..data.len()].copy_from_slice(data);
+            self.buf_len = data.len();
+        }
+    }
+
+    fn finalize_hex(mut self) -> String {
+        let bit_len = self.total_len.wrapping_mul(8);
+        self.update(&[0x80]);
+        if self.buf_len > 56 {
+            self.buf[self.buf_len..64].fill(0);
+            Self::compress(&mut self.state, &self.buf);
+            self.buf_len = 0;
+        }
+        self.buf[self.buf_len..56].fill(0);
+        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        Self::compress(&mut self.state, &self.buf);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(64);
+        for word in self.state {
+            for byte in word.to_be_bytes() {
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+        out
+    }
+}
+
+/// Read-only list-signature fingerprint across OpenCode's four tracked tables.
+pub fn content_fingerprint(db_path: &Path) -> Result<Vec<(String, u64, String)>, String> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| error.to_string())?;
+    conn.busy_timeout(Duration::from_millis(500))
+        .map_err(|error| error.to_string())?;
+    let _ = conn.execute_batch("PRAGMA query_only = ON; PRAGMA mmap_size = 4294967296;");
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let len_fn = if rusqlite::version_number() >= 3_043_000 {
+        "octet_length"
+    } else {
+        "length"
+    };
+    let queries = [
+        (
+            "session",
+            "SELECT \"id\", \"directory\", \"title\", \"time_created\", \"time_updated\", \
+             \"parent_id\", \"time_archived\" FROM \"session\" ORDER BY \"id\""
+                .to_owned(),
+            7usize,
+        ),
+        (
+            "session_v2",
+            "SELECT \"id\", \"directory\", \"title\", \"time_created\", \"time_updated\", \
+             \"parent_id\", \"time_archived\" FROM \"session_v2\" ORDER BY \"id\""
+                .to_owned(),
+            7usize,
+        ),
+        (
+            "message",
+            format!(
+                "SELECT \"id\", \"session_id\", \"time_created\", \"time_updated\", \
+                 {len_fn}(\"data\") FROM \"message\" ORDER BY \"id\""
+            ),
+            5usize,
+        ),
+        (
+            "session_message",
+            format!(
+                "SELECT \"id\", \"session_id\", \"type\", \"seq\", \"time_created\", \
+                 \"time_updated\", {len_fn}(\"data\") FROM \"session_message\" ORDER BY \"id\""
+            ),
+            7usize,
+        ),
+    ];
+    let mut out = Vec::with_capacity(queries.len());
+    for (table, sql, ncols) in &queries {
+        let mut stmt = tx.prepare(sql).map_err(|error| error.to_string())?;
+        let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
+        let mut digest = Sha256::new();
+        let mut row_count: u64 = 0;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            for col in 0..*ncols {
+                match row.get_ref(col).map_err(|error| error.to_string())? {
+                    ValueRef::Null => digest.update(&[0x00]),
+                    ValueRef::Integer(v) => {
+                        digest.update(&[0x01]);
+                        digest.update(&v.to_le_bytes());
+                    }
+                    ValueRef::Real(v) => {
+                        digest.update(&[0x02]);
+                        digest.update(&v.to_bits().to_le_bytes());
+                    }
+                    ValueRef::Text(b) => {
+                        digest.update(&[0x03]);
+                        digest.update(&(b.len() as u64).to_le_bytes());
+                        digest.update(b);
+                    }
+                    ValueRef::Blob(b) => {
+                        digest.update(&[0x04]);
+                        digest.update(&(b.len() as u64).to_le_bytes());
+                        digest.update(b);
+                    }
+                }
+            }
+            digest.update(&[0xff]);
+            row_count += 1;
+        }
+        out.push(((*table).to_owned(), row_count, digest.finalize_hex()));
+    }
+    drop(tx);
+    Ok(out)
+}
 
 const SKIP_TYPES: [&str; 4] = ["system", "synthetic", "compaction", "idle"];
 
@@ -348,5 +558,66 @@ mod tests {
             data_length: 1,
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sha256_matches_nist_vectors() {
+        let h_empty = Sha256::new().finalize_hex();
+        assert_eq!(
+            h_empty,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let mut h_abc = Sha256::new();
+        h_abc.update(b"abc");
+        assert_eq!(
+            h_abc.finalize_hex(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let mut h_2blk = Sha256::new();
+        h_2blk.update(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+        assert_eq!(
+            h_2blk.finalize_hex(),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn content_fingerprint_tracks_mutations_and_ignores_part() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("sesskit_fp_{}_{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER, parent_id TEXT, time_archived INTEGER);
+             CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, parent_id TEXT, time_archived INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             INSERT INTO session_v2 VALUES ('s1', '/tmp', 't', 10, 20, NULL, NULL);
+             INSERT INTO session_message VALUES ('m1', 's1', 'user', 0, 10, 20, '{\"text\":\"hi\"}');
+             INSERT INTO part VALUES ('p1', 'abc');",
+        )
+        .unwrap();
+        let fp1 = content_fingerprint(&db).unwrap();
+        assert_eq!(fp1[1].1, 1);
+        assert_eq!(fp1[3].1, 1);
+        conn.execute("UPDATE part SET data = 'longer-part-payload'", [])
+            .unwrap();
+        let fp2 = content_fingerprint(&db).unwrap();
+        assert_eq!(fp1, fp2);
+        conn.execute(
+            "UPDATE session_message SET data = '{\"text\":\"longer\"}' WHERE id = 'm1'",
+            [],
+        )
+        .unwrap();
+        let fp3 = content_fingerprint(&db).unwrap();
+        assert_ne!(fp2, fp3);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

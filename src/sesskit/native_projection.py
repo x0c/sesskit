@@ -63,6 +63,30 @@ def project_opencode_sessions(db_path: str, session_ids: list[str]) -> dict | No
     return result if isinstance(result, dict) else None
 
 
+def opencode_content_fingerprint(db_path: str) -> tuple[bool, tuple | None]:
+    """Compute list-driving OpenCode DB fingerprint natively when available.
+
+    Returns ``(handled, fingerprint)`` so SQLite busy/missing-schema failures in
+    native code report ``(True, None)`` and fall straight back to mtime without
+    repeating the failing query in Python.
+    """
+    backend = _backend()
+    if backend is None:
+        return False, None
+    fn = getattr(backend, "opencode_content_fingerprint", None)
+    if fn is None:
+        return False, None
+    try:
+        raw = fn(db_path)
+    except RuntimeError:
+        return True, None
+    except (AttributeError, UnicodeError, TypeError, ValueError):
+        return False, None
+    if not isinstance(raw, list):
+        return False, None
+    return True, tuple((str(table), int(count), str(digest)) for table, count, digest in raw)
+
+
 def _python_count_loops(runtime: str, path: str) -> int | None:
     if runtime == "claude":
         from sesskit.parsers.claude import count_loops_from_path

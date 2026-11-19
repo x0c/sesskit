@@ -140,8 +140,45 @@ def host_cache_tag(host: HostExtension | None) -> str:
     ))
 
 
+def persistable_host_tag(host: HostExtension | None) -> str | None:
+    """Return a disk-safe host version tag, or None when non-persistable.
+
+    Transforms backed by closures or lambdas (typically unit tests) cannot
+    be uniquely named across calls/processes and stay L1-only.
+    """
+    if host is None:
+        return ""
+    base = host_cache_tag(host)
+    fn = host.excerpt_preprocess
+    if fn is None:
+        return base
+    qual = getattr(fn, "__qualname__", "") or ""
+    mod = getattr(fn, "__module__", "") or ""
+    if not qual or "<locals>" in qual or "<lambda>" in qual:
+        return None
+    return f"{base}|tx={mod}.{qual}"
+
+
 MEMO_MISS = object()
 """Sentinel returned by :meth:`ListRecordMemo.get` when no current record exists."""
+
+_MEMO_SCALAR_TYPES = frozenset((type(None), bool, int, float, str, bytes))
+
+
+def _copy_memo_value(value: object) -> object:
+    """Fast recursive copy for JSON-shaped list records without deepcopy overhead."""
+    value_type = type(value)
+    if value_type in _MEMO_SCALAR_TYPES:
+        return value
+    if value_type is dict:
+        if all(type(item) in _MEMO_SCALAR_TYPES for item in value.values()):  # type: ignore[union-attr]
+            return dict(value)  # type: ignore[arg-type]
+        return {key: _copy_memo_value(item) for key, item in value.items()}  # type: ignore[union-attr]
+    if value_type is list:
+        return [_copy_memo_value(item) for item in value]  # type: ignore[attr-defined]
+    if value_type is tuple:
+        return tuple(_copy_memo_value(item) for item in value)  # type: ignore[attr-defined]
+    return copy.deepcopy(value)
 
 
 class ListRecordMemo:
@@ -151,7 +188,7 @@ class ListRecordMemo:
     one of them changes. ``version`` must capture every input the builder reads
     (native source stamps plus :meth:`host_key`); a mismatch is a miss, so a
     stale record can never be returned. ``None`` results are memoized too.
-    Values are deep-copied in both directions because callers mutate records.
+    Values are safely copied in both directions because callers mutate records.
     """
 
     def __init__(self, limit: int = 4096) -> None:
@@ -171,10 +208,10 @@ class ListRecordMemo:
                 return MEMO_MISS
             self._entries.move_to_end(key)
             value = entry[1]
-        return copy.deepcopy(value)
+        return _copy_memo_value(value)
 
     def put(self, key: object, version: object, value: object) -> None:
-        stored = copy.deepcopy(value)
+        stored = _copy_memo_value(value)
         with self._lock:
             self._entries[key] = (version, stored)
             self._entries.move_to_end(key)
@@ -254,6 +291,26 @@ def is_ephemeral_agent_cwd(cwd: str, *, extra_prefixes: tuple[str, ...] | None =
     ):
         return True
     return _has_ephemeral_marker(cwd)
+
+
+def make_ephemeral_checker(
+    extra_prefixes: tuple[str, ...] | None = None,
+    *,
+    fn: Callable[..., bool] | None = None,
+) -> Callable[[str], bool]:
+    """Per-scan memoized wrapper around :func:`is_ephemeral_agent_cwd`."""
+    check_fn = is_ephemeral_agent_cwd if fn is None else fn
+    memo: dict[str, bool] = {}
+
+    def check(cwd: str) -> bool:
+        cached = memo.get(cwd)
+        if cached is not None:
+            return cached
+        result = check_fn(cwd, extra_prefixes=extra_prefixes)
+        memo[cwd] = result
+        return result
+
+    return check
 
 
 def _has_ephemeral_marker(cwd: str) -> bool:
@@ -571,17 +628,26 @@ def stat_signature(paths) -> tuple[tuple[str, int, int], ...]:
 _LIVE_CWD_CACHE: dict[str, tuple[tuple[int, ...], list[tuple[int, str]]]] = {}
 _PROC_CMDLINE_CACHE: dict[int, str] = {}
 _PROC_ENVIRON_CACHE: dict[int, dict[str, str]] = {}
+_PROC_ENVIRON_QUERIED: dict[int, set[str]] = {}
+_PROC_START_TIME_CACHE: dict[int, float] = {}
 _LIVE_PIDS_BY_NAME: dict[str, frozenset[int]] = {}
 
 
+def _is_tracked_live_pid(pid: int) -> bool:
+    return any(pid in pids for pids in _LIVE_PIDS_BY_NAME.values())
+
+
 def _track_live_pids(process_name: str, pids: list[int]) -> None:
-    """记下本轮仍活着的 pid；离开集合的进程丢掉命令行/环境缓存，避免 pid 复用串味。"""
+    """记下本轮仍活着的 pid；离开集合的进程丢掉命令行/环境/启动时间缓存，避免 pid 复用串味。"""
     current = frozenset(pids)
     previous = _LIVE_PIDS_BY_NAME.get(process_name, frozenset())
-    for pid in previous - current:
-        _PROC_CMDLINE_CACHE.pop(pid, None)
-        _PROC_ENVIRON_CACHE.pop(pid, None)
     _LIVE_PIDS_BY_NAME[process_name] = current
+    for pid in previous - current:
+        if not _is_tracked_live_pid(pid):
+            _PROC_CMDLINE_CACHE.pop(pid, None)
+            _PROC_ENVIRON_CACHE.pop(pid, None)
+            _PROC_ENVIRON_QUERIED.pop(pid, None)
+            _PROC_START_TIME_CACHE.pop(pid, None)
 
 
 def clear_live_cwd_cache() -> None:
@@ -589,6 +655,8 @@ def clear_live_cwd_cache() -> None:
     _LIVE_CWD_CACHE.clear()
     _PROC_CMDLINE_CACHE.clear()
     _PROC_ENVIRON_CACHE.clear()
+    _PROC_ENVIRON_QUERIED.clear()
+    _PROC_START_TIME_CACHE.clear()
     _LIVE_PIDS_BY_NAME.clear()
     clear_ps_cmdline_cache()
 
@@ -692,7 +760,13 @@ def process_start_time(pid: int) -> float | None:
     """进程启动的 unix 时间戳；失败返回 None。
 
     macOS 的 ``ps`` 没有 ``etimes``，统一解析 ``etime``（两端都有）。
+    仅对本轮存活进程列表跟踪中的 pid 启用进程级启动时间缓存。
     """
+    tracked = _is_tracked_live_pid(pid)
+    if tracked:
+        cached = _PROC_START_TIME_CACHE.get(pid)
+        if cached is not None:
+            return cached
     try:
         out = subprocess.check_output(
             ["ps", "-p", str(pid), "-o", "etime="],
@@ -703,7 +777,10 @@ def process_start_time(pid: int) -> float | None:
     elapsed = _etime_seconds(out)
     if elapsed is None:
         return None
-    return time.time() - elapsed
+    started = time.time() - elapsed
+    if tracked and _is_tracked_live_pid(pid):
+        _PROC_START_TIME_CACHE[pid] = started
+    return started
 
 
 def process_start_times(pids: list[int]) -> dict[int, float]:
@@ -715,28 +792,43 @@ def process_start_times(pids: list[int]) -> dict[int, float]:
     unique = list(dict.fromkeys(pids))
     if not unique:
         return {}
-    if len(unique) == 1:
-        started = process_start_time(unique[0])
-        return {unique[0]: started} if started is not None else {}
+    result: dict[int, float] = {}
+    missing: list[int] = []
+    for pid in unique:
+        if _is_tracked_live_pid(pid) and pid in _PROC_START_TIME_CACHE:
+            result[pid] = _PROC_START_TIME_CACHE[pid]
+        else:
+            missing.append(pid)
+    if not missing:
+        return result
+    if len(missing) == 1:
+        pid = missing[0]
+        started = process_start_time(pid)
+        if started is not None:
+            result[pid] = started
+        return result
     try:
         out = subprocess.check_output(
-            ["ps", "-p", ",".join(str(pid) for pid in unique), "-o", "pid=,etime="],
+            ["ps", "-p", ",".join(str(pid) for pid in missing), "-o", "pid=,etime="],
             stderr=subprocess.DEVNULL,
         ).decode(errors="replace")
     except (OSError, subprocess.CalledProcessError, FileNotFoundError):
-        return {}
+        return result
     now = time.time()
-    result: dict[int, float] = {}
+    missing_set = set(missing)
     for line in out.splitlines():
         parts = line.strip().split(None, 1)
         if len(parts) != 2 or not parts[0].isdigit():
             continue
         pid = int(parts[0])
-        if pid not in unique:
+        if pid not in missing_set:
             continue
         elapsed = _etime_seconds(parts[1])
         if elapsed is not None:
-            result[pid] = now - elapsed
+            started = now - elapsed
+            result[pid] = started
+            if _is_tracked_live_pid(pid):
+                _PROC_START_TIME_CACHE[pid] = started
     return result
 
 
@@ -805,6 +897,29 @@ def _extract_wanted_environment(out: str, wanted: tuple[str, ...], env: dict[str
         env[key] = out[start:end]
 
 
+def _environ_cache_hit(pid: int, wanted: tuple[str, ...]) -> dict[str, str] | None:
+    cached = _PROC_ENVIRON_CACHE.get(pid)
+    if cached is None:
+        return None
+    wanted_set = set(wanted)
+    queried = _PROC_ENVIRON_QUERIED.get(pid)
+    if wanted_set <= set(cached) or (queried is not None and wanted_set <= queried):
+        return {key: cached[key] for key in wanted if key in cached}
+    return None
+
+
+def _record_environ_cache(
+    pid: int,
+    env: dict[str, str],
+    wanted: tuple[str, ...],
+    *,
+    had_cached: bool,
+) -> None:
+    _PROC_ENVIRON_CACHE[pid] = env
+    prev = _PROC_ENVIRON_QUERIED.get(pid) if had_cached else None
+    _PROC_ENVIRON_QUERIED[pid] = (prev or set()) | set(wanted)
+
+
 def process_environ(
     pid: int,
     *,
@@ -815,18 +930,19 @@ def process_environ(
     始终读取通用键（``SESSKIT_*``、运行时原生目录键）；宿主键由调用方经
     ``extra_keys``（来自其扩展）显式声明。Linux 读 ``/proc/<pid>/environ``
     返回全量环境；macOS 用 ``ps eww``（输出混在命令行尾部）只提取所需键。
-    同一 pid 在仍存活期间复用上一轮结果（macOS 按已提取键集的并集缓存）。
+    同一 pid 在仍存活期间复用上一轮结果（macOS 按已查询声明键集的并集缓存）。
     """
     wanted = tuple(dict.fromkeys((*GENERIC_ENV_KEYS, *(extra_keys or ()))))
+    hit = _environ_cache_hit(pid, wanted)
+    if hit is not None:
+        return hit
     cached = _PROC_ENVIRON_CACHE.get(pid)
-    if cached is not None and set(wanted) <= set(cached):
-        return {key: cached[key] for key in wanted if key in cached}
     try:
         if sys.platform.startswith("linux"):
             with open(f"/proc/{pid}/environ", "rb") as f:
                 raw = f.read()
             if not raw:
-                _PROC_ENVIRON_CACHE[pid] = {}
+                _record_environ_cache(pid, {}, wanted, had_cached=False)
                 return {}
             env: dict[str, str] = {}
             for item in raw.split(b"\x00"):
@@ -834,7 +950,7 @@ def process_environ(
                     continue
                 key, value = item.decode(errors="replace").split("=", 1)
                 env[key] = value
-            _PROC_ENVIRON_CACHE[pid] = env
+            _record_environ_cache(pid, env, wanted, had_cached=False)
             return dict(env)
         out = subprocess.check_output(
             ["ps", "eww", "-p", str(pid)],
@@ -846,7 +962,7 @@ def process_environ(
     env = dict(cached) if cached is not None else {}
     # ps eww 把环境变量拼在同一行；只提取调用方声明的键，避免把命令参数误当环境。
     _extract_wanted_environment(out, wanted, env)
-    _PROC_ENVIRON_CACHE[pid] = env
+    _record_environ_cache(pid, env, wanted, had_cached=(cached is not None))
     return {key: env[key] for key in wanted if key in env}
 
 
@@ -871,9 +987,9 @@ def process_environs(
     result: dict[int, dict[str, str]] = {}
     missing: list[int] = []
     for pid in unique:
-        cached = _PROC_ENVIRON_CACHE.get(pid)
-        if cached is not None and set(wanted) <= set(cached):
-            result[pid] = {key: cached[key] for key in wanted if key in cached}
+        hit = _environ_cache_hit(pid, wanted)
+        if hit is not None:
+            result[pid] = hit
         else:
             missing.append(pid)
     if not missing:
@@ -906,7 +1022,7 @@ def process_environs(
         cached = _PROC_ENVIRON_CACHE.get(pid)
         env = dict(cached) if cached is not None else {}
         _extract_wanted_environment(segments.get(pid, ""), wanted, env)
-        _PROC_ENVIRON_CACHE[pid] = env
+        _record_environ_cache(pid, env, wanted, had_cached=(cached is not None))
         result[pid] = {key: env[key] for key in wanted if key in env}
     return result
 

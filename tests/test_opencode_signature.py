@@ -462,6 +462,40 @@ class SignatureTests(unittest.TestCase):
         self.assertNotEqual(stable_signature, unstable_signature)
         self.assertIn(self.db_path, oc._SIGNATURE_FINGERPRINT_CACHE)
 
+    def test_native_fingerprint_tracks_content_and_falls_back_when_schema_missing(self):
+        oc._SIGNATURE_FINGERPRINT_CACHE.pop(self.db_path, None)
+        with mock.patch.dict(os.environ, {"SESSKIT_NATIVE": "1"}, clear=False):
+            fp1 = oc._content_fingerprint(self.db_path)
+            self.assertIsInstance(fp1, tuple)
+            assert fp1 is not None
+            self.assertEqual([row[0] for row in fp1], ["session", "session_v2", "message", "session_message"])
+
+            # Part-only write does not change native fingerprint
+            self._write(
+                "UPDATE part SET data = ?, time_updated = ? WHERE id = 'p1'",
+                (json.dumps({"type": "text", "text": "part update"}), 99999),
+            )
+            self.assertEqual(oc._content_fingerprint(self.db_path), fp1)
+
+            # Non-maximum session_message length edit flips native fingerprint
+            self._write(
+                "UPDATE session_message SET data = ? WHERE id = 'sm1'",
+                (json.dumps({"time": {"created": 1001}, "text": "longer text"}),),
+            )
+            self.assertNotEqual(oc._content_fingerprint(self.db_path), fp1)
+
+            # Missing v2 tables returns None cleanly -> triggers mtime fallback
+            sub = os.path.join(self.tmp.name, "native_old")
+            os.mkdir(sub)
+            old_db = os.path.join(sub, "opencode.db")
+            conn = sqlite3.connect(old_db)
+            conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER)")
+            conn.commit()
+            conn.close()
+            self.assertIsNone(oc._content_fingerprint(old_db))
+            os.environ["OPENCODE_DATA_DIR"] = sub
+            self.assertIn("files", repr(self._sig()))
+
 
 if __name__ == "__main__":
     unittest.main()

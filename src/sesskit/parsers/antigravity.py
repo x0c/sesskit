@@ -46,21 +46,28 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
+import threading
 from typing import Any
 
 from sesskit import titles
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
 from sesskit.parsers.common import (
+    MEMO_MISS,
+    HostExtension,
+    ListRecordMemo,
     ephemeral_prefixes_for,
-    is_ephemeral_agent_cwd,
     live_pid_snapshot,
+    make_ephemeral_checker,
     parse_timestamp,
+    persistable_host_tag,
     preprocess_excerpt,
+    resolve_scan_cache,
     stat_signature,
     terminal_error_evidence,
 )
@@ -908,9 +915,43 @@ def _read_summaries(root: str) -> dict[str, dict]:
             pass
 
 
+_DEFAULT_READ_SUMMARIES = _read_summaries
+_SHARED_CACHE_LOCK = threading.Lock()
+_SUMMARIES_CACHE: tuple[tuple, dict[str, dict]] | None = None
+_HISTORY_CACHE: tuple[tuple, dict[str, dict]] | None = None
+_LIST_MEMO = ListRecordMemo()
+
+
+def _file_stamp_ctime(path: str | None) -> tuple[int, int, int, int, int] | None:
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
 def _read_all_summaries() -> dict[str, dict]:
+    global _SUMMARIES_CACHE
+    active_roots = _roots()
+    use_cache = _read_summaries is _DEFAULT_READ_SUMMARIES
+    cache_key: tuple | None = None
+    if use_cache:
+        cache_key = tuple(
+            (
+                root,
+                _file_stamp_ctime(os.path.join(root, "conversation_summaries.db")),
+                _file_stamp_ctime(os.path.join(root, "conversation_summaries.db-wal")),
+            )
+            for root in active_roots
+        )
+        with _SHARED_CACHE_LOCK:
+            cached = _SUMMARIES_CACHE
+            if cached is not None and cached[0] == cache_key:
+                return dict(cached[1])
     merged: dict[str, dict] = {}
-    for root in _roots():
+    for root in active_roots:
         for cid, entry in _read_summaries(root).items():
             prev = merged.get(cid)
             if prev is None:
@@ -926,6 +967,18 @@ def _read_all_summaries() -> dict[str, dict]:
                         bool(prev.get("not_fully_idle")) or bool(entry.get("not_fully_idle"))
                     ),
                 }
+    if use_cache and cache_key is not None:
+        sig_after = tuple(
+            (
+                root,
+                _file_stamp_ctime(os.path.join(root, "conversation_summaries.db")),
+                _file_stamp_ctime(os.path.join(root, "conversation_summaries.db-wal")),
+            )
+            for root in active_roots
+        )
+        if sig_after == cache_key:
+            with _SHARED_CACHE_LOCK:
+                _SUMMARIES_CACHE = (cache_key, dict(merged))
     return merged
 
 
@@ -1083,8 +1136,18 @@ def _history_map() -> dict[str, dict]:
     is the only surviving user-text evidence; it fills list excerpts so the
     sessions stay searchable. Missing or unreadable files yield no rows.
     """
+    global _HISTORY_CACHE
+    active_roots = _roots()
+    cache_key = tuple(
+        (root, _file_stamp_ctime(os.path.join(root, "history.jsonl")))
+        for root in active_roots
+    )
+    with _SHARED_CACHE_LOCK:
+        cached = _HISTORY_CACHE
+        if cached is not None and cached[0] == cache_key:
+            return dict(cached[1])
     mapped: dict[str, dict] = {}
-    for root in _roots():
+    for root in active_roots:
         path = os.path.join(root, "history.jsonl")
         if not os.path.isfile(path):
             continue
@@ -1120,6 +1183,13 @@ def _history_map() -> dict[str, dict]:
                         }
         except OSError:
             continue
+    sig_after = tuple(
+        (root, _file_stamp_ctime(os.path.join(root, "history.jsonl")))
+        for root in active_roots
+    )
+    if sig_after == cache_key:
+        with _SHARED_CACHE_LOCK:
+            _HISTORY_CACHE = (cache_key, dict(mapped))
     return mapped
 
 
@@ -1377,6 +1447,127 @@ def _build_session_info(
     return None
 
 
+def _summary_version(summary: dict | None) -> tuple | None:
+    if not summary:
+        return None
+    return (
+        summary.get("title") or "",
+        summary.get("preview") or "",
+        summary.get("step_count") or 0,
+        summary.get("last_modified_time"),
+        summary.get("workspace_uris") or "",
+        summary.get("status") or "",
+        bool(summary.get("killed")),
+        bool(summary.get("not_fully_idle")),
+        summary.get("last_user_input_time"),
+        summary.get("app_data_dir") or "",
+        bool(summary.get("is_subagent")),
+        summary.get("root") or "",
+    )
+
+
+def _annotation_stamp(
+    cid: str,
+    summary: dict | None,
+    transcript_path: str | None,
+    db_path: str | None,
+    roots: list[str],
+) -> tuple | None:
+    if not cid or "/" in cid or "\\" in cid or ".." in cid:
+        return None
+    if ((summary or {}).get("title") or "").strip():
+        return None
+    candidate_roots = [
+        r for r in ((summary or {}).get("root"), *_root_from_history_path(transcript_path, db_path), *roots) if r
+    ]
+    seen: set[str] = set()
+    stamps: list[tuple[str, tuple[int, int, int, int, int]]] = []
+    for root in candidate_roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        ann_path = os.path.join(root, "annotations", f"{cid}.pbtxt")
+        stamp = _file_stamp_ctime(ann_path)
+        if stamp is not None:
+            stamps.append((ann_path, stamp))
+    return tuple(stamps) if stamps else None
+
+
+def _memoized_session_info(
+    cid: str,
+    transcript_path: str | None,
+    db_path: str | None,
+    summaries: dict[str, dict],
+    history: dict[str, dict] | None = None,
+    *,
+    host: HostExtension | None = None,
+    roots: list[str] | None = None,
+) -> SessionInfo | None:
+    """Reuse built Antigravity list records across L1 memory and L2 session cache."""
+    primary_path = transcript_path or db_path
+    if not primary_path:
+        return None
+    primary_stamp = _file_stamp_ctime(primary_path)
+    if primary_stamp is None:
+        return None
+    active_roots = _roots() if roots is None else roots
+    summary = summaries.get(cid)
+    if summary is None:
+        summary = _read_all_summaries().get(cid)
+    db_stamp = _file_stamp_ctime(db_path) if (db_path and db_path != primary_path) else None
+    wal_stamp = _file_stamp_ctime(f"{db_path}-wal") if db_path else None
+    ann_stamp = _annotation_stamp(cid, summary, transcript_path, db_path, active_roots)
+    sum_ver = _summary_version(summary)
+    hist_ver = None
+    if not transcript_path and history:
+        hist_row = history.get(cid)
+        if hist_row:
+            hist_ver = (hist_row.get("text"), hist_row.get("ts"), hist_row.get("cwd"))
+    version = (
+        "ag-list-v1",
+        cid,
+        transcript_path or "",
+        db_path or "",
+        primary_stamp,
+        db_stamp,
+        wal_stamp,
+        ann_stamp,
+        sum_ver,
+        hist_ver,
+        ListRecordMemo.host_key(host),
+    )
+    memo_key = (cid, transcript_path, db_path)
+    cached = _LIST_MEMO.get(memo_key, version)
+    if cached is not MEMO_MISS:
+        return cached  # type: ignore[return-value]
+
+    host_tag = persistable_host_tag(host)
+    session_cache = resolve_scan_cache(host) if host_tag is not None else None
+    extra_version = ""
+    if host_tag is not None and session_cache is not None:
+        digest = hashlib.sha256(
+            repr((*version[:-1], host_tag)).encode("utf-8", "surrogatepass")
+        ).hexdigest()
+        extra_version = f"ag-list-v1:{digest}"
+        disk_cached = session_cache.get_session("antigravity", primary_path, extra_version)
+        if isinstance(disk_cached, dict):
+            if disk_cached.get("_empty"):
+                _LIST_MEMO.put(memo_key, version, None)
+                return None
+            restored = {**disk_cached, "live": False, "pid": None}
+            _LIST_MEMO.put(memo_key, version, restored)
+            return restored  # type: ignore[return-value]
+
+    info = _build_session_info(
+        cid, transcript_path, db_path, summaries, history, host=host
+    )
+    _LIST_MEMO.put(memo_key, version, info)
+    if session_cache is not None:
+        disk_payload = {"_empty": True} if info is None else {**info, "live": False, "pid": None}
+        session_cache.put_session("antigravity", primary_path, disk_payload, extra_version)
+    return info
+
+
 def scan_sessions(
     limit: int = 50,
     keep_ids: set[str] | None = None,
@@ -1385,6 +1576,7 @@ def scan_sessions(
     host=None,
 ) -> list[SessionInfo]:
     """Scan Antigravity transcripts plus conversation databases."""
+    roots = _roots()
     transcripts = _transcript_candidates()
     dbs = _db_candidates()
     summaries = _read_all_summaries()
@@ -1395,7 +1587,7 @@ def scan_sessions(
         reverse=True,
     )
     host_marker = host.title_prompt_marker if host is not None else None
-    host_prefixes = ephemeral_prefixes_for(host)
+    ephemeral_check = make_ephemeral_checker(ephemeral_prefixes_for(host))
     retained_ids = keep_ids or set()
     recent: list[SessionInfo] = []
     retained: list[SessionInfo] = []
@@ -1408,8 +1600,14 @@ def scan_sessions(
         summary = summaries.get(cid)
         if summary and summary.get("is_subagent"):
             continue
-        info = _build_session_info(
-            cid, transcripts.get(cid), dbs.get(cid), summaries, history, host=host
+        info = _memoized_session_info(
+            cid,
+            transcripts.get(cid),
+            dbs.get(cid),
+            summaries,
+            history,
+            host=host,
+            roots=roots,
         )
         if info is None:
             continue
@@ -1425,7 +1623,7 @@ def scan_sessions(
         cwd = str(info.get("cwd") or "")
         if not cwd and not include_missing_cwd:
             continue
-        if cwd and is_ephemeral_agent_cwd(cwd, extra_prefixes=host_prefixes):
+        if cwd and ephemeral_check(cwd):
             continue
         (retained if cid in retained_ids else recent).append(info)
     recent.sort(key=lambda s: float(s.get("mtime") or 0), reverse=True)
@@ -1662,18 +1860,46 @@ def refresh_session(session: dict, *, host=None) -> SessionInfo | None:
     path = str(session.get("path") or "")
     if not cid or not path:
         return None
-    transcripts = _transcript_candidates()
-    dbs = _db_candidates()
+    roots = _roots()
     summaries = _read_all_summaries()
     history = _history_map()
-    tpath = transcripts.get(cid, path if path.endswith(".jsonl") else None)
-    dpath = dbs.get(cid, path if path.endswith(".db") else None)
-    # Prefer the exact stored path when it still exists.
-    if path.endswith(".jsonl") and os.path.isfile(path):
-        tpath = path
-    if path.endswith(".db") and os.path.isfile(path):
-        dpath = path
-    return _build_session_info(cid, tpath, dpath, summaries, history, host=host)
+    candidate_roots = list(
+        dict.fromkeys(
+            [
+                *_root_from_history_path(
+                    path if path.endswith(".jsonl") else None,
+                    path if path.endswith(".db") else None,
+                ),
+                *roots,
+            ]
+        )
+    )
+    tpath: str | None = path if path.endswith(".jsonl") and os.path.isfile(path) else None
+    if tpath is None:
+        for root in candidate_roots:
+            logs_dir = os.path.join(root, "brain", cid, ".system_generated", "logs")
+            for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+                candidate = os.path.join(logs_dir, fname)
+                if os.path.isfile(candidate):
+                    tpath = candidate
+                    break
+            if tpath is not None:
+                break
+    dpath: str | None = path if path.endswith(".db") and os.path.isfile(path) else None
+    if dpath is None:
+        for root in candidate_roots:
+            candidate = os.path.join(root, "conversations", f"{cid}.db")
+            if os.path.isfile(candidate):
+                dpath = candidate
+                break
+    if tpath is None and dpath is None:
+        transcripts = _transcript_candidates()
+        dbs = _db_candidates()
+        tpath = transcripts.get(cid)
+        dpath = dbs.get(cid)
+    return _memoized_session_info(
+        cid, tpath, dpath, summaries, history, host=host, roots=roots
+    )
 
 
 def scan_signature() -> tuple | None:

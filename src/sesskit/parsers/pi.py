@@ -23,13 +23,16 @@ from sesskit.parsers.common import (
     is_ephemeral_agent_cwd,
     live_pid_snapshot,
     live_processes,
+    make_ephemeral_checker,
     open_file_paths,
     parse_timestamp,
+    persistable_host_tag,
     preprocess_excerpt,
     process_command_line,
     process_environs,
     process_start_time,
     process_start_times,
+    resolve_scan_cache,
     stat_signature,
     terminal_error_evidence,
 )
@@ -790,7 +793,7 @@ def _memoized_session_info(
     *,
     cache_entries: bool = True,
 ) -> tuple[SessionInfo, float] | None:
-    """``_build_session_info`` reused while the file stamp and host inputs match.
+    """``_build_session_info`` reused across L1 memory and L2 session cache.
 
     The stamp is taken before the build, so a write racing the parse only makes
     the next scan rebuild; it can never pin an older record to a newer file.
@@ -799,8 +802,37 @@ def _memoized_session_info(
     cached = _LIST_MEMO.get(path, version)
     if cached is not MEMO_MISS:
         return cached  # type: ignore[return-value]
+
+    host_tag = persistable_host_tag(host)
+    session_cache = resolve_scan_cache(host) if host_tag is not None else None
+    extra_version = ""
+    if host_tag is not None and session_cache is not None:
+        digest = hashlib.sha256(
+            repr(("pi-list-v1", stamp[3], host_tag)).encode("utf-8", "surrogatepass")
+        ).hexdigest()
+        extra_version = f"pi-list-v1:{digest}"
+        disk_cached = session_cache.get_session("pi", path, extra_version)
+        if isinstance(disk_cached, dict):
+            if disk_cached.get("_empty"):
+                _LIST_MEMO.put(path, version, None)
+                return None
+            raw_info = disk_cached.get("info")
+            if isinstance(raw_info, dict):
+                restored_info = {**raw_info, "live": False, "pid": None}
+                created = float(disk_cached.get("created") or 0.0)
+                restored = (restored_info, created)
+                _LIST_MEMO.put(path, version, restored)
+                return restored  # type: ignore[return-value]
+
     built = _build_session_info(path, host, cache_entries=cache_entries)
     _LIST_MEMO.put(path, version, built)
+    if session_cache is not None:
+        disk_payload = (
+            {"_empty": True}
+            if built is None
+            else {"info": {**built[0], "live": False, "pid": None}, "created": float(built[1])}
+        )
+        session_cache.put_session("pi", path, disk_payload, extra_version)
     return built
 
 
@@ -814,7 +846,7 @@ def scan_sessions(
     if not os.path.isdir(SESSIONS_DIR):
         return []
     keep_ids = {str(item) for item in (keep_ids or ()) if item}
-    host_prefixes = ephemeral_prefixes_for(host)
+    ephemeral_check = make_ephemeral_checker(ephemeral_prefixes_for(host), fn=is_ephemeral_agent_cwd)
     is_isolation_dir = (
         host.is_isolation_dir
         if (host is not None and host.is_isolation_dir is not None)
@@ -855,7 +887,7 @@ def scan_sessions(
             continue
         if over_quota and session_id not in keep_ids:
             continue
-        if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
+        if ephemeral_check(info["cwd"]):
             continue
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue
@@ -1594,7 +1626,6 @@ def _apply_live_flags(
     starts = process_start_times([pid for pid, _cwd in tui_procs])
     live_map = _live_map_path(host)
     _load_persisted_overrides([pid for pid, _cwd in tui_procs], starts, created_ts, live_map)
-    open_paths = open_file_paths([pid for pid, _cwd in tui_procs])
     host_keys = tuple(host.env_keys) if host is not None else ()
     if host is not None and host.pi_instance_env_key:
         host_keys = (*host_keys, host.pi_instance_env_key)
@@ -1619,6 +1650,23 @@ def _apply_live_flags(
                 if not _claim_session_ref(claim) and not _claim_session_path(claim):
                     continue
                 claims_by_pid.setdefault(claim_pid, []).append(claim)
+
+    instance_key = host.pi_instance_env_key if host is not None else ""
+
+    def _matching_claim(pid: int) -> dict | None:
+        env_instance = (
+            str((envs.get(pid) or {}).get(instance_key) or "").strip() if instance_key else ""
+        )
+        candidates = claims_by_pid.get(pid) or []
+        if env_instance:
+            candidates = [
+                claim for claim in candidates
+                if _claim_instance(claim) == env_instance
+            ]
+        return max(candidates, key=_claim_sequence, default=None)
+
+    unclaimed_pids = [pid for pid, _cwd in tui_procs if _matching_claim(pid) is None]
+    open_paths = open_file_paths(unclaimed_pids) if unclaimed_pids else {}
 
     def _proc_session_dir(pid: int) -> str:
         env = envs.get(pid) or {}
@@ -1742,17 +1790,10 @@ def _apply_live_flags(
         return True
 
     def bind_exact(pid: int) -> None:
-        instance_key = host.pi_instance_env_key if host is not None else ""
         env_instance = (
             str((envs.get(pid) or {}).get(instance_key) or "").strip() if instance_key else ""
         )
-        candidates = claims_by_pid.get(pid) or []
-        if env_instance:
-            candidates = [
-                claim for claim in candidates
-                if _claim_instance(claim) == env_instance
-            ]
-        claim = max(candidates, key=_claim_sequence, default=None)
+        claim = _matching_claim(pid)
         if claim is not None:
             session = bind_by_id_or_path(pid, _claim_session_ref(claim))
             if session is None:

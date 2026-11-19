@@ -23,6 +23,7 @@ from sesskit.parsers.common import (
     host_cache_tag,
     is_ephemeral_agent_cwd,
     live_pid_snapshot,
+    make_ephemeral_checker,
     preprocess_excerpt,
     stat_signature,
     terminal_error_evidence,
@@ -57,18 +58,42 @@ def _load_index() -> dict[str, str]:
     return index
 
 
+def _scan_session_files_with_stats() -> list[tuple[str, int, int]]:
+    """Collect ``(path, mtime_ns, size)`` across ``SESSIONS_DIR`` in one scandir stat per file."""
+    rows: list[tuple[str, int, int]] = []
+    if not os.path.isdir(SESSIONS_DIR):
+        return rows
+    stack = [SESSIONS_DIR]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                subdirs: list[str] = []
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            subdirs.append(entry.path)
+                        elif entry.name.endswith(".jsonl"):
+                            st = entry.stat()
+                            rows.append((entry.path, st.st_mtime_ns, st.st_size))
+                    except OSError:
+                        continue
+                if subdirs:
+                    subdirs.sort(reverse=True)
+                    stack.extend(subdirs)
+        except OSError:
+            continue
+    return rows
+
+
 def _find_all_session_files() -> list[str]:
     """递归扫描 ~/.codex/sessions/ 下所有 .jsonl 文件，按文件名（时间戳）降序排列。"""
-    files: list[str] = []
-    if not os.path.isdir(SESSIONS_DIR):
-        return files
-    for root, dirs, fnames in os.walk(SESSIONS_DIR):
-        dirs.sort()
-        for fname in fnames:
-            if fname.endswith(".jsonl"):
-                files.append(os.path.join(root, fname))
+    files = [path for path, _mtime_ns, _size in _scan_session_files_with_stats()]
     files.sort(reverse=True)
     return files
+
+
+_DEFAULT_FIND_ALL_SESSION_FILES = _find_all_session_files
 
 
 def _extract_uuid_from_filename(path: str) -> str | None:
@@ -880,10 +905,20 @@ def _live_session_ids() -> dict[str, int]:
 
 def scan_signature() -> tuple | None:
     """逐 rollout 文件 stat + codex pid 快照；禁止用 sessions 目录 mtime。"""
-    files = _find_all_session_files()
-    if os.path.isfile(SESSION_INDEX):
-        files = [*files, SESSION_INDEX]
-    return (stat_signature(files), live_pid_snapshot("codex"))
+    if _find_all_session_files is not _DEFAULT_FIND_ALL_SESSION_FILES:
+        files = _find_all_session_files()
+        if os.path.isfile(SESSION_INDEX):
+            files = [*files, SESSION_INDEX]
+        return (stat_signature(files), live_pid_snapshot("codex"))
+    rows = _scan_session_files_with_stats()
+    try:
+        idx_st = os.stat(SESSION_INDEX)
+    except OSError:
+        pass
+    else:
+        rows.append((SESSION_INDEX, idx_st.st_mtime_ns, idx_st.st_size))
+    rows.sort()
+    return (tuple(rows), live_pid_snapshot("codex"))
 
 
 def _cache_version(host: HostExtension | None) -> str:
@@ -915,7 +950,6 @@ def scan_sessions(
     慢，实测是首屏卡顿主因之一（结果与逐次调用字节级一致）。
     """
     index = _load_index()
-    all_files = _find_all_session_files()
     live_ids = _live_session_ids()
     provider = host_claim_provider
     if provider is None and host is not None:
@@ -924,13 +958,20 @@ def scan_sessions(
         # Explicit host ownership is more precise than the native process probe.
         live_ids.update(provider(SESSIONS_DIR))
 
-    candidates: list[tuple[float, str]] = []
-    for path in all_files:
-        try:
-            candidates.append((os.path.getmtime(path), path))
-        except OSError:
-            continue
-    candidates.sort(key=lambda c: c[0], reverse=True)
+    if _find_all_session_files is _DEFAULT_FIND_ALL_SESSION_FILES:
+        file_stats = _scan_session_files_with_stats()
+        file_stats.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        candidate_paths = [path for path, _mtime_ns, _size in file_stats]
+    else:
+        all_files = _find_all_session_files()
+        candidates: list[tuple[float, str]] = []
+        for path in all_files:
+            try:
+                candidates.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        candidate_paths = [path for _mtime, path in candidates]
 
     isdir_cache: dict[str, bool] = {}
 
@@ -943,39 +984,42 @@ def scan_sessions(
 
     results: list[dict] = []
     host_marker = host.title_prompt_marker if host is not None else None
-    host_prefixes = ephemeral_prefixes_for(host)
+    ephemeral_check = make_ephemeral_checker(ephemeral_prefixes_for(host), fn=is_ephemeral_agent_cwd)
     session_cache = host.cache if (host is not None and host.cache is not None) else get_cache()
     cache_version = _cache_version(host)
-    for _, path in candidates:
-        cache = session_cache
-        info = cache.get_session("codex", path, cache_version)
-        if info is not None and "loop_count" not in info:
-            info = None
+    for path in candidate_paths:
+        info = session_cache.get_session("codex", path, cache_version)
+        if isinstance(info, dict) and info.get("_empty"):
+            continue
+        built_fresh = False
         if info is None:
             try:
                 info = _build_session_info(path, index, host, compute_loop_count=False)
             except OSError:
                 continue
-        if info is None:
-            continue
-        if info["thread_source"] == "subagent":
-            continue  # Codex 自身多智能体拆出的子代理线程，不是用户发起的顶层会话，
-            # 会与父会话共享同一段历史开头造成列表重复
+            built_fresh = True
+            if info is None:
+                session_cache.put_session("codex", path, {"_empty": True}, cache_version)
+                continue
         info["live"] = info["id"] in live_ids
         info["pid"] = live_ids.get(info["id"])
-        if not info["first_user_msg"] and not info["live"]:
-            continue  # 已结束且没有用户消息的空会话
+        filtered = (
+            info["thread_source"] == "subagent"
+            or (not info["first_user_msg"] and not info["live"])
+            or titles.is_title_generation_prompt(info["first_user_msg"], marker=host_marker)
+            or ephemeral_check(info["cwd"])
+            or bool(info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]))
+            or bool(cwd_filter and not info["cwd"].startswith(cwd_filter))
+        )
+        if filtered:
+            if built_fresh:
+                session_cache.put_session(
+                    "codex", path, {**info, "live": False, "pid": None}, cache_version,
+                )
+            continue
         if not info["first_user_msg"] and info["fallback_title"] == "(无消息)":
             # 派生缓存可能来自更新前；让已有运行中空会话也立即获得可读标题。
             info["fallback_title"] = "Codex 新会话"
-        if titles.is_title_generation_prompt(info["first_user_msg"], marker=host_marker):
-            continue  # host's own background title-generation noise, filtered per scan
-        if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
-            continue  # host-declared automation workspaces whose dirs resurrect
-        if info["cwd"] and not include_missing_cwd and not cached_isdir(info["cwd"]):
-            continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
-        if cwd_filter and not info["cwd"].startswith(cwd_filter):
-            continue
         results.append(info)
         if len(results) >= limit:
             break
@@ -1012,16 +1056,22 @@ def refresh_session(
     cache = host.cache if (host is not None and host.cache is not None) else get_cache()
     cache_version = _cache_version(host)
     info = cache.get_session("codex", path, cache_version)
+    if isinstance(info, dict) and info.get("_empty"):
+        return None
     if info is not None and "loop_count" not in info:
-        info = None
+        from sesskit.native_projection import count_loops
+
+        info["loop_count"] = count_loops("codex", path)
+        cache.put_session("codex", path, {**info, "live": False, "pid": None}, cache_version)
     if info is None:
         try:
             info = _build_session_info(path, _load_index(), host)
         except OSError:
             return None
         if info is None:
+            cache.put_session("codex", path, {"_empty": True}, cache_version)
             return None
-        cache.put_session("codex", path, info, cache_version)
+        cache.put_session("codex", path, {**info, "live": False, "pid": None}, cache_version)
     if not info["first_user_msg"] and info["fallback_title"] == "(无消息)":
         info["fallback_title"] = "Codex 新会话"
     return info

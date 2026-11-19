@@ -102,12 +102,9 @@ For status inference, each parser maps its native tail signals to the shared
 1. `refresh_session(session, host=...)` re-derives one already listed session
    through the same runtime builder as the next scan; list filters and liveness
    are not applied.
-2. Pi shares the list memo and an incremental entries reader: unchanged files
-   are not reread, and an append parses only the new complete lines. OpenCode v2
-   shares the list memo keyed by the session row plus per-session message
-   aggregate, so a WAL write in another session does not rebuild this one.
-3. A missing history, unknown runtime, or history that no longer yields a
-   session returns `None`; callers keep their last scan result.
+2. Pi and Antigravity share their in-process list memos plus persisted session caches (`get_session` / `put_session`); Pi also reuses an incremental entries reader so unchanged files are not reread and appends parse only new complete lines. Antigravity `refresh_session` resolves sibling transcript/db paths directly without full directory walks when the stored path exists. OpenCode v2 shares the list memo and optional persisted versioned cache (`get_versioned_session` / `put_versioned_session`) keyed by the session row plus per-session message aggregate, so a WAL write in another session does not rebuild untouched sessions.
+3. Codex and Cursor scans persist empty/filtered session-metadata markers as well as surviving rows (while surviving rows backfill and persist `loop_count`) so unchanged filtered files are not re-parsed on warm scans.
+4. A missing history, unknown runtime, or history that no longer yields a session returns `None`; callers keep their last scan result.
 
 ### Load flow (conversation path)
 
@@ -302,8 +299,8 @@ pipelines.
 | Liveness | Open-file plus command-line pinning | `_live_session_ids()` in `claude.py` / `codex.py`, `_apply_live_flags()` in `opencode.py` / `kimi.py` / `cursor.py`, `_mark_live()` helpers | Marking `live` plus `pid` on session records without launching anything |
 | Version | List-level `scan_signature` | `scan_signature()` in each parser module | Cheap list-change detection; Cursor variant excludes the streaming WAL so live writes do not invalidate the whole list every few seconds |
 | Version | Conversation-level `extra_version` | Cursor scanner cache key including WAL state | Preview freshness for uncheckpointed tails; never collapse with the list-level key |
-| Cache | Session / conversation cache slots | `src/sesskit/cache.py` `file_signature()`, `NullSessionCache` | Default no-op cache; file signature is device plus inode plus size plus mtime-ns |
-| Memo | In-process list-record memo | `src/sesskit/parsers/common.py` `ListRecordMemo`; Pi `_LIST_MEMO`, OpenCode `_V2_LIST_MEMO` | Bounded LRU of built list records keyed by native source version plus host key; see CONTRACT Listing modes (0.2.19) |
+| Cache | Session / conversation / versioned cache slots | `src/sesskit/cache.py` `file_signature()`, `NullSessionCache` (`get_session`, `put_session`, `get_versioned_session`, `put_versioned_session`) | Default no-op cache; file signature is device plus inode plus size plus mtime-ns; versioned slot supports multi-session DB stores |
+| Memo | In-process list-record memo | `src/sesskit/parsers/common.py` `ListRecordMemo`; Pi `_LIST_MEMO`, Antigravity `_LIST_MEMO`, OpenCode `_V2_LIST_MEMO` | Bounded LRU of built list records keyed by native source version plus host key; see CONTRACT Listing modes (0.2.19; persisted L2 0.3.12) |
 | Filter | Missing-directory drop | `include_missing_cwd` parameter on scanners | Default drops sessions whose project directory no longer exists; archive flows opt in explicitly |
 | Filter | Ephemeral-workspace drop | `src/sesskit/parsers/common.py` `is_ephemeral_agent_cwd()` | Always drops manager-job and marker-ignored workspaces regardless of the missing-directory flag |
 | Filter | Title-generation sessions | `src/sesskit/titles.py` `is_title_generation_prompt()` | Drops automated title-generation histories from listings |

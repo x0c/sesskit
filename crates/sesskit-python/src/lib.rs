@@ -36,6 +36,15 @@ fn project_opencode_sessions(
 }
 
 #[pyfunction]
+fn opencode_content_fingerprint(
+    py: Python<'_>,
+    db_path: String,
+) -> PyResult<Vec<(String, u64, String)>> {
+    py.detach(|| sesskit_stats::opencode_list::content_fingerprint(Path::new(&db_path)))
+        .map_err(PyRuntimeError::new_err)
+}
+
+#[pyfunction]
 fn count_loops_many(
     py: Python<'_>,
     items: Vec<(String, String)>,
@@ -48,6 +57,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("PROTOCOL_VERSION", 2)?;
     module.add_function(wrap_pyfunction!(project_json_many, module)?)?;
     module.add_function(wrap_pyfunction!(project_opencode_sessions, module)?)?;
+    module.add_function(wrap_pyfunction!(opencode_content_fingerprint, module)?)?;
     module.add_function(wrap_pyfunction!(count_loops_many, module)?)?;
     Ok(())
 }

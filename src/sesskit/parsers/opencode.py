@@ -22,7 +22,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from itertools import groupby
 
-from sesskit import titles
+from sesskit import native_projection, titles
 from sesskit.models import ConversationMessage, SessionInfo, make_session_info
 from sesskit.parsers.common import (
     MEMO_MISS,
@@ -32,10 +32,13 @@ from sesskit.parsers.common import (
     host_session_ident,
     is_ephemeral_agent_cwd,
     live_processes,
+    make_ephemeral_checker,
+    persistable_host_tag,
     preprocess_excerpt,
     process_command_line,
     process_environs,
     process_start_times,
+    resolve_scan_cache,
     terminal_error_evidence,
 )
 
@@ -113,6 +116,7 @@ WHERE s.parent_id IS NULL
   AND s.time_archived IS NULL
 """
 _SCAN_SQL = _SCAN_SELECT + "ORDER BY s.time_updated DESC\nLIMIT ?\n"
+_SCAN_CUTOFF_SQL = _SCAN_SELECT + "  AND s.time_updated >= ?\nORDER BY s.time_updated DESC\nLIMIT ?\n"
 _SESSION_SQL = _SCAN_SELECT + "  AND s.id = ?\n"
 
 _CONVERSATION_SQL = """
@@ -516,6 +520,7 @@ def connect_ro(db_path: str) -> sqlite3.Connection | None:
 
 
 _connect_ro = connect_ro  # 旧私有名兼容：模块内部与测试仍引用
+_DEFAULT_CONNECT_RO = connect_ro
 
 
 def _status_tag(last_msg_data: str | None) -> str:
@@ -755,6 +760,30 @@ def _v2_list_version(
     versions: dict[str, tuple],
 ) -> tuple:
     return (tuple(row), versions.get(str(row["id"])), ListRecordMemo.host_key(host))
+
+
+def _v2_cache_version_str(
+    row: sqlite3.Row,
+    host_tag: str,
+    versions: dict[str, tuple],
+) -> str:
+    payload = ("oc-v2-list-v1", tuple(row), versions.get(str(row["id"])), host_tag)
+    digest = hashlib.sha256(
+        repr(payload).encode("utf-8", "surrogatepass")
+    ).hexdigest()
+    return f"oc-v2-list-v1:{digest}"
+
+
+def _v2_disk_cache_hooks(host: HostExtension | None):
+    host_tag = persistable_host_tag(host)
+    if host_tag is None:
+        return None, None, None
+    session_cache = resolve_scan_cache(host)
+    get_v = getattr(session_cache, "get_versioned_session", None)
+    put_v = getattr(session_cache, "put_versioned_session", None)
+    if callable(get_v) and callable(put_v):
+        return host_tag, get_v, put_v
+    return None, None, None
 
 
 def _memoized_session_info_v2(
@@ -1059,6 +1088,10 @@ def _content_fingerprint(db_path: str) -> tuple | None:
     tables, or other SQLite errors so the caller can use the conservative mtime
     fallback. The connection timeout is 0.5 seconds (`connect_ro`).
     """
+    if connect_ro is _DEFAULT_CONNECT_RO and _connect_ro is _DEFAULT_CONNECT_RO:
+        handled, native_fp = native_projection.opencode_content_fingerprint(db_path)
+        if handled:
+            return native_fp
     try:
         conn = connect_ro(db_path)
     except (sqlite3.Error, OSError):
@@ -1178,104 +1211,187 @@ def scan_sessions(
 ) -> list[SessionInfo]:
     """扫描所有 OpenCode 数据目录下的会话，返回统一结构列表，按 mtime 降序。
 
-    每个数据目录一条 SQL 拿候选（已过滤子代理会话和已归档会话），条数按
-    展示 limit 超额读取，Python 侧滤掉标题生成噪音后再截到 limit——否则噪音
-    会占满 SQL 窗口，真实会话在边界进进出出，侧边栏自己乱跳。实测单条 SQL
-    （含四个预览子查询）仍是个位数到几十毫秒，远在首屏 ≤1s 预算内。
+    每个数据目录先分批处理 v2 会话（L1/L2 命中时跳过 Rust 批量投影，凑足展示
+    limit 后提前停批），并用精确的 v1 `MAX(time_updated)` 截断老库查询，再补齐
+    仍落入窗口的 v1 会话；全程保留标题生成与临时目录过滤及 v1/v2 去重不变式。
     """
     db_paths = _db_paths()
     successful_queries = 0
     results: list[dict] = []
     created_ms: dict[str, int] = {}
     host_marker = host.title_prompt_marker if host is not None else None
-    host_prefixes = ephemeral_prefixes_for(host)
+    ephemeral_check = make_ephemeral_checker(ephemeral_prefixes_for(host), fn=is_ephemeral_agent_cwd)
     query_limit = max(limit * _SCAN_OVERFETCH, _SCAN_OVERFETCH_MIN, limit)
+    host_tag, get_v, put_v = _v2_disk_cache_hooks(host)
+    use_disk = host_tag is not None and get_v is not None and put_v is not None
     for db_path in db_paths:
         conn = _connect_ro(db_path)
         if conn is None:
             continue
+        db_v2_results: list[dict] = []
+        v2_kept_tu_ms: list[int] = []
         try:
-            rows = conn.execute(_SCAN_SQL, (query_limit,)).fetchall()
-        except sqlite3.Error:
-            continue
-        finally:
-            conn.close()
-        successful_queries += 1
-        for row in rows:
-            info = _build_session_info(row, db_path, host)
-            if info is None:
-                continue
-            # 标题生成用 `opencode run` 会真实落盘会话；用宿主标记拦掉自产噪音。
-            # 原生标题也要查：OpenCode 常把生成结果写成 `{"runtime:id": "标题"}`，
-            # 或把被总结的那条会话的标题套到这条一次性任务上。
-            first_user = str(info.get("first_user_msg") or "")
-            fallback = str(info.get("fallback_title") or "")
-            native = str(info.get("native_title") or "")
-            if (
-                titles.is_title_generation_prompt(first_user, marker=host_marker)
-                or titles.is_title_generation_prompt(fallback, marker=host_marker)
-                or titles.is_title_generation_prompt(native, marker=host_marker)
-            ):
-                continue
-            if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
-                continue
-            if cwd_filter and not info["cwd"].startswith(cwd_filter):
-                continue
-            results.append(info)
-            created_ms[str(info["id"])] = int(row["time_created"] or 0)
-
-    # v2 分支：只收编 v1 表里没有的会话（迁移行去重靠 _SCAN_SQL_V2 里的
-    # NOT EXISTS）。单库 v2 查询失败（比如 v2 之前的老库根本没有这两张表）
-    # 只跳过该库的 v2 部分，不影响 v1 结果；是否 raise 仍看双分支合计。
-    for db_path in db_paths:
-        conn = _connect_ro(db_path)
-        if conn is None:
-            continue
-        try:
-            v2_rows = conn.execute(_SCAN_SQL_V2, (query_limit,)).fetchall()
-        except sqlite3.Error:
-            conn.close()
-            continue
-        successful_queries += 1
-        try:
-            versions = _v2_session_versions(conn, [str(row["id"]) for row in v2_rows])
-            pending_ids = []
-            for row in v2_rows:
-                if versions is None:
-                    pending_ids.append(str(row["id"]))
-                    continue
-                key = (db_path, str(row["id"]))
-                version = _v2_list_version(row, host, versions)
-                if _V2_LIST_MEMO.get(key, version) is MEMO_MISS:
-                    pending_ids.append(str(row["id"]))
-            from sesskit.native_projection import project_opencode_sessions
-
-            native_records = project_opencode_sessions(db_path, pending_ids) or {}
-            for row in v2_rows:
-                try:
-                    info = _memoized_session_info_v2(
-                        conn, row, db_path, host, versions,
-                        native_facts=native_records.get(str(row["id"])),
+            # 1) v2 branch (chunked + L1/L2 versioned cache)
+            try:
+                v2_rows = conn.execute(_SCAN_SQL_V2, (query_limit,)).fetchall()
+            except sqlite3.Error:
+                v2_rows = None
+            if v2_rows is not None:
+                successful_queries += 1
+                first_chunk = max(limit + 32, 64) if limit > 0 else len(v2_rows)
+                next_chunk = max(limit, 128) if limit > 0 else max(len(v2_rows), 1)
+                idx = 0
+                while idx < len(v2_rows):
+                    chunk_size = first_chunk if idx == 0 else next_chunk
+                    chunk = v2_rows[idx : idx + chunk_size]
+                    idx += chunk_size
+                    versions = _v2_session_versions(conn, [str(row["id"]) for row in chunk])
+                    resolved: dict[str, dict | None] = {}
+                    pending_ids: list[str] = []
+                    pending_versions: dict[str, tuple] = {}
+                    pending_ver_strs: dict[str, str] = {}
+                    for row in chunk:
+                        sid = str(row["id"])
+                        if versions is None:
+                            pending_ids.append(sid)
+                            continue
+                        key = (db_path, sid)
+                        version = _v2_list_version(row, host, versions)
+                        memo_val = _V2_LIST_MEMO.get(key, version)
+                        if memo_val is not MEMO_MISS:
+                            resolved[sid] = memo_val  # type: ignore[assignment]
+                            continue
+                        if use_disk:
+                            ver_str = _v2_cache_version_str(row, host_tag, versions)
+                            disk_val = get_v(
+                                "opencode",
+                                f"v2:{db_path}:{sid}",
+                                ver_str,
+                                source_path=db_path,
+                            )
+                            if isinstance(disk_val, dict):
+                                restored = (
+                                    None
+                                    if disk_val.get("_empty")
+                                    else {**disk_val, "live": False, "pid": None}
+                                )
+                                _V2_LIST_MEMO.put(key, version, restored)
+                                resolved[sid] = restored
+                                continue
+                            pending_ver_strs[sid] = ver_str
+                        pending_versions[sid] = version
+                        pending_ids.append(sid)
+                    native_records = (
+                        native_projection.project_opencode_sessions(db_path, pending_ids) or {}
+                        if pending_ids
+                        else {}
                     )
-                except sqlite3.Error:
-                    continue  # 单会话预览失败只跳过该会话，不连累同库其它 v2 行
-                if info is None:
-                    continue
-                first_user = str(info.get("first_user_msg") or "")
-                fallback = str(info.get("fallback_title") or "")
-                native = str(info.get("native_title") or "")
-                if (
-                    titles.is_title_generation_prompt(first_user, marker=host_marker)
-                    or titles.is_title_generation_prompt(fallback, marker=host_marker)
-                    or titles.is_title_generation_prompt(native, marker=host_marker)
-                ):
-                    continue
-                if is_ephemeral_agent_cwd(info["cwd"], extra_prefixes=host_prefixes):
-                    continue
-                if cwd_filter and not info["cwd"].startswith(cwd_filter):
-                    continue
-                results.append(info)
-                created_ms[str(info["id"])] = int(row["time_created"] or 0)
+                    for row in chunk:
+                        sid = str(row["id"])
+                        if sid in resolved:
+                            info = resolved[sid]
+                        else:
+                            try:
+                                info = _memoized_session_info_v2(
+                                    conn,
+                                    row,
+                                    db_path,
+                                    host,
+                                    versions,
+                                    native_facts=native_records.get(sid),
+                                )
+                            except sqlite3.Error:
+                                continue  # 单会话预览失败只跳过该会话，不连累同库其它 v2 行
+                            if use_disk and versions is not None and sid in pending_ver_strs:
+                                disk_payload = (
+                                    {"_empty": True}
+                                    if info is None
+                                    else {**info, "live": False, "pid": None}
+                                )
+                                put_v(
+                                    "opencode",
+                                    f"v2:{db_path}:{sid}",
+                                    disk_payload,
+                                    pending_ver_strs[sid],
+                                    source_path=db_path,
+                                )
+                        if info is None:
+                            continue
+                        first_user = str(info.get("first_user_msg") or "")
+                        fallback = str(info.get("fallback_title") or "")
+                        native = str(info.get("native_title") or "")
+                        if (
+                            titles.is_title_generation_prompt(first_user, marker=host_marker)
+                            or titles.is_title_generation_prompt(fallback, marker=host_marker)
+                            or titles.is_title_generation_prompt(native, marker=host_marker)
+                        ):
+                            continue
+                        if ephemeral_check(info["cwd"]):
+                            continue
+                        if cwd_filter and not info["cwd"].startswith(cwd_filter):
+                            continue
+                        db_v2_results.append(info)
+                        tu_raw = row["time_updated"]
+                        if tu_raw is not None:
+                            v2_kept_tu_ms.append(int(tu_raw))
+                        created_ms[str(info["id"])] = int(row["time_created"] or 0)
+                        if limit > 0 and len(db_v2_results) >= limit:
+                            break
+                    if limit > 0 and len(db_v2_results) >= limit:
+                        break
+            results.extend(db_v2_results)
+
+            # 2) v1 branch with exact time_updated cutoff pruning
+            try:
+                v1_max_row = conn.execute(
+                    "SELECT MAX(time_updated) FROM session "
+                    "WHERE parent_id IS NULL AND time_archived IS NULL"
+                ).fetchone()
+            except sqlite3.Error:
+                v1_max_row = None
+                v1_table_ok = False
+            else:
+                v1_table_ok = True
+                successful_queries += 1
+
+            if v1_table_ok:
+                v1_max_tu = v1_max_row[0] if v1_max_row else None
+                cutoff_tu: int | None = None
+                if limit > 0 and len(v2_kept_tu_ms) >= limit:
+                    cutoff_tu = min(v2_kept_tu_ms)
+                skip_v1 = v1_max_tu is None or (
+                    cutoff_tu is not None and int(v1_max_tu) < cutoff_tu
+                )
+                if not skip_v1:
+                    try:
+                        if cutoff_tu is not None:
+                            rows = conn.execute(_SCAN_CUTOFF_SQL, (cutoff_tu, query_limit)).fetchall()
+                        else:
+                            rows = conn.execute(_SCAN_SQL, (query_limit,)).fetchall()
+                    except sqlite3.Error:
+                        rows = []
+                    for row in rows:
+                        info = _build_session_info(row, db_path, host)
+                        if info is None:
+                            continue
+                        # 标题生成用 `opencode run` 会真实落盘会话；用宿主标记拦掉自产噪音。
+                        # 原生标题也要查：OpenCode 常把生成结果写成 `{"runtime:id": "标题"}`，
+                        # 或把被总结的那条会话的标题套到这条一次性任务上。
+                        first_user = str(info.get("first_user_msg") or "")
+                        fallback = str(info.get("fallback_title") or "")
+                        native = str(info.get("native_title") or "")
+                        if (
+                            titles.is_title_generation_prompt(first_user, marker=host_marker)
+                            or titles.is_title_generation_prompt(fallback, marker=host_marker)
+                            or titles.is_title_generation_prompt(native, marker=host_marker)
+                        ):
+                            continue
+                        if ephemeral_check(info["cwd"]):
+                            continue
+                        if cwd_filter and not info["cwd"].startswith(cwd_filter):
+                            continue
+                        results.append(info)
+                        created_ms[str(info["id"])] = int(row["time_created"] or 0)
         finally:
             conn.close()
 
@@ -1320,6 +1436,43 @@ def refresh_session(
             if row is None:
                 return None
             versions = _v2_session_versions(conn, [session_id])
+            if versions is not None:
+                key = (db_path, session_id)
+                version = _v2_list_version(row, host, versions)
+                cached = _V2_LIST_MEMO.get(key, version)
+                if cached is not MEMO_MISS:
+                    return cached  # type: ignore[return-value]
+                host_tag, get_v, put_v = _v2_disk_cache_hooks(host)
+                if host_tag is not None and get_v is not None and put_v is not None:
+                    ver_str = _v2_cache_version_str(row, host_tag, versions)
+                    disk_val = get_v(
+                        "opencode",
+                        f"v2:{db_path}:{session_id}",
+                        ver_str,
+                        source_path=db_path,
+                    )
+                    if isinstance(disk_val, dict):
+                        restored = (
+                            None
+                            if disk_val.get("_empty")
+                            else {**disk_val, "live": False, "pid": None}
+                        )
+                        _V2_LIST_MEMO.put(key, version, restored)
+                        return restored  # type: ignore[return-value]
+                    info = _memoized_session_info_v2(conn, row, db_path, host, versions)
+                    disk_payload = (
+                        {"_empty": True}
+                        if info is None
+                        else {**info, "live": False, "pid": None}
+                    )
+                    put_v(
+                        "opencode",
+                        f"v2:{db_path}:{session_id}",
+                        disk_payload,
+                        ver_str,
+                        source_path=db_path,
+                    )
+                    return info
             return _memoized_session_info_v2(conn, row, db_path, host, versions)
         except sqlite3.Error:
             return None

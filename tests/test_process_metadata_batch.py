@@ -91,3 +91,43 @@ def test_environ_batch_uses_cache_and_fetches_only_missing_pids():
         ["ps", "eww", "-p", "202", "-o", "pid=,command="],
         stderr=subprocess.DEVNULL,
     )
+
+
+def test_environ_cache_records_absent_declared_keys_on_macos():
+    output_101 = b"101 /usr/bin/pi SESSKIT_SESSION_ID=sess-a\n"
+    output_202 = b"202 /usr/bin/pi OTHER=1\n"
+    with mock.patch.object(common.sys, "platform", "darwin"), \
+         mock.patch.object(
+             common.subprocess, "check_output", side_effect=[output_101, output_202]
+         ) as check:
+        first = common.process_environs([101], extra_keys=("MISSING_HOST_KEY",))
+        second = common.process_environs([101], extra_keys=("MISSING_HOST_KEY",))
+        assert first == {101: {"SESSKIT_SESSION_ID": "sess-a"}}
+        assert second == {101: {"SESSKIT_SESSION_ID": "sess-a"}}
+        assert check.call_count == 1
+        third = common.process_environs([202], extra_keys=("MISSING_HOST_KEY",))
+        fourth = common.process_environs([202], extra_keys=("MISSING_HOST_KEY",))
+        assert third == {202: {}}
+        assert fourth == {202: {}}
+        assert check.call_count == 2
+
+
+def test_start_time_cache_applies_only_to_tracked_live_pids():
+    with mock.patch.object(common.time, "time", return_value=2_000_000.0), \
+         mock.patch.object(
+             common.subprocess, "check_output", return_value=b"123 00:10:00\n456 00:20:00\n",
+         ) as check:
+        # Untracked PIDs bypass cache
+        common.process_start_times([123, 456])
+        common.process_start_times([123, 456])
+        assert check.call_count == 2
+
+        # Tracked live PIDs reuse cached start time and evict when process exits
+        common._track_live_pids("pi", [123, 456])
+        common.process_start_times([123, 456])
+        common.process_start_times([123, 456])
+        assert check.call_count == 3
+
+        common._track_live_pids("pi", [456])
+        assert 123 not in common._PROC_START_TIME_CACHE
+        assert 456 in common._PROC_START_TIME_CACHE

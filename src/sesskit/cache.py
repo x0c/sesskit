@@ -37,6 +37,27 @@ class NullSessionCache:
     def put_session(self, runtime: str, path: str, payload: dict, extra_version: str = "") -> None:
         return None
 
+    def get_versioned_session(
+        self,
+        runtime: str,
+        key: str,
+        version: str,
+        *,
+        source_path: str | None = None,
+    ) -> dict | None:
+        return None
+
+    def put_versioned_session(
+        self,
+        runtime: str,
+        key: str,
+        payload: dict,
+        version: str,
+        *,
+        source_path: str | None = None,
+    ) -> None:
+        return None
+
     def get_conversation(self, runtime: str, key: str, path: str) -> list | None:
         return None
 
