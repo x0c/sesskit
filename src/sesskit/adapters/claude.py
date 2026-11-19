@@ -24,6 +24,7 @@ _CAPABILITY_FLAG_KWARGS = {
     "usage_data": True,
     "compaction_markers": True,
     "message_origin": True,
+    "skill_invocations": True,
 }
 
 

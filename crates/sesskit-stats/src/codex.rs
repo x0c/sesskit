@@ -130,6 +130,14 @@ fn observe(entry: &Value, ts: Option<f64>, out: &mut Vec<Observation>) {
 }
 
 
+fn is_skill_context_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("<skill>") || !trimmed.ends_with("</skill>") {
+        return false;
+    }
+    trimmed.contains("<name>") && trimmed.contains("<path>")
+}
+
 /// Real user input (`parsers/codex.py::user_message_text`): legacy
 /// `event_msg.user_message`, or a `response_item` user message whose text is not
 /// injected framework context.
@@ -138,7 +146,10 @@ fn is_user_prompt(entry: &Value) -> bool {
     match entry.get("type").and_then(Value::as_str) {
         Some("event_msg") => {
             payload.get("type").and_then(Value::as_str) == Some("user_message")
-                && payload.get("message").and_then(Value::as_str).is_some_and(|m| !m.trim().is_empty())
+                && payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| !m.trim().is_empty() && !is_skill_context_text(m))
         }
         Some("response_item") => {
             if payload.get("type").and_then(Value::as_str) != Some("message")
@@ -154,7 +165,10 @@ fn is_user_prompt(entry: &Value) -> bool {
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
-            !text.is_empty() && !text.starts_with("# AGENTS.md instructions") && !text.starts_with("<environment_context>")
+            !text.is_empty()
+                && !text.starts_with("# AGENTS.md instructions")
+                && !text.starts_with("<environment_context>")
+                && !is_skill_context_text(&text)
         }
         _ => false,
     }
@@ -323,5 +337,20 @@ mod tests {
         assert_eq!(models(&pruned), vec![(Some("gpt-b"), 310), (Some("gpt-a"), 210)]);
         assert_eq!(pruned.window_tokens, 520);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn injected_skill_context_is_excluded_from_user_prompts() {
+        let injected: Value = serde_json::from_str(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<skill>\n<name>review</name>\n<path>/skills/review/SKILL.md</path>\nBody\n</skill>"}]}}"#,
+        )
+        .unwrap();
+        assert!(!is_user_prompt(&injected));
+
+        let human: Value = serde_json::from_str(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"$review fix bug"}]}}"#,
+        )
+        .unwrap();
+        assert!(is_user_prompt(&human));
     }
 }

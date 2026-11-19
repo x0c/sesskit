@@ -148,6 +148,64 @@ def _conversation_id_from_transcript(path: str) -> str | None:
     return None
 
 
+_AGY_METADATA_RE = re.compile(
+    r"<ADDITIONAL_METADATA>([\s\S]*?)</ADDITIONAL_METADATA>"
+)
+_AGY_SKILL_BLOCK_RE = re.compile(r"<SKILL>([\s\S]*?)</SKILL>")
+_AGY_EXPLICIT_SKILL_RE = re.compile(
+    r"The user has explicitly invoked the \(([^()\r\n]+)\) skill"
+)
+_AGY_SLASH_CMD_RE = re.compile(
+    r"(?:^|\n)/([A-Za-z0-9][A-Za-z0-9._:-]*)\s+is a \[Slash Command\]:"
+)
+
+
+def extract_explicit_skills_from_user_input(content: object) -> list[tuple[str, str | None]]:
+    """Extract ``[(skill_name, args_or_none), ...]`` from Antigravity USER_INPUT.
+
+    Only ``<ADDITIONAL_METADATA>`` carrying an expanded ``<SKILL>`` block
+    confirms an explicit invocation; bare ``/name`` text without ``<SKILL>``
+    returns ``[]``.
+    """
+    text = content if isinstance(content, str) else ""
+    if "<SKILL>" not in text or "<ADDITIONAL_METADATA>" not in text:
+        return []
+    meta_match = _AGY_METADATA_RE.search(text)
+    if meta_match is None:
+        return []
+    meta = meta_match.group(1)
+    if "<SKILL>" not in meta:
+        return []
+    user_req = unwrap_user_request(text)
+    names: list[str] = []
+    for skill_match in _AGY_SKILL_BLOCK_RE.finditer(meta):
+        body = skill_match.group(1)
+        inv_match = _AGY_EXPLICIT_SKILL_RE.search(body)
+        if inv_match:
+            names.append(inv_match.group(1).strip())
+    if not names:
+        for slash_match in _AGY_SLASH_CMD_RE.finditer(meta):
+            names.append(slash_match.group(1).strip())
+    if not names and user_req.startswith("/"):
+        first_tok = user_req[1:].split(None, 1)[0].strip()
+        if first_tok and not any(ch in first_tok for ch in ("<", ">", "/")):
+            names.append(first_tok)
+    out: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for name in names:
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        args: str | None = None
+        prefix = f"/{name}"
+        if user_req.startswith(prefix):
+            rest = user_req[len(prefix):]
+            if not rest or rest[0].isspace():
+                args = rest.strip() or None
+        out.append((name, args))
+    return out
+
+
 def unwrap_user_request(content: object) -> str:
     """Return the human prompt inside an Antigravity USER_INPUT record."""
     text = content if isinstance(content, str) else ""

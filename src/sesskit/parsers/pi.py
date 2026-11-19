@@ -77,10 +77,45 @@ def message_text(content: object) -> str:
     return "\n\n".join(parts)
 
 
-_PI_SKILL_BLOCK_RE = re.compile(
-    r'\A<skill name="(?P<name>[a-z0-9]+(?:-[a-z0-9]+)*)" location="[^"\r\n]+">'
-    r'(?P<instructions>[\s\S]*)</skill>(?P<arguments>[\s\S]*)\Z'
+_PI_SKILL_LINE_PREFIX_RE = re.compile(
+    r'\A<skill name="(?P<name>[a-z0-9]+(?:-[a-z0-9]+)*)" location="(?P<location>[^"\r\n]+)">'
+    r'(?P<instructions>[\s\S]*?)\r?\n</skill>(?P<rest>(?:\r?\n[\s\S]*)?)\Z'
 )
+_PI_SKILL_PREFIX_RE = re.compile(
+    r'\A<skill name="(?P<name>[a-z0-9]+(?:-[a-z0-9]+)*)" location="(?P<location>[^"\r\n]+)">'
+    r'(?P<instructions>[\s\S]*?)</skill>(?P<rest>[\s\S]*)\Z'
+)
+
+
+def parse_pi_skill_blocks(content: object) -> tuple[list[tuple[str, str]], str] | None:
+    """Parse one or more leading Pi ``<skill name=… location=…>`` blocks.
+
+    Returns ``([(name, location), ...], trailing_arguments)`` when the user
+    message starts with one or more valid native skill blocks, else ``None``.
+    Uses non-greedy inner matching (aligned with Pi's ``parseSkillBlock``) so
+    skill bodies or multiple blocks are never mis-split.
+    """
+    text = message_text(content)
+    if not text.startswith("<skill name="):
+        return None
+    blocks: list[tuple[str, str]] = []
+    remaining = text
+    while remaining.startswith("<skill name="):
+        match = _PI_SKILL_LINE_PREFIX_RE.fullmatch(remaining) or _PI_SKILL_PREFIX_RE.fullmatch(remaining)
+        if match is None:
+            if not blocks:
+                return None
+            break
+        name = match.group("name")
+        if len(name) > 64:
+            if not blocks:
+                return None
+            break
+        blocks.append((name, match.group("location").strip()))
+        remaining = match.group("rest").lstrip()
+    if not blocks:
+        return None
+    return blocks, remaining.strip()
 
 
 def user_message_text(content: object) -> str:
@@ -91,15 +126,13 @@ def user_message_text(content: object) -> str:
     native shape is unwrapped; assistant examples and malformed lookalikes
     remain verbatim. A no-argument call retains its concise invocation marker.
     """
-    text = message_text(content)
-    match = _PI_SKILL_BLOCK_RE.fullmatch(text)
-    if match is None:
-        return text
-    name = match.group("name")
-    if len(name) > 64:
-        return text
-    arguments = match.group("arguments").strip()
-    return arguments or f"/skill:{name}"
+    parsed = parse_pi_skill_blocks(content)
+    if parsed is None:
+        return message_text(content)
+    blocks, arguments = parsed
+    if arguments:
+        return arguments
+    return " ".join(f"/skill:{name}" for name, _location in blocks)
 
 
 def read_entries(path: str) -> list[dict]:

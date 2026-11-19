@@ -49,6 +49,7 @@ class CursorAdapter(RuntimeAdapter):
         compaction_markers=False,
         message_origin=True,
         message_model_attribution=True,
+        skill_invocations=True,
     )
 
     def scan(self, limit: int = 50, keep_ids: set[str] | None = None,

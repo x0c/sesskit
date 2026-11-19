@@ -27,6 +27,7 @@ from sesskit.parsers.common import (
     terminal_error_evidence,
 )
 from sesskit.parsers.common import parse_timestamp as _parse_timestamp
+from sesskit.skills import normalize_skill_name, raw_skill_name
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects/")
 
@@ -39,30 +40,117 @@ _SKIP_PREFIXES = (
     "<bash-stderr>",
 )
 
+_BUILTIN_COMMANDS = frozenset({
+    "add-dir", "agents", "bashes", "bug", "clear", "compact", "config",
+    "context", "copy", "cost", "exit", "export", "feedback", "fork", "help",
+    "hooks", "ide", "login", "logout", "mcp", "memory", "model", "permissions",
+    "plugin", "plugins", "quit", "release-notes", "rename", "resume", "rewind",
+    "skills", "stats", "status", "tasks", "terminal-setup", "theme", "todos",
+    "upgrade", "usage", "vim",
+})
+
+_SKILL_BASE_DIR_RE = re.compile(r"\ABase directory for this skill:\s+\S+[\r\n]", re.IGNORECASE)
+_SKILL_BASE_DIR_LINE_RE = re.compile(r"\ABase directory for this skill:\s+([^\r\n]+)", re.IGNORECASE)
+
+
+def _join_content_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                t = (part.get("text") or "").strip()
+                if t:
+                    texts.append(t)
+        return " ".join(texts).strip()
+    return ""
+
+
+def parse_user_skill_command(content) -> tuple[str, str | None] | None:
+    """Parse Claude Code's native `<command-name>` + `<command-message>` wrapper.
+
+    Requires both command tags to agree (supporting ``/plugin:skill`` with
+    ``skill`` message) so unrelated prose mentioning ``<command-args>`` is
+    never unwrapped. Returns ``(raw_name, args_or_none)`` or ``None``.
+    """
+    t = _join_content_text(content)
+    if not t or not t.startswith(("<command-name>", "<command-message>")):
+        return None
+    name_m = re.search(r"<command-name>(/[^<>\s]+)</command-name>", t)
+    msg_m = re.search(r"<command-message>([^<>]+)</command-message>", t)
+    if not name_m or not msg_m:
+        return None
+    cmd_name = raw_skill_name(name_m.group(1))
+    cmd_msg = raw_skill_name(msg_m.group(1))
+    if not cmd_name or not cmd_msg:
+        return None
+    if cmd_name != cmd_msg and normalize_skill_name(cmd_name) != normalize_skill_name(cmd_msg):
+        return None
+    args_m = re.search(r"<command-args>(.*?)</command-args>", t, re.DOTALL)
+    args = args_m.group(1).strip() if args_m else ""
+    return cmd_name, (args or None)
+
+
+def is_builtin_command_name(name: str, *, catalog: set[str] | None = None, has_skill_context: bool = False) -> bool:
+    """True when a command name is a built-in Claude CLI command without skill evidence."""
+    if has_skill_context:
+        return False
+    raw = raw_skill_name(name).lower()
+    bare = normalize_skill_name(name).lower()
+    if catalog and (raw in catalog or bare in catalog):
+        return False
+    return raw in _BUILTIN_COMMANDS or bare in _BUILTIN_COMMANDS
+
+
+def is_skill_expansion_text(content) -> str | None:
+    """Return the base directory path when content is a Claude skill expansion body."""
+    t = _join_content_text(content)
+    if not t:
+        return None
+    if not _SKILL_BASE_DIR_RE.match(t):
+        return None
+    line_m = _SKILL_BASE_DIR_LINE_RE.match(t)
+    return line_m.group(1).strip() if line_m else ""
+
+
+def parse_skill_listing(entry: object) -> list[str]:
+    """Extract skill names from Claude ``attachment.type == 'skill_listing'``."""
+    if not isinstance(entry, dict) or entry.get("type") != "attachment":
+        return []
+    attachment = entry.get("attachment")
+    if not isinstance(attachment, dict) or attachment.get("type") != "skill_listing":
+        return []
+    content = attachment.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return []
+    names: list[str] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("- "):
+            continue
+        item = line[2:].strip()
+        if ": " in item:
+            item = item.split(": ", 1)[0].strip()
+        cleaned = raw_skill_name(item)
+        if cleaned:
+            names.append(cleaned)
+    return names
+
 
 def extract_text(content) -> str | None:
-    """从消息 content 中提取纯文本，跳过本地命令回显。"""
+    """从消息 content 中提取纯文本，跳过本地命令回显与注入技能正文。"""
+    parsed_cmd = parse_user_skill_command(content)
+    if parsed_cmd is not None:
+        cmd_name, args = parsed_cmd
+        return args or f"/{cmd_name}"
     if isinstance(content, str):
         t = content.strip()
         if not t:
             return None
-        command_args = re.search(r"<command-args>(.*?)</command-args>", t, re.DOTALL)
-        if command_args:
-            args = command_args.group(1).strip()
-            if args:
-                return args
-            # A prompt-based skill has both native command fields. Preserve
-            # command-only invocation, but not unrelated local-command echoes.
-            name = re.search(r"<command-name>(/[^<>\s]+)</command-name>", t)
-            message = re.search(r"<command-message>([^<>]+)</command-message>", t)
-            if (
-                t.startswith(("<command-name>", "<command-message>"))
-                and name and message
-                and name.group(1).lstrip("/") == message.group(1).strip().lstrip("/")
-            ):
-                return name.group(1)
-            return None
         if t.startswith(_SKIP_PREFIXES):
+            return None
+        if is_skill_expansion_text(t) is not None:
             return None
         if re.match(r"^<\w+>.*</\w+>$", t, re.DOTALL):
             return None
@@ -77,9 +165,11 @@ def extract_text(content) -> str | None:
                 if t:
                     texts.append(t)
         joined = " ".join(texts)
-        if joined.startswith(("<command-name>", "<command-message>")):
-            return extract_text(joined)
-        return joined or None
+        if not joined:
+            return None
+        if joined.startswith(_SKIP_PREFIXES) or is_skill_expansion_text(joined) is not None:
+            return None
+        return joined
     return None
 
 
@@ -153,6 +243,8 @@ def _last_texts(entries: list[dict]) -> tuple[str | None, str | None]:
     """Newest real user text and newest assistant text, same rules as the tail loop."""
     user = agent = None
     for e in reversed(entries):
+        if e.get("isMeta") or e.get("isSidechain"):
+            continue
         t = e.get("type")
         if user is None and t == "user":
             text = _extract_text(e.get("message", {}).get("content", ""))
@@ -544,7 +636,7 @@ def _build_session_info(
             cwd = e.get("cwd")
         if e.get("type") == "ai-title":
             ai_title = _prefer_claude_native_title(ai_title, e.get("aiTitle"))
-        if e.get("type") == "user" and first_user_msg is None:
+        if e.get("type") == "user" and not e.get("isMeta") and not e.get("isSidechain") and first_user_msg is None:
             text = _extract_text(e.get("message", {}).get("content", ""))
             if text:
                 first_user_msg = text
@@ -602,6 +694,8 @@ def _build_session_info(
             last_prompt = e.get("lastPrompt")
             title_candidates.append(("last_prompt", last_prompt))
         elif t == "user":
+            if e.get("isMeta") or e.get("isSidechain"):
+                continue
             text = _extract_text(e.get("message", {}).get("content", ""))
             if is_interrupted_marker(text):
                 last_was_user = "aborted"  # 用户主动中断当前轮次，不是真实用户消息
@@ -802,7 +896,7 @@ def _peek_head_meta(path: str, max_lines: int = 40) -> tuple[str | None, str | N
                     foreign_pointer = True
                 if cwd is None and obj.get("cwd"):
                     cwd = obj.get("cwd")
-                if obj.get("type") == "user" and first_user is None:
+                if obj.get("type") == "user" and not obj.get("isMeta") and not obj.get("isSidechain") and first_user is None:
                     text = _extract_text(obj.get("message", {}).get("content", ""))
                     if text:
                         first_user = text

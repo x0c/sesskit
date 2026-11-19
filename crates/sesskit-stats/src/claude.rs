@@ -13,13 +13,44 @@ const TEAM_LEAD_PREFIX: &str = "<teammate-message teammate_id=\"team-lead\"";
 const SKIP_PREFIXES: [&str; 6] =
     ["<local-command", "<command-name>", "<command-message>", "<bash-input>", "<bash-stdout>", "<bash-stderr>"];
 
-/// A real human prompt: non-meta user row with text outside local-command wrappers.
+fn extract_tag<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = text.find(open)? + open.len();
+    let end = text[start..].find(close)? + start;
+    Some(text[start..end].trim())
+}
+
+/// Matched Claude `<command-name>/name</command-name>` + `<command-message>name</command-message>`
+/// prompt-based skill invocations carry real user intent (`parsers/claude.py::parse_user_skill_command`).
+fn is_matched_skill_command(text: &str) -> bool {
+    if !(text.starts_with("<command-name>") || text.starts_with("<command-message>")) {
+        return false;
+    }
+    let Some(name) = extract_tag(text, "<command-name>", "</command-name>") else { return false };
+    let Some(msg) = extract_tag(text, "<command-message>", "</command-message>") else { return false };
+    let clean_name = name.trim_start_matches('/').trim();
+    let clean_msg = msg.trim_start_matches('/').trim();
+    if clean_name.is_empty() || clean_msg.is_empty() {
+        return false;
+    }
+    let bare_name = clean_name.rsplit(':').next().unwrap_or(clean_name);
+    let bare_msg = clean_msg.rsplit(':').next().unwrap_or(clean_msg);
+    clean_name == clean_msg || bare_name == bare_msg
+}
+
+/// A real human prompt: non-meta user row with text outside local-command wrappers
+/// (matched `<command-name>` + `<command-message>` skill commands count as prompts).
 fn is_user_prompt(entry: &Value) -> bool {
     if entry.get("type").and_then(Value::as_str) != Some("user") || truthy(entry.get("isMeta")) {
         return false;
     }
     let text = text_of(entry.get("message").and_then(|m| m.get("content")));
-    !text.is_empty() && !SKIP_PREFIXES.iter().any(|p| text.starts_with(p))
+    if text.is_empty() || text.starts_with("Base directory for this skill:") {
+        return false;
+    }
+    if is_matched_skill_command(&text) {
+        return true;
+    }
+    !SKIP_PREFIXES.iter().any(|p| text.starts_with(p))
 }
 const HEAD_LINES: usize = 40;
 
@@ -209,4 +240,36 @@ pub fn read(path: &Path, window: &Window) -> Option<SessionStats> {
         b.loop_count = crate::loops::claude_from_bytes(&bytes).ok().flatten();
     }
     Some(b.finish(window))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matched_skill_command_counts_as_user_prompt_while_meta_stays_excluded() {
+        let skill_cmd: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":"<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args></command-args>"}}"#,
+        )
+        .unwrap();
+        assert!(is_user_prompt(&skill_cmd));
+
+        let local_cmd: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/cost</command-name>"}}"#,
+        )
+        .unwrap();
+        assert!(!is_user_prompt(&local_cmd));
+
+        let meta_skill: Value = serde_json::from_str(
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Base directory for this skill: /skills/review\nBody"}}"#,
+        )
+        .unwrap();
+        assert!(!is_user_prompt(&meta_skill));
+
+        let non_meta_base_dir: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":"Base directory for this skill: /skills/review\nBody"}}"#,
+        )
+        .unwrap();
+        assert!(!is_user_prompt(&non_meta_base_dir));
+    }
 }

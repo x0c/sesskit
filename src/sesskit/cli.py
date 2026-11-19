@@ -15,6 +15,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from typing import Any
 
 from sesskit import __version__, titles
 from sesskit.adapters import list_adapters
@@ -1127,6 +1128,110 @@ def cmd_usage(args, registry: ParserRegistry) -> dict:
     return ok(payload)
 
 
+def cmd_skills(args, registry: ParserRegistry) -> dict:
+    """Show normalized skill invocations (active explicit vs passive auto) for a session or scan."""
+    from sesskit import skills as _skills
+
+    ref = getattr(args, "session", None)
+    trigger_filter = getattr(args, "trigger", None)
+    include_missing = _include_missing_cwd(args)
+    if ref:
+        session = resolve_ref(
+            registry,
+            ref,
+            _RESOLVE_SCAN_LIMIT,
+            include_missing_cwd=include_missing,
+        )
+        snapshot = _skills.load_skills(session)
+        if snapshot.state == "unavailable":
+            raise ApiError(
+                "load_failed",
+                f"history unreadable: {ref}",
+                EXIT_ERROR,
+                hint="the session may have been deleted; refresh with sesskit list",
+                next_commands=["sesskit list"],
+            )
+        invocations = snapshot.invocations
+        if trigger_filter:
+            invocations = tuple(i for i in invocations if i.trigger == trigger_filter)
+        filtered_snapshot = _skills.SkillSnapshot(
+            state=snapshot.state,
+            runtime=snapshot.runtime,
+            session_id=snapshot.session_id,
+            invocations=invocations,
+            schema=snapshot.schema,
+        )
+        return ok(_skills.skill_snapshot_to_dict(filtered_snapshot))
+
+    runtime_filter = getattr(args, "runtime", None)
+    limit = max(1, int(getattr(args, "limit", 50) or 50))
+    raw_since = getattr(args, "since", None)
+    raw_until = getattr(args, "until", None)
+    since_ts = _parse_time_bound(raw_since, is_until=False) if raw_since else None
+    until_ts = _parse_time_bound(raw_until, is_until=True) if raw_until else None
+    if runtime_filter:
+        try:
+            runtime_parser = registry.get(runtime_filter)
+        except KeyError as exc:
+            raise ApiError(
+                "usage_error",
+                f"unknown runtime: {runtime_filter}",
+                EXIT_USAGE,
+            ) from exc
+        sessions = runtime_parser.scan_sessions(
+            limit,
+            include_missing_cwd=include_missing,
+        )
+    else:
+        scanned = registry.scan_all(
+            limit,
+            include_missing_cwd=include_missing,
+        )
+        sessions = [
+            s
+            for runtime_sessions in scanned.values()
+            for s in runtime_sessions
+        ]
+    if since_ts is not None:
+        sessions = [s for s in sessions if (s.get("mtime") or 0) >= since_ts]
+    if until_ts is not None:
+        sessions = [s for s in sessions if (s.get("mtime") or 0) <= until_ts]
+
+    paired: list[tuple[tuple[str, str], Any]] = []
+    flat_invocations: list[dict] = []
+    sessions_with_skills: set[str] = set()
+    for s in sessions:
+        snap = _skills.load_skills(s)
+        if snap.state != "available":
+            continue
+        invs = snap.invocations
+        if trigger_filter:
+            invs = tuple(i for i in invs if i.trigger == trigger_filter)
+        if not invs:
+            continue
+        s_key = f"{s['source']}:{s['id']}"
+        sessions_with_skills.add(s_key)
+        for inv in invs:
+            paired.append(((s_key, str(s["source"])), inv))
+            row = _skills.skill_invocation_to_dict(inv)
+            row["session"] = s_key
+            row["runtime"] = s["source"]
+            flat_invocations.append(row)
+
+    summary = _skills.summarize_skills(paired, session_key_fn=lambda k: k)
+    payload: dict[str, Any] = {
+        "schema": _skills.SKILLS_SCHEMA_ID,
+        "mode": "summary",
+        "scanned_sessions": len(sessions),
+        "sessions_with_skills": len(sessions_with_skills),
+        "total_invocations": len(flat_invocations),
+        "summary": summary,
+    }
+    if getattr(args, "detail", "summary") == "invocations":
+        payload["invocations"] = flat_invocations
+    return ok(payload)
+
+
 COMMANDS = [
     {
         "name": "list",
@@ -1247,6 +1352,24 @@ COMMANDS = [
         "handler": cmd_stats,
         "args": stats_args(),
         "returns": {"schema": "sesskit.stats/v1", "by": "session|project", "totals": "bounded active-time sums"},
+    },
+    {
+        "name": "skills",
+        "help": "Inspect or summarize normalized skill invocations (explicit active vs auto passive) across runtimes",
+        "handler": cmd_skills,
+        "args": [
+            {"flags": ["session"], "kwargs": {"nargs": "?", "default": None, "help": "optional id, prefix, or runtime:id; omit to summarize scanned sessions"}},
+            {"flags": ["--runtime"], "kwargs": {"help": "filter by runtime when summarizing"}},
+            {"flags": ["--limit"], "kwargs": {"type": int, "default": 50, "help": "scan depth per runtime when summarizing"}},
+            {"flags": ["--since"], "kwargs": {"help": "lower mtime bound (e.g. 7d, 30d, ISO date)"}},
+            {"flags": ["--until"], "kwargs": {"help": "upper mtime bound"}},
+            {"flags": ["--trigger"], "kwargs": {"choices": ["explicit", "auto", "unknown"], "help": "filter invocations by trigger kind"}},
+            {"flags": ["--detail"], "kwargs": {"choices": ["summary", "invocations"], "default": "summary", "help": "summary only (default) or include invocations array in multi-session mode"}},
+            {"flags": ["--include-missing-cwd"], "kwargs": {"action": "store_true"}},
+            {"flags": ["--compact"], "kwargs": {"action": "store_true"}},
+            {"flags": ["--json"], "kwargs": {"action": "store_true", "help": "single-line JSON output (same as --compact)"}},
+        ],
+        "returns": {"schema": "sesskit.skills/v1", "summary": "aggregated skill counts", "invocations": "per-invocation records"},
     },
     {
         "name": "share",

@@ -173,7 +173,10 @@ _V2_VERSIONS_SQL = (
 _V2_VERSIONS_BATCH = 500
 
 # 非对话行：tail/状态判定与正文提取一律跳过这些 type。
-_V2_SKIP_TYPES = frozenset({"system", "synthetic", "compaction", "idle"})
+_V2_SKIP_TYPES = frozenset({
+    "system", "synthetic", "compaction", "idle",
+    "skill", "shell", "model-switched", "agent-switched", "location-switched",
+})
 
 
 def _v2_json_dict(raw: object) -> dict:

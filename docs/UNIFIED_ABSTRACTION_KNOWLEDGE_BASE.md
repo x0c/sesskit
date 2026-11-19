@@ -239,7 +239,11 @@ emits one typed-only `lifecycle` error event (classified kind, `turn` scope,
 native `errorMessage` evidence, verbatim stop reason); the v1 projection
 skips it, so v1 bytes stay identical. The Pi incremental reader shares the
 same builder, so snapshot and reader agree event-for-event. User-message events carry a native-evidence `origin`
-(human/injected/system/unknown); assistant messages carry native `Usage`
+(human/injected/system/unknown); events and turns carry structured
+`SkillInvocation` metadata (`skills`) separated from human prompt text, and
+`ActivitySnapshot.skill_invocations` / `load_skills()` deduplicate per-turn
+active (`explicit`) versus passive (`auto`) invocations while preserving
+`evidence`; assistant messages carry native `Usage`
 (model plus token/cost fields, never estimated) where recorded; compaction
 boundaries surface as standalone `compaction` events or `CompactionInfo`
 markers on the projected event. `session_relations()` reports native

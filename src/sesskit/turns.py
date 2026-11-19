@@ -19,6 +19,7 @@ from sesskit.models import (
     Evidence,
     InteractionEvent,
     SessionOutcome,
+    SkillInvocation,
     ToolInvocation,
     Turn,
     TurnOutcome,
@@ -180,6 +181,10 @@ def derive_turns(snapshot: ActivitySnapshot, *, runtime: str = "") -> tuple[Turn
         if event.type == "user_message" and spans[-1]:
             spans.append([])
         spans[-1].append(event)
+    by_seq_skills: dict[int, list[SkillInvocation]] = {}
+    for inv in derive_skill_invocations(snapshot, runtime=runtime):
+        if inv.seq is not None:
+            by_seq_skills.setdefault(inv.seq, []).append(inv)
     # Drop a trailing empty span (cannot happen: spans only split on append).
     turns: list[Turn] = []
     for index, span in enumerate(spans):
@@ -189,6 +194,9 @@ def derive_turns(snapshot: ActivitySnapshot, *, runtime: str = "") -> tuple[Turn
             (event.seq for event in span if event.type == "user_message"), None,
         )
         is_last = index == len(spans) - 1
+        span_skills: list[SkillInvocation] = []
+        for event in span:
+            span_skills.extend(by_seq_skills.get(event.seq, ()))
         turns.append(Turn(
             turn_id=_span_turn_id(span, index),
             index=index,
@@ -196,6 +204,7 @@ def derive_turns(snapshot: ActivitySnapshot, *, runtime: str = "") -> tuple[Turn
             end_seq=span[-1].seq,
             outcome=_turn_outcome(span, is_last=is_last, runtime=runtime),
             user_seq=user_seq,
+            skills=tuple(span_skills),
         ))
     for status in [turn.outcome.status for turn in turns]:
         assert status in _TURN_STATUSES, status
@@ -383,6 +392,131 @@ def error_views(
             source_seq=event.seq,
         ))
     return tuple(views)
+
+
+def derive_skill_invocations(
+    snapshot: ActivitySnapshot, *, runtime: str = "",
+) -> tuple[SkillInvocation, ...]:
+    """Derive deduplicated, logical-round-correlated skill invocations.
+
+    Logical rounds split on non-injected ``user_message`` events so runtime
+    expansion blocks emitted as separate ``origin="injected"`` rows (such as
+    Codex ``<skill>`` blocks) correlate with the preceding human request and
+    suppress duplicate passive ``skill_tool`` / ``file_read`` detections for
+    the same skill within that round.
+    """
+    del runtime  # Behavior is driven purely by event evidence, never runtime names.
+    events = list(snapshot.events)
+    if not events:
+        return ()
+
+    # Split into turn spans (matching derive_turns for turn_id assignment) and
+    # logical rounds (grouping injected user_messages with their trigger round).
+    turn_spans: list[list[ActivityEvent]] = [[]]
+    for event in events:
+        if event.type == "user_message" and turn_spans[-1]:
+            turn_spans.append([])
+        turn_spans[-1].append(event)
+
+    seq_to_turn_id: dict[int, str] = {}
+    for index, span in enumerate(turn_spans):
+        tid = _span_turn_id(span, index)
+        for event in span:
+            seq_to_turn_id[event.seq] = tid
+
+    logical_rounds: list[list[ActivityEvent]] = [[]]
+    for event in events:
+        if (
+            event.type == "user_message"
+            and event.origin != "injected"
+            and logical_rounds[-1]
+        ):
+            logical_rounds.append([])
+        logical_rounds[-1].append(event)
+
+    def _keys(inv: SkillInvocation) -> tuple[str, str]:
+        return (inv.name.strip().lower(), inv.bare_name.lower())
+
+    results: list[SkillInvocation] = []
+    for round_events in logical_rounds:
+        round_out: list[SkillInvocation] = []
+        explicit_index: dict[str, int] = {}
+        explicit_keys: set[str] = set()
+        skill_tool_keys: set[tuple[str, str]] = set()
+        skill_tool_names: set[str] = set()
+        file_read_names: set[str] = set()
+
+        for event in round_events:
+            if not event.skills:
+                continue
+            tid = event.turn_id or seq_to_turn_id.get(event.seq)
+            for inv in event.skills:
+                stamped = replace(
+                    inv,
+                    seq=inv.seq if inv.seq is not None else event.seq,
+                    ts=inv.ts if inv.ts is not None else event.ts,
+                    turn_id=inv.turn_id or tid,
+                )
+                k_raw, k_bare = _keys(stamped)
+                if stamped.trigger == "explicit":
+                    existing_idx = explicit_index.get(k_raw)
+                    if existing_idx is None and k_bare:
+                        existing_idx = explicit_index.get(k_bare)
+                    if existing_idx is not None:
+                        prev = round_out[existing_idx]
+                        # Upgrade inferred explicit mention with native confirmation
+                        # (e.g., Codex human [$skill](...) followed by <skill> block)
+                        # while preserving user arguments when missing.
+                        if prev.evidence.origin == "inferred" and stamped.evidence.origin == "native":
+                            merged_args = stamped.arguments or prev.arguments
+                            round_out[existing_idx] = replace(stamped, arguments=merged_args)
+                        elif prev.arguments is None and stamped.arguments is not None:
+                            round_out[existing_idx] = replace(prev, arguments=stamped.arguments)
+                        continue
+                    idx = len(round_out)
+                    round_out.append(stamped)
+                    explicit_index[k_raw] = idx
+                    if k_bare:
+                        explicit_index[k_bare] = idx
+                        explicit_keys.add(k_bare)
+                    explicit_keys.add(k_raw)
+                    continue
+
+                if k_raw in explicit_keys or (k_bare and k_bare in explicit_keys):
+                    # Already explicitly invoked in this logical round; avoid
+                    # double-counting a companion Skill tool_use or SKILL.md read.
+                    continue
+
+                if stamped.detection == "skill_tool":
+                    arg_key = (stamped.arguments or "").strip()
+                    if (k_raw, arg_key) in skill_tool_keys or (k_bare, arg_key) in skill_tool_keys:
+                        continue
+                    round_out.append(stamped)
+                    skill_tool_keys.add((k_raw, arg_key))
+                    skill_tool_keys.add((k_bare, arg_key))
+                    skill_tool_names.add(k_raw)
+                    if k_bare:
+                        skill_tool_names.add(k_bare)
+                    continue
+
+                if stamped.detection == "file_read":
+                    if (
+                        k_raw in skill_tool_names
+                        or (k_bare and k_bare in skill_tool_names)
+                        or k_raw in file_read_names
+                        or (k_bare and k_bare in file_read_names)
+                    ):
+                        continue
+                    round_out.append(stamped)
+                    file_read_names.add(k_raw)
+                    if k_bare:
+                        file_read_names.add(k_bare)
+                    continue
+
+                round_out.append(stamped)
+
+        results.extend(round_out)
+    return tuple(results)
 
 
 def interaction_views(snapshot: ActivitySnapshot) -> tuple[InteractionEvent, ...]:

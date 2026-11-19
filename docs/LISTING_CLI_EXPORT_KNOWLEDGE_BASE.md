@@ -19,7 +19,7 @@
 ## §1 Business background and core concepts
 
 This domain is the user-facing surface of SessKit: session discovery output
-(`list`, `search`), single-session reads (`show`), bulk and share exports
+(`list`, `search`), single-session reads (`show`, `skills`), bulk and share exports
 (`export`, `share`), and command introspection (`describe`). Those snapshot
 commands print one JSON envelope (`ok`, `data`, `error`, `meta`). The additive
 `stream` observer prints versioned bare JSONL records, including structured error

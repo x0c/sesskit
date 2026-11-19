@@ -56,6 +56,7 @@ sesskit search refactor --top 3
 sesskit show <会话id或前缀> --full
 sesskit share <会话id> --out /tmp/share.json
 sesskit export --since 7d --out /tmp/week.json
+sesskit skills --limit 20
 sesskit describe
 sesskit verify --sample 30
 ```
@@ -71,7 +72,7 @@ sesskit verify --sample 30
 ## Python API
 
 ```python
-from sesskit import load_session_conversation, refresh_session
+from sesskit import load_session_conversation, load_skills, refresh_session
 from sesskit.registry import default_registry
 from sesskit.transcript import load_events, SCHEMA_ID
 
@@ -81,6 +82,7 @@ for runtime_id, items in sessions.items():
     for session in items[:3]:
         messages = load_session_conversation(session)
         events = load_events(session)  # SCHEMA_ID == "sesskit.transcript/v1"
+        skills = load_skills(session)  # SCHEMA_ID == "sesskit.skills/v1"（区分 explicit 与 auto）
         # 两次扫描之间刷新本条会话；历史已不存在时返回 None。
         fresh = refresh_session(session)
 ```

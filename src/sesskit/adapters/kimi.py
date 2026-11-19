@@ -27,7 +27,7 @@ class KimiAdapter(RuntimeAdapter):
     # heuristic tool-result status, no structured interaction normalization.
     # Typed-activity adaptation stays deferred, but the wire log's
     # turn-scoped `usage.record` events are a verified native usage mapping.
-    capabilities = Capabilities(usage_data=True, performance_data=True)
+    capabilities = Capabilities(usage_data=True, performance_data=True, skill_invocations=True)
 
     def scan(self, limit: int = 50, keep_ids: set[str] | None = None,
              *, include_missing_cwd: bool = False) -> Any:
@@ -53,6 +53,9 @@ class KimiAdapter(RuntimeAdapter):
         from sesskit.transcript import _parse_kimi
 
         return _parse_kimi(session)
+
+    def load_skills(self, session: dict) -> Any:
+        return _parser.extract_skill_snapshot(session)
 
     def performance_capabilities(self) -> Any:
         from sesskit.performance_adapters import kimi as _performance_kimi

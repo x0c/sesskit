@@ -62,6 +62,8 @@ class Capabilities:
     #: Plain conversation load accepts ``include_errors`` to bring back
     #: error-only assistant turns hidden from the default chat view.
     conversation_include_errors: bool = False
+    #: Structured skill-invocation extraction (active vs passive) is supported.
+    skill_invocations: bool = False
 
 
 def session_path(session: dict, runtime_id: str) -> str:
@@ -123,6 +125,22 @@ class RuntimeAdapter(ABC):
     @abstractmethod
     def load_events(self, session: dict) -> list[dict]:
         """Project the session to v1 transcript dicts (byte-compatible)."""
+
+    def load_skills(self, session: dict) -> Any:
+        """Load deduplicated skill invocations for one scanned session dict."""
+        from sesskit.skills import SkillSnapshot
+
+        runtime = str(session.get("source") or self.id or "unknown")
+        session_id = str(session.get("id") or "") or None
+        if not self.capabilities.typed_activity:
+            return SkillSnapshot(state="unsupported", runtime=runtime, session_id=session_id)
+        snapshot = self.load_activity(session)
+        return SkillSnapshot(
+            state=snapshot.state,
+            runtime=runtime,
+            session_id=session_id,
+            invocations=snapshot.skill_invocations,
+        )
 
     def load_usage(self, session: dict, *, history_view: str = "all_branches") -> Any:
         """Load preserved token/cost usage for a scanned session dict.

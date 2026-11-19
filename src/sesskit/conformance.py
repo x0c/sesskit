@@ -322,6 +322,22 @@ def check_conversation(conversation: Sequence[Any], events: Sequence[Any], *,
     return violations
 
 
+def check_skills(snapshot: ActivitySnapshot) -> list[Violation]:
+    """Skill invocations carry non-empty names and non-unknown evidence when known."""
+    violations: list[Violation] = []
+    if snapshot.state != "available":
+        return violations
+    for inv in snapshot.skill_invocations:
+        if not inv.name.strip():
+            violations.append(Violation("skill_name", f"seq={inv.seq} has empty skill name"))
+        if inv.trigger != "unknown" and inv.evidence.origin == "unknown":
+            violations.append(Violation(
+                "skill_evidence",
+                f"seq={inv.seq} has trigger={inv.trigger} with unknown evidence",
+            ))
+    return violations
+
+
 def run_conformance(
     runtime: str,
     *,
@@ -345,6 +361,7 @@ def run_conformance(
         violations.extend(check_pairing(typed))
         violations.extend(check_evidence(typed))
         violations.extend(check_outcome(snapshot))
+        violations.extend(check_skills(snapshot))
         if compare_views:
             violations.extend(check_v1_parity(snapshot, v1_events))
         state = snapshot.state

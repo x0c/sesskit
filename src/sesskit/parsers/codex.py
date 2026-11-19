@@ -167,14 +167,67 @@ def _terminal_fingerprint(kind: str, entry: dict, payload: dict, text: str) -> s
 
 
 _SKILL_CONTEXT_RE = re.compile(
-    r"\A<skill>\s*<name>[^<>\r\n]+</name>\s*<path>[^<>\r\n]+</path>"
-    r"[\s\S]*</skill>\Z"
+    r"\A(?:<skill>\s*<name>[^<>\r\n]+</name>\s*<path>[^<>\r\n]+</path>"
+    r"[\s\S]*?</skill>\s*)+\Z"
+)
+_SKILL_BLOCK_ITEM_RE = re.compile(
+    r"<skill>\s*<name>([^<>\r\n]+)</name>\s*<path>([^<>\r\n]+)</path>[\s\S]*?</skill>"
+)
+_CODEX_SKILL_LINK_RE = re.compile(
+    r"\[\$([a-z0-9][a-z0-9._:/-]{0,127})\]\(([^()\r\n]*?/SKILL\.md)\)"
+)
+_CODEX_DOLLAR_MENTION_RE = re.compile(
+    r"(?:^|(?<=[\s(\"'\[,]))\$([a-z0-9][a-z0-9-]{1,63})(?=\s|$|[.,;:!?)\]\"'])"
 )
 
 
 def is_skill_context_text(text: str) -> bool:
     """A complete Codex-injected skill fragment, not an ordinary $skill prompt."""
     return _SKILL_CONTEXT_RE.fullmatch(text.strip()) is not None
+
+
+def parse_codex_skill_context(text: str) -> list[tuple[str, str]]:
+    """Return ``[(name, path), ...]`` from a complete Codex ``<skill>`` block."""
+    stripped = text.strip()
+    if not is_skill_context_text(stripped):
+        return []
+    return [
+        (m.group(1).strip(), m.group(2).strip())
+        for m in _SKILL_BLOCK_ITEM_RE.finditer(stripped)
+    ]
+
+
+def normalize_codex_skill_links(text: str) -> str:
+    """Collapse Codex ``[$name](…/SKILL.md)`` UI links to ``$name``."""
+    if "SKILL.md)" not in text:
+        return text
+    return _CODEX_SKILL_LINK_RE.sub(lambda m: f"${m.group(1)}", text)
+
+
+def extract_codex_user_skill_mentions(text: str) -> list[tuple[str, str | None, str]]:
+    """Return ``[(name, path_or_none, source_field)]`` from human Codex text.
+
+    Markdown skill links (``[$name](…/SKILL.md)``) carry a direct path; bare
+    ``$name`` mentions return ``path=None`` and are treated as weak/inferred
+    unless confirmed by a companion ``<skill>`` injection block.
+    """
+    out: list[tuple[str, str | None, str]] = []
+    seen: set[str] = set()
+    for m in _CODEX_SKILL_LINK_RE.finditer(text):
+        name = m.group(1).strip()
+        path = m.group(2).strip()
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append((name, path, "markdown_link"))
+    cleaned = normalize_codex_skill_links(text)
+    for m in _CODEX_DOLLAR_MENTION_RE.finditer(cleaned):
+        name = m.group(1).strip()
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append((name, None, "dollar_mention"))
+    return out
 
 
 def _response_message_text(payload: dict, role: str) -> str:
@@ -194,6 +247,8 @@ def _response_message_text(payload: dict, role: str) -> str:
         return ""
     if role == "user" and is_skill_context_text(text):
         return ""
+    if role == "user":
+        text = normalize_codex_skill_links(text)
     return text
 
 
@@ -251,7 +306,10 @@ def user_message_text(entry: dict) -> str:
     if not isinstance(payload, dict):
         return ""
     if entry.get("type") == "event_msg" and payload.get("type") == "user_message":
-        return str(payload.get("message") or "").strip()
+        text = str(payload.get("message") or "").strip()
+        if not text or is_skill_context_text(text):
+            return ""
+        return normalize_codex_skill_links(text)
     if entry.get("type") == "response_item":
         return _response_message_text(payload, "user")
     return ""

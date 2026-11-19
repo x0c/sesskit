@@ -48,6 +48,13 @@ from sesskit.parsers.common import (
 CHATS_DIR = os.path.expanduser("~/.cursor/chats")
 
 _USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
+_ATTACHED_SKILLS_RE = re.compile(
+    r"<manually_attached_skills>\s*([\s\S]*?)\s*</manually_attached_skills>"
+)
+_SKILL_NAME_LINE_RE = re.compile(r"^\s*Skill Name:\s*([^\r\n]+)", re.MULTILINE)
+_SKILL_PATH_LINE_RE = re.compile(r"^\s*Path:\s*([^\r\n]+)", re.MULTILINE)
+_AGENT_SKILL_TAG_RE = re.compile(r'<agent_skill\b[^>]*\bfullPath="([^"\r\n]+)"')
+_SUMMARY_REPLAY_PREFIX = "[Previous conversation summary]:"
 # Cursor CLI：`agent --resume <uuid>` / `--resume=<uuid>`；`-1` 表示续最近一条，无法精确绑定。
 _RESUME_ID_RE = re.compile(
     r"--resume(?:=|\s+)(?P<id>-1|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
@@ -823,11 +830,65 @@ def _text_from_content(content) -> str:
     return "\n".join(parts)
 
 
+def is_summary_replay_blob(raw: str) -> bool:
+    """True when a Cursor user blob is a compacted conversation summary replay."""
+    return raw.lstrip().startswith(_SUMMARY_REPLAY_PREFIX)
+
+
+def extract_skill_catalog(raw: str, catalog: dict[str, str]) -> None:
+    """Populate ``path -> skill_name`` from Cursor ``<agent_skills>`` listings."""
+    if "<agent_skills>" not in raw:
+        return
+    from sesskit.skills import skill_from_path
+
+    for match in _AGENT_SKILL_TAG_RE.finditer(raw):
+        resolved = skill_from_path(match.group(1))
+        if resolved is not None:
+            name, norm_path = resolved
+            catalog[norm_path] = name
+
+
+def extract_attached_skills_from_blob(obj: dict) -> list[tuple[str, str | None]]:
+    """Extract ``[(skill_name, path_or_none), ...]`` from a current user turn."""
+    if obj.get("role") != "user":
+        return []
+    raw = _text_from_content(obj.get("content"))
+    if not raw or is_summary_replay_blob(raw):
+        return []
+    # Only current user turns (with <user_query> or structured parts list) carry
+    # live attachments; string-only compacted summaries are excluded.
+    if not _USER_QUERY_RE.search(raw) and not isinstance(obj.get("content"), list):
+        return []
+    block_match = _ATTACHED_SKILLS_RE.search(raw)
+    if block_match is None:
+        return []
+    block = block_match.group(1)
+    from sesskit.skills import raw_skill_name, skill_from_path
+
+    # Split per-skill sections when multiple skills are attached in one block.
+    names = [raw_skill_name(m.group(1)) for m in _SKILL_NAME_LINE_RE.finditer(block)]
+    paths = [m.group(1).strip() for m in _SKILL_PATH_LINE_RE.finditer(block)]
+    if names:
+        out: list[tuple[str, str | None]] = []
+        for index, name in enumerate(names):
+            if not name:
+                continue
+            path = paths[index] if index < len(paths) else None
+            out.append((name, path))
+        return out
+    out = []
+    for path in paths:
+        resolved = skill_from_path(path)
+        if resolved is not None:
+            out.append((resolved[0], resolved[1]))
+    return out
+
+
 def user_text_from_blob(obj: dict) -> str | None:
     if obj.get("role") != "user":
         return None
     raw = _text_from_content(obj.get("content"))
-    if not raw:
+    if not raw or is_summary_replay_blob(raw):
         return None
     match = _USER_QUERY_RE.search(raw)
     if match:

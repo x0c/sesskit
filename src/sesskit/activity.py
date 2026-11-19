@@ -34,6 +34,7 @@ from sesskit.models import (
     QuestionItem,
     QuestionOption,
     SessionOutcome,
+    SkillInvocation,
     ToolResultOutcome,
     Usage,
 )
@@ -41,6 +42,7 @@ from sesskit.parsers import claude as scan_claude
 from sesskit.parsers import codex as scan_codex
 from sesskit.parsers import pi as scan_pi
 from sesskit.parsers.common import classify_tool, parse_timestamp
+from sesskit.skills import normalize_skill_name, raw_skill_name, skill_from_tool_call
 from sesskit.transcript import _codex_custom_input as _codex_coerce_custom
 from sesskit.transcript import _codex_reasoning_text as _codex_reasoning
 from sesskit.transcript import _failed as _heuristic_status
@@ -376,6 +378,25 @@ def _build_pi_events(
     events: list[ActivityEvent] = []
     pending_compactions = dict(compactions or {})
     pending_transitions = dict(transitions or {})
+    pi_catalog: dict[str, str] = {}
+
+    def _collect_pi_catalog(msg: dict) -> None:
+        sections = msg.get("sections")
+        if not isinstance(sections, dict):
+            return
+        skills_xml = sections.get("skills")
+        if not isinstance(skills_xml, str) or "<available_skills>" not in skills_xml:
+            return
+        import re as _re
+
+        for m in _re.finditer(
+            r"<skill>\s*<name>([^<>\r\n]+)</name>[\s\S]*?<location>([^<>\r\n]+)</location>[\s\S]*?</skill>",
+            skills_xml,
+        ):
+            sname = raw_skill_name(m.group(1))
+            sloc = m.group(2).strip()
+            if sname and sloc:
+                pi_catalog[sloc] = sname
 
     def add(event_type: str, ts: float | None, message_id: str,
             record: str, **fields: Any) -> None:
@@ -466,10 +487,30 @@ def _build_pi_events(
         ts = parse_timestamp(item.get("timestamp")) or parse_timestamp(message.get("timestamp"))
         role = message.get("role")
         usage = _pi_usage(message, record)
+        if role == "system":
+            _collect_pi_catalog(message)
+            continue
         if role == "user":
+            content_obj = message.get("content")
+            parsed_skill = scan_pi.parse_pi_skill_blocks(content_obj)
+            user_skills: tuple[SkillInvocation, ...] = ()
+            if parsed_skill is not None:
+                blocks, skill_args = parsed_skill
+                user_skills = tuple(
+                    SkillInvocation(
+                        name=bname,
+                        trigger="explicit",
+                        detection="command",
+                        evidence=Evidence(_NATIVE, field="skill_block", record=record),
+                        arguments=skill_args or None,
+                        path=bloc or None,
+                    )
+                    for bname, bloc in blocks
+                )
             add("user_message", ts, message_id, record,
-                text=scan_pi.user_message_text(message.get("content")),
-                origin="human")
+                text=scan_pi.user_message_text(content_obj),
+                origin="human",
+                skills=user_skills)
             continue
         if role == "toolResult":
             output = message.get("content")
@@ -544,10 +585,17 @@ def _build_pi_events(
                         surfaced_error = message_error is not None
                 elif part_type == "toolCall":
                     raw = part.get("arguments") if part.get("arguments") is not None else part.get("input")
+                    tname = str(part.get("name") or "tool")
+                    cid = str(part.get("id") or "")
+                    coerced = _coerce_input(raw)
+                    tskills = skill_from_tool_call(
+                        tname, coerced, record=record, call_id=cid, catalog=pi_catalog or None,
+                    )
                     add("tool_call", ts, message_id, record,
-                        name=str(part.get("name") or "tool"),
-                        call_id=str(part.get("id") or ""),
-                        raw_input=_coerce_input(raw))
+                        name=tname,
+                        call_id=cid,
+                        raw_input=coerced,
+                        skills=tskills)
                     emitted = True
                     has_tool_call = True
         if message_error is not None and emitted and not surfaced_error:
@@ -821,6 +869,8 @@ class _ClaudeFeed:
         self.calls: dict[str, tuple[int, str, object, int]] = {}
         # call_id -> (output, typed outcome, result row)
         self.results: dict[str, tuple[Any, ToolResultOutcome, int]] = {}
+        self.skill_catalog: set[str] = set()
+        self.pending_command: tuple[int | None, str, str | None, str] | None = None
 
     def _add(self, event_type: str, ts: float | None, record: str, **fields: Any) -> int | None:
         text = fields.get("text")
@@ -845,9 +895,28 @@ class _ClaudeFeed:
         """Interpret one batch of ``(lineno, entry)`` rows, appending events."""
         before = len(self.events)
         for lineno, entry in rows:
-            if not isinstance(entry, dict) or entry.get("isMeta") or entry.get("isSidechain"):
+            if not isinstance(entry, dict) or entry.get("isSidechain"):
                 continue
             record = _claude_record(lineno)
+            if entry.get("isMeta"):
+                if entry.get("type") == "user" and self.pending_command is not None:
+                    meta_msg = entry.get("message")
+                    meta_content = meta_msg.get("content") if isinstance(meta_msg, dict) else None
+                    base_dir = scan_claude.is_skill_expansion_text(meta_content)
+                    if base_dir is not None:
+                        ev_idx, cmd_name, cmd_args, cmd_record = self.pending_command
+                        if ev_idx is not None and 0 <= ev_idx < len(self.events):
+                            confirmed = SkillInvocation(
+                                name=cmd_name,
+                                trigger="explicit",
+                                detection="command",
+                                evidence=Evidence(_NATIVE, field="command-name+isMeta", record=cmd_record),
+                                arguments=cmd_args,
+                                path=base_dir or None,
+                            )
+                            self.events[ev_idx] = replace(self.events[ev_idx], skills=(confirmed,))
+                        self.pending_command = None
+                continue
             err_text = scan_claude.system_error_text(entry)
             if err_text:
                 field = "isApiErrorMessage" if entry.get("isApiErrorMessage") is True else "error.formatted"
@@ -857,6 +926,8 @@ class _ClaudeFeed:
             if entry.get("type") == "system":
                 continue
             if entry.get("type") == "attachment":
+                for listed in scan_claude.parse_skill_listing(entry):
+                    self.skill_catalog.add(listed.lower())
                 text = scan_claude.queued_command_text(entry)
                 if text:
                     if self.pending_error is not None:
@@ -907,6 +978,20 @@ class _ClaudeFeed:
                 if origin_kind not in (None, "human"):
                     continue
                 compact = entry.get("isCompactSummary") is True
+                parsed_cmd = None if compact else scan_claude.parse_user_skill_command(content or "")
+                user_skills: tuple[SkillInvocation, ...] = ()
+                if parsed_cmd is not None:
+                    cmd_name, cmd_args = parsed_cmd
+                    if not scan_claude.is_builtin_command_name(cmd_name, catalog=self.skill_catalog):
+                        user_skills = (
+                            SkillInvocation(
+                                name=cmd_name,
+                                trigger="explicit",
+                                detection="command",
+                                evidence=Evidence(_NATIVE, field="command-name", record=record),
+                                arguments=cmd_args,
+                            ),
+                        )
                 text = scan_claude.extract_text(content or "")
                 if text and not scan_claude.is_interrupted_marker(text):
                     if self.pending_error is not None:
@@ -921,10 +1006,18 @@ class _ClaudeFeed:
                         self._add("user_message", ts, record, text=text, origin="system",
                                   compaction=CompactionInfo(
                                       Evidence(_NATIVE, field="isCompactSummary", record=record)))
-                    elif origin_kind == "human":
-                        self._add("user_message", ts, record, text=text, origin="human")
+                        self.pending_command = None
                     else:
-                        self._add("user_message", ts, record, text=text)
+                        add_kwargs: dict[str, Any] = {"text": text}
+                        if origin_kind == "human":
+                            add_kwargs["origin"] = "human"
+                        if user_skills:
+                            add_kwargs["skills"] = user_skills
+                        ev_idx = self._add("user_message", ts, record, **add_kwargs)
+                        if parsed_cmd is not None:
+                            self.pending_command = (ev_idx, parsed_cmd[0], parsed_cmd[1], record)
+                        else:
+                            self.pending_command = None
                 elif (compact or (isinstance(content, str) and content.strip())) and not scan_claude.is_interrupted_marker(text):
                     # Command/caveat wrappers strip to nothing: native injected
                     # chrome with no human text. Surfaced typed-only (v1 skips
@@ -932,9 +1025,11 @@ class _ClaudeFeed:
                     raw = content.strip() if isinstance(content, str) else ""
                     if raw:
                         self._add("user_message", ts, record, text=raw, origin="injected")
+                    self.pending_command = None
                 continue
             if entry_type != "assistant" or not isinstance(content, list):
                 continue
+            self.pending_command = None
             usage = _claude_usage(message, record, entry)
             native_msg_id = message.get("id")
             native_msg_id = native_msg_id.strip() if isinstance(native_msg_id, str) and native_msg_id.strip() else None
@@ -956,7 +1051,11 @@ class _ClaudeFeed:
                     call_id = str(part.get("id") or "")
                     name = str(part.get("name") or "tool")
                     raw = _coerce_input(part.get("input"))
-                    index = self._add("tool_call", ts, record, name=name, call_id=call_id, raw_input=raw)
+                    tskills = skill_from_tool_call(name, raw, record=record, call_id=call_id)
+                    index = self._add(
+                        "tool_call", ts, record, name=name, call_id=call_id, raw_input=raw,
+                        skills=tskills,
+                    )
                     if index is not None and call_id:
                         self.calls[call_id] = (index, name, raw, lineno)
         self._link_interactions()
@@ -1407,6 +1506,28 @@ def _codex_injected_user_text(entry: dict) -> str | None:
     return None
 
 
+def _merge_codex_user_skills(
+    existing: tuple[SkillInvocation, ...],
+    incoming: tuple[SkillInvocation, ...],
+) -> tuple[SkillInvocation, ...]:
+    """Merge Codex user-message skills by normalized name, preferring native evidence."""
+    merged = list(existing)
+    by_norm: dict[str, int] = {normalize_skill_name(inv.name): idx for idx, inv in enumerate(merged)}
+    for inv in incoming:
+        key = normalize_skill_name(inv.name)
+        idx = by_norm.get(key)
+        if idx is None:
+            by_norm[key] = len(merged)
+            merged.append(inv)
+            continue
+        prev = merged[idx]
+        if prev.evidence.origin == "inferred" and inv.evidence.origin == "native":
+            merged[idx] = replace(inv, arguments=inv.arguments or prev.arguments)
+        elif prev.arguments is None and inv.arguments is not None:
+            merged[idx] = replace(prev, arguments=inv.arguments)
+    return tuple(merged)
+
+
 class _CodexFeed:
     """Stateful row-sequence interpreter shared by snapshots and readers.
 
@@ -1460,9 +1581,12 @@ class _CodexFeed:
 
     def _add_dedup(self, event_type: str, ts: float | None, record: str, text: str,
                    error: AgentError | None = None, origin: str = "unknown",
-                   turn_id: str | None = None) -> None:
+                   turn_id: str | None = None,
+                   skills: tuple[SkillInvocation, ...] = ()) -> None:
         # Match the legacy adjacent-event rule. Non-text events break adjacency.
         if self.events and self.events[-1].type == event_type and self.events[-1].text == text:
+            if skills and not self.events[-1].skills:
+                self.events[-1] = replace(self.events[-1], skills=skills)
             return
         # Codex has no per-message native id: per-message granularity stops
         # at the turn. Keep message_id None explicitly; turn linkage carries
@@ -1470,10 +1594,10 @@ class _CodexFeed:
         effective_turn = turn_id if turn_id is not None else self.current_turn
         if error is None:
             index = self._add(event_type, ts, record, text=text, origin=origin,  # type: ignore[arg-type]
-                              message_id=None, turn_id=effective_turn)
+                              message_id=None, turn_id=effective_turn, skills=skills)
         else:
             index = self._add(event_type, ts, record, text=text, error=error,  # type: ignore[arg-type]
-                              origin=origin, message_id=None, turn_id=effective_turn)
+                              origin=origin, message_id=None, turn_id=effective_turn, skills=skills)
         if index is not None and turn_id is not None and event_type == "assistant_message":
             self.turn_event_index[turn_id] = index
 
@@ -1545,14 +1669,77 @@ class _CodexFeed:
                                            Evidence(_NATIVE, field="payload.reason", record=record),
                                            None, False, "turn"))
                 continue
+            if entry.get("type") == "event_msg" and kind == "item_completed":
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") == "UserMessage":
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        item_skills = tuple(
+                            SkillInvocation(
+                                name=sname,
+                                trigger="explicit",
+                                detection="attached",
+                                evidence=Evidence(_NATIVE, field="item_completed.UserMessage.skill", record=record),
+                                path=str(part.get("path") or "").strip() or None,
+                            )
+                            for part in content
+                            if isinstance(part, dict)
+                            and part.get("type") == "skill"
+                            and (sname := raw_skill_name(str(part.get("name") or "")))
+                        )
+                        if item_skills:
+                            for idx in range(len(self.events) - 1, max(-1, len(self.events) - 9), -1):
+                                ev = self.events[idx]
+                                if ev.type != "user_message" or ev.origin != "human":
+                                    continue
+                                if ev.turn_id is not None and native_turn is not None and ev.turn_id != native_turn:
+                                    continue
+                                self.events[idx] = replace(
+                                    ev,
+                                    skills=_merge_codex_user_skills(ev.skills, item_skills),
+                                )
+                                break
+                continue
             user_text = scan_codex.user_message_text(entry)
             if user_text:
-                self._add_dedup("user_message", ts, record, user_text, origin="human")
+                raw_content_text = ""
+                if entry.get("type") == "event_msg":
+                    raw_content_text = str(payload.get("message") or "").strip()
+                elif entry.get("type") == "response_item":
+                    raw_parts = payload.get("content")
+                    if isinstance(raw_parts, list):
+                        raw_content_text = "\n".join(
+                            str(p.get("text") or "").strip()
+                            for p in raw_parts
+                            if isinstance(p, dict) and p.get("type") in ("input_text", "output_text")
+                        )
+                md_skills = tuple(
+                    SkillInvocation(
+                        name=raw_skill_name(m_name),
+                        trigger="explicit",
+                        detection="attached",
+                        evidence=Evidence(_INFERRED, field="markdown_skill_link", record=record),
+                        path=m_path,
+                    )
+                    for m_name, m_path, m_field in scan_codex.extract_codex_user_skill_mentions(raw_content_text or user_text)
+                    if m_field == "markdown_link" and m_path
+                )
+                self._add_dedup("user_message", ts, record, user_text, origin="human", skills=md_skills)
                 continue
             injected_text = _codex_injected_user_text(entry)
             if injected_text:
                 # Dropped from the conversation view; typed-only here.
-                self._add("user_message", ts, record, text=injected_text, origin="injected")
+                ctx_skills = tuple(
+                    SkillInvocation(
+                        name=raw_skill_name(sname),
+                        trigger="explicit",
+                        detection="attached",
+                        evidence=Evidence(_NATIVE, field="payload.content", record=record),
+                        path=spath,
+                    )
+                    for sname, spath in scan_codex.parse_codex_skill_context(injected_text)
+                )
+                self._add("user_message", ts, record, text=injected_text, origin="injected", skills=ctx_skills)
                 continue
             assistant_text = scan_codex.assistant_message_text(entry)
             if assistant_text:
@@ -1575,7 +1762,8 @@ class _CodexFeed:
                 call_id = str(payload.get("call_id") or payload.get("id") or "")
                 name = str(payload.get("name") or "tool")
                 raw = _coerce_input(payload.get("arguments"))
-                index = self._add("tool_call", ts, record, name=name, call_id=call_id, raw_input=raw)
+                tskills = skill_from_tool_call(name, raw, record=record, call_id=call_id)
+                index = self._add("tool_call", ts, record, name=name, call_id=call_id, raw_input=raw, skills=tskills)
                 if index is not None and call_id:
                     self.calls[call_id] = (index, name, raw, lineno)
             elif kind == "custom_tool_call":
@@ -1583,8 +1771,9 @@ class _CodexFeed:
                 name = str(payload.get("name") or "tool")
                 raw_input = str(payload.get("input") or "")
                 coerced = _codex_coerce_custom(raw_input)
+                tskills = skill_from_tool_call(name, coerced, record=record, call_id=call_id)
                 index = self._add("tool_call", ts, record,
-                                  name=name, call_id=call_id, raw_input=coerced)
+                                  name=name, call_id=call_id, raw_input=coerced, skills=tskills)
                 if index is not None and call_id:
                     self.calls[call_id] = (index, name, coerced, lineno)
             elif kind in {"function_call_output", "custom_tool_call_output"}:

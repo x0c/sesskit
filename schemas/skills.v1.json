@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/x0c/sesskit/schemas/skills.v1.json",
+  "title": "SessKit Skill Invocations (sesskit.skills/v1)",
+  "description": "Normalized cross-runtime skill invocation dataset separating active (explicit) user invocations from passive (auto) model-side skill tool calls and read-only SKILL.md accesses, with native/inferred evidence.",
+  "type": "object",
+  "required": ["schema", "summary"],
+  "properties": {
+    "schema": { "const": "sesskit.skills/v1" },
+    "state": {
+      "type": "string",
+      "enum": ["available", "empty", "unavailable", "unsupported"]
+    },
+    "runtime": { "type": "string" },
+    "session_id": { "type": ["string", "null"] },
+    "invocations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/invocation" }
+    },
+    "summary": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/summaryRow" }
+    }
+  },
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "required": ["origin"],
+      "properties": {
+        "origin": { "type": "string", "enum": ["native", "inferred", "unknown"] },
+        "field": { "type": ["string", "null"] },
+        "record": { "type": ["string", "null"] }
+      }
+    },
+    "invocation": {
+      "type": "object",
+      "required": ["name", "bare_name", "trigger", "detection", "evidence"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "bare_name": { "type": "string", "minLength": 1 },
+        "trigger": { "type": "string", "enum": ["explicit", "auto", "unknown"] },
+        "detection": {
+          "type": "string",
+          "enum": ["command", "attached", "skill_tool", "file_read", "unknown"]
+        },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "arguments": { "type": ["string", "null"] },
+        "path": { "type": ["string", "null"] },
+        "call_id": { "type": ["string", "null"] },
+        "seq": { "type": ["integer", "null"] },
+        "ts": { "type": ["number", "null"] },
+        "turn_id": { "type": ["string", "null"] },
+        "session": { "type": "string" },
+        "runtime": { "type": "string" }
+      }
+    },
+    "summaryRow": {
+      "type": "object",
+      "required": ["name", "bare_name", "total", "explicit_count", "auto_count", "unknown_count", "detections"],
+      "properties": {
+        "name": { "type": "string" },
+        "bare_name": { "type": "string" },
+        "total": { "type": "integer", "minimum": 0 },
+        "explicit_count": { "type": "integer", "minimum": 0 },
+        "auto_count": { "type": "integer", "minimum": 0 },
+        "unknown_count": { "type": "integer", "minimum": 0 },
+        "detections": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "last_ts": { "type": ["number", "null"] },
+        "session_count": { "type": "integer", "minimum": 0 },
+        "runtimes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -38,11 +38,13 @@ from sesskit.models import (
     QuestionItem,
     QuestionOption,
     SessionOutcome,
+    SkillInvocation,
     ToolResultOutcome,
     Usage,
 )
 from sesskit.parsers import antigravity as scan_antigravity
 from sesskit.parsers.common import classify_tool, parse_timestamp
+from sesskit.skills import raw_skill_name, skill_from_tool_call
 
 _NATIVE = "native"
 _INFERRED = "inferred"
@@ -273,10 +275,27 @@ class _AntigravityFeed:
                     if source == "USER_EXPLICIT"
                     else ("system" if source == "SYSTEM" else "unknown")
                 )
+                user_skills: tuple[SkillInvocation, ...] = ()
+                if source == "USER_EXPLICIT":
+                    explicit_skills = scan_antigravity.extract_explicit_skills_from_user_input(raw_content)
+                    if explicit_skills:
+                        user_skills = tuple(
+                            SkillInvocation(
+                                name=raw_skill_name(sname),
+                                trigger="explicit",
+                                detection="command",
+                                evidence=Evidence(_NATIVE, field="ADDITIONAL_METADATA.SKILL", record=record),
+                                arguments=sargs,
+                            )
+                            for sname, sargs in explicit_skills
+                            if raw_skill_name(sname)
+                        )
                 if text and text != "None":
                     extra: dict[str, Any] = {"text": text, "origin": origin}
                     if media:
                         extra["raw_input"] = {"media": media}
+                    if user_skills:
+                        extra["skills"] = user_skills
                     self._add("user_message", ts, record, **extra)
                 elif media:
                     self._add(
@@ -390,6 +409,9 @@ class _AntigravityFeed:
                             name=name,
                             call_id=call_id,
                             raw_input=raw_input,
+                            skills=skill_from_tool_call(
+                                name, raw_input, record=record, call_id=call_id,
+                            ),
                         )
                         if ev_index is not None:
                             self.calls[call_id] = (ev_index, name, raw_input, record)

@@ -21,13 +21,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 from collections.abc import Mapping
 
 from sesskit import titles
 from sesskit.cache import get_cache
-from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
+from sesskit.models import (
+    ConversationMessage,
+    Evidence,
+    SessionInfo,
+    SkillInvocation,
+    effective_session_time,
+    make_session_info,
+)
 from sesskit.parsers.common import (
     HostExtension,
     ephemeral_prefixes_for,
@@ -43,6 +51,7 @@ from sesskit.parsers.common import (
     stat_signature,
 )
 from sesskit.parsers.common import parse_timestamp as _parse_iso
+from sesskit.skills import SkillSnapshot, normalize_skill_name, raw_skill_name, skill_from_tool_call
 
 KIMI_HOME = os.path.expanduser("~/.kimi-code")
 SESSIONS_DIR = os.path.join(KIMI_HOME, "sessions")
@@ -280,18 +289,77 @@ def _text_from_parts(parts) -> str:
     return "\n\n".join(texts)
 
 
+_SKILL_LOADED_BLOCK_RE = re.compile(
+    r"(?:User activated the skill [^\n]*\n+|Skill tool loaded instructions[^\n]*\n+)?"
+    r"<skill-loaded\b([^>]*)>[\s\S]*?</skill-loaded>",
+)
+_SKILL_ATTR_RE = re.compile(r'([a-zA-Z0-9_-]+)="([^"]*)"')
+
+
+def _strip_skill_loaded_blocks(text: str) -> str:
+    if "<skill-loaded" not in text:
+        return text.strip()
+    return _SKILL_LOADED_BLOCK_RE.sub("", text).strip()
+
+
+def _skill_loaded_attrs(text: str) -> list[dict[str, str]]:
+    if "<skill-loaded" not in text:
+        return []
+    out: list[dict[str, str]] = []
+    for m in _SKILL_LOADED_BLOCK_RE.finditer(text):
+        attrs = dict(_SKILL_ATTR_RE.findall(m.group(1)))
+        out.append(attrs)
+    return out
+
+
+def _origin_dict(entry: dict, message: dict) -> dict | None:
+    origin = message.get("origin")
+    if isinstance(origin, dict):
+        return origin
+    origin = entry.get("origin")
+    return origin if isinstance(origin, dict) else None
+
+
 def user_text(entry: dict) -> str | None:
-    """从 context.append_message 事件里取真人用户正文；系统注入事件返回 None。"""
+    """从 context.append_message 事件里取真人用户正文；系统或被动技能注入返回 None。"""
     message = entry.get("message")
     if not isinstance(message, dict) or message.get("role") != "user":
         return None
-    origin = message.get("origin")
+    origin = _origin_dict(entry, message)
     origin_kind = origin.get("kind") if isinstance(origin, dict) else None
-    # origin.kind 为 "user" 才是真人输入；task-notification 等系统事件也走 user 轮次，丢弃。
+    if origin_kind == "skill_activation":
+        trigger = str(origin.get("trigger") or "").strip() if isinstance(origin, dict) else ""
+        if trigger != "user-slash":
+            return None
+        sname = raw_skill_name(str(origin.get("skillName") or "")) if isinstance(origin, dict) else ""
+        sargs = str(origin.get("skillArgs") or "").strip() if isinstance(origin, dict) else ""
+        raw_text = _text_from_parts(message.get("content"))
+        extra_text = _strip_skill_loaded_blocks(raw_text)
+        return sargs or extra_text or (f"/skill:{sname}" if sname else None)
+    # origin.kind 为 "user" 才是真人输入；task-notification 等系统事件丢弃。
     if origin_kind not in (None, "user"):
         return None
-    text = _text_from_parts(message.get("content"))
-    return text or None
+    raw_text = _text_from_parts(message.get("content"))
+    if not raw_text:
+        return None
+    cleaned = _strip_skill_loaded_blocks(raw_text)
+    if cleaned:
+        return cleaned
+    if isinstance(origin, dict) and isinstance(origin.get("skillActivations"), list):
+        for item in origin["skillActivations"]:
+            if isinstance(item, dict) and item.get("skillName"):
+                sname = raw_skill_name(str(item["skillName"]))
+                sargs = str(item.get("skillArgs") or "").strip()
+                if sargs:
+                    return sargs
+                if sname:
+                    return f"/skill:{sname}"
+    attrs = _skill_loaded_attrs(raw_text)
+    if attrs and attrs[0].get("trigger") == "user-slash":
+        sname = raw_skill_name(attrs[0].get("name", ""))
+        sargs = (attrs[0].get("args") or "").strip()
+        return sargs or (f"/skill:{sname}" if sname else None)
+    return None
 
 
 _user_text = user_text  # 旧私有名兼容：模块内部仍引用
@@ -379,7 +447,7 @@ def _build_session_info(
     except OSError:
         return None
 
-    cwd = str(state.get("workDir") or "")
+    cwd = str(state.get("cwd") or state.get("workDir") or "")
     native_title = state.get("title") or None
     updated_at = _parse_iso(state.get("updatedAt"))
 
@@ -703,6 +771,158 @@ def clone_session(session: SessionInfo) -> SessionInfo:
         shutil.rmtree(dst_dir, ignore_errors=True)
         raise ValueError("复制后的会话无法被扫描识别")
     return info
+
+
+def extract_skill_snapshot(session: Mapping[str, object]) -> SkillSnapshot:
+    """Extract normalized skill invocations directly from Kimi wire history."""
+    path = str(session.get("path") or "")
+    session_id = str(session.get("id") or "") or None
+    if not path or not os.path.isfile(path):
+        return SkillSnapshot(state="unavailable", runtime="kimi", session_id=session_id)
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            entries = list(iter_message_entries(handle))
+    except OSError:
+        return SkillSnapshot(state="unavailable", runtime="kimi", session_id=session_id)
+
+    if not entries:
+        return SkillSnapshot(state="empty", runtime="kimi", session_id=session_id)
+
+    invocations: list[SkillInvocation] = []
+    explicit_keys: set[str] = set()
+    tool_skill_keys: set[str] = set()
+    file_read_keys: set[str] = set()
+    turn_index = -1
+
+    def _start_turn() -> str:
+        nonlocal turn_index
+        turn_index += 1
+        explicit_keys.clear()
+        tool_skill_keys.clear()
+        file_read_keys.clear()
+        return f"turn-{turn_index:04d}"
+
+    current_turn = "turn-0000"
+    for seq_idx, entry in enumerate(entries, start=1):
+        ts = event_time(entry)
+        record = f"wire:{seq_idx}"
+        message = entry.get("message")
+        if isinstance(message, dict) and message.get("role") == "user":
+            origin = _origin_dict(entry, message)
+            origin_kind = origin.get("kind") if isinstance(origin, dict) else None
+            if origin_kind == "skill_activation":
+                trigger = str(origin.get("trigger") or "").strip() if isinstance(origin, dict) else ""
+                sname = raw_skill_name(str(origin.get("skillName") or "")) if isinstance(origin, dict) else ""
+                sargs = str(origin.get("skillArgs") or "").strip() or None if isinstance(origin, dict) else None
+                spath = str(origin.get("skillPath") or "").strip() or None if isinstance(origin, dict) else None
+                if trigger == "user-slash":
+                    current_turn = _start_turn()
+                    if sname:
+                        inv = SkillInvocation(
+                            name=sname,
+                            trigger="explicit",
+                            detection="command",
+                            evidence=Evidence("native", field="origin.skillName", record=record),
+                            arguments=sargs,
+                            path=spath,
+                            seq=seq_idx,
+                            ts=ts,
+                            turn_id=current_turn,
+                        )
+                        invocations.append(inv)
+                        explicit_keys.update((sname.lower(), normalize_skill_name(sname).lower()))
+                elif trigger in {"model-tool", "nested-skill"} and sname:
+                    k_raw = sname.lower()
+                    k_bare = normalize_skill_name(sname).lower()
+                    if k_raw not in explicit_keys and k_bare not in explicit_keys and k_raw not in tool_skill_keys and k_bare not in tool_skill_keys:
+                        inv = SkillInvocation(
+                            name=sname,
+                            trigger="auto",
+                            detection="skill_tool",
+                            evidence=Evidence("native", field="origin.skillName", record=record),
+                            arguments=sargs,
+                            path=spath,
+                            seq=seq_idx,
+                            ts=ts,
+                            turn_id=current_turn,
+                        )
+                        invocations.append(inv)
+                        tool_skill_keys.update((k_raw, k_bare))
+                continue
+            if origin_kind in (None, "user"):
+                utext = user_text(entry)
+                if utext is not None:
+                    current_turn = _start_turn()
+                if isinstance(origin, dict) and isinstance(origin.get("skillActivations"), list):
+                    for item in origin["skillActivations"]:
+                        if not isinstance(item, dict):
+                            continue
+                        sname = raw_skill_name(str(item.get("skillName") or ""))
+                        if not sname:
+                            continue
+                        sargs = str(item.get("skillArgs") or "").strip() or None
+                        spath = str(item.get("skillPath") or "").strip() or None
+                        inv = SkillInvocation(
+                            name=sname,
+                            trigger="explicit",
+                            detection="attached",
+                            evidence=Evidence("native", field="origin.skillActivations", record=record),
+                            arguments=sargs,
+                            path=spath,
+                            seq=seq_idx,
+                            ts=ts,
+                            turn_id=current_turn,
+                        )
+                        invocations.append(inv)
+                        explicit_keys.update((sname.lower(), normalize_skill_name(sname).lower()))
+                continue
+            continue
+
+        event = entry.get("event")
+        if not isinstance(event, dict) or event.get("type") != "tool.call":
+            continue
+        tname = str(event.get("name") or "tool")
+        call_id = str(event.get("toolCallId") or event.get("uuid") or "")
+        raw_args = event.get("args") if event.get("args") is not None else event.get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except ValueError:
+                pass
+        for inv in skill_from_tool_call(tname, raw_args, record=record, call_id=call_id):
+            k_raw = inv.name.lower()
+            k_bare = inv.bare_name.lower()
+            if k_raw in explicit_keys or k_bare in explicit_keys:
+                continue
+            if inv.detection == "skill_tool":
+                if k_raw in tool_skill_keys or k_bare in tool_skill_keys:
+                    continue
+                tool_skill_keys.update((k_raw, k_bare))
+            elif inv.detection == "file_read":
+                if k_raw in tool_skill_keys or k_bare in tool_skill_keys or k_raw in file_read_keys or k_bare in file_read_keys:
+                    continue
+                file_read_keys.update((k_raw, k_bare))
+            invocations.append(
+                SkillInvocation(
+                    name=inv.name,
+                    trigger=inv.trigger,
+                    detection=inv.detection,
+                    evidence=inv.evidence,
+                    arguments=inv.arguments,
+                    path=inv.path,
+                    call_id=inv.call_id,
+                    seq=seq_idx,
+                    ts=ts,
+                    turn_id=current_turn,
+                )
+            )
+    return SkillSnapshot(
+        state="available",
+        runtime="kimi",
+        session_id=session_id,
+        invocations=tuple(invocations),
+    )
 
 
 def load_conversation(path: str) -> list[ConversationMessage]:

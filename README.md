@@ -58,6 +58,7 @@ sesskit search refactor --top 3
 sesskit show <session-id-or-prefix> --full
 sesskit share <session-id> --out /tmp/share.json
 sesskit export --since 7d --out /tmp/week.json
+sesskit skills --limit 20
 sesskit describe
 sesskit verify --sample 30
 ```
@@ -83,7 +84,7 @@ Snapshot commands print one JSON envelope:
 ## Python API
 
 ```python
-from sesskit import load_session_conversation, refresh_session
+from sesskit import load_session_conversation, load_skills, refresh_session
 from sesskit.registry import default_registry
 from sesskit.transcript import load_events, SCHEMA_ID
 
@@ -93,6 +94,7 @@ for runtime_id, items in sessions.items():
     for session in items[:3]:
         messages = load_session_conversation(session)
         events = load_events(session)  # SCHEMA_ID == "sesskit.transcript/v1"
+        skills = load_skills(session)  # SCHEMA_ID == "sesskit.skills/v1" (explicit vs auto)
         # Refresh this session between scans; None if its history is gone.
         fresh = refresh_session(session)
 ```

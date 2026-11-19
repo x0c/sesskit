@@ -143,6 +143,48 @@ ActivityEventType = Literal[
     "compaction", "lifecycle",
 ]
 MessageOrigin = Literal["human", "injected", "system", "unknown"]
+SkillTrigger = Literal["explicit", "auto", "unknown"]
+SkillDetection = Literal["command", "attached", "skill_tool", "file_read", "unknown"]
+
+
+@dataclass(frozen=True)
+class SkillInvocation:
+    """Normalized skill invocation attached to an event, turn, or session."""
+
+    name: str
+    trigger: SkillTrigger
+    detection: SkillDetection
+    evidence: Evidence
+    arguments: str | None = None
+    path: str | None = None
+    call_id: str | None = None
+    seq: int | None = None
+    ts: float | None = None
+    turn_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("skill name must not be empty")
+        if self.trigger not in {"explicit", "auto", "unknown"}:
+            raise ValueError(f"unsupported skill trigger: {self.trigger!r}")
+        if self.detection not in {"command", "attached", "skill_tool", "file_read", "unknown"}:
+            raise ValueError(f"unsupported skill detection: {self.detection!r}")
+        if self.trigger != "unknown" and self.evidence.origin == "unknown":
+            raise ValueError("a known skill trigger requires native or inferred evidence")
+        if self.arguments is not None and not self.arguments.strip():
+            object.__setattr__(self, "arguments", None)
+        if self.path is not None and not self.path.strip():
+            object.__setattr__(self, "path", None)
+        if self.call_id is not None and not self.call_id.strip():
+            object.__setattr__(self, "call_id", None)
+
+    @property
+    def bare_name(self) -> str:
+        """Unqualified skill name (last colon segment) for fallback matching."""
+        cleaned = self.name.strip().lstrip("/$@").strip()
+        if ":" in cleaned:
+            return cleaned.rsplit(":", 1)[-1].strip()
+        return cleaned
 RelationKind = Literal["subagent", "fork", "resume", "handoff", "continuation", "unknown"]
 RequestPurpose = Literal[
     "question", "permission", "plan_approval", "elicitation",
@@ -302,6 +344,7 @@ class ActivityEvent:
     usage: Usage | None = None
     compaction: CompactionInfo | None = None
     stop_reason: str | None = None
+    skills: tuple[SkillInvocation, ...] = ()
 
     def __post_init__(self) -> None:
         if self.seq < 1:
@@ -348,6 +391,13 @@ class ActivitySnapshot:
         from sesskit.turns import pair_invocations
 
         return pair_invocations(self)
+
+    @property
+    def skill_invocations(self) -> tuple[SkillInvocation, ...]:
+        """Deduplicated, turn-correlated skill invocations; computed, not stored."""
+        from sesskit.turns import derive_skill_invocations
+
+        return derive_skill_invocations(self)
 
 
 _STALE_MTIME_GAP_SECONDS = 3600
@@ -555,6 +605,7 @@ class Turn:
     end_seq: int
     outcome: TurnOutcome
     user_seq: int | None = None
+    skills: tuple[SkillInvocation, ...] = ()
 
     def __post_init__(self) -> None:
         if self.index < 0:
@@ -584,6 +635,7 @@ class UserMessage(_TypedEventBase):
     kind: Literal["user_message"] = "user_message"
     text: str = ""
     origin: MessageOrigin = "unknown"
+    skills: tuple[SkillInvocation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -607,6 +659,7 @@ class ToolCall(_TypedEventBase):
     call_id: str = ""
     raw_input: object = None
     interaction: InteractionRequest | None = None
+    skills: tuple[SkillInvocation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -683,7 +736,7 @@ def as_typed(event: ActivityEvent) -> UserMessage | AssistantMessage | Thinking 
         "evidence": event.evidence,
     }
     if event.type == "user_message":
-        return UserMessage(text=event.text or "", origin=event.origin, **shared)
+        return UserMessage(text=event.text or "", origin=event.origin, skills=event.skills, **shared)
     if event.type == "assistant_message":
         return AssistantMessage(text=event.text or "", error=event.error, **shared)
     if event.type == "thinking":
@@ -694,6 +747,7 @@ def as_typed(event: ActivityEvent) -> UserMessage | AssistantMessage | Thinking 
             call_id=event.call_id or "",
             raw_input=event.raw_input,
             interaction=event.interaction,
+            skills=event.skills,
             **shared,
         )
     if event.type == "tool_result":

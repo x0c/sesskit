@@ -33,11 +33,13 @@ from sesskit.models import (
     QuestionItem,
     QuestionOption,
     SessionOutcome,
+    SkillInvocation,
     ToolResultOutcome,
     Usage,
 )
 from sesskit.parsers import cursor as scan_cursor
 from sesskit.parsers.common import classify_tool
+from sesskit.skills import raw_skill_name, skill_from_tool_call
 
 _NATIVE = "native"
 _INFERRED = "inferred"
@@ -200,6 +202,7 @@ class _CursorFeed:
         self.emitted_calls: set[str] = set()
         self.orphan_results: set[str] = set()
         self.flushed_total = 0
+        self.skill_catalog: dict[str, str] = {}
 
     def _add(self, event_type: str, rowid: int, **fields: Any) -> int | None:
         text = fields.get("text")
@@ -243,15 +246,29 @@ class _CursorFeed:
             role = obj.get("role")
             content = obj.get("content")
             if role == "user":
+                raw_text = scan_cursor._text_from_content(content)
+                if isinstance(raw_text, str) and raw_text:
+                    scan_cursor.extract_skill_catalog(raw_text, self.skill_catalog)
                 text = scan_cursor.user_text_from_blob(obj)
                 if text:
-                    self._add("user_message", rowid, text=text, origin="human")
+                    attached = scan_cursor.extract_attached_skills_from_blob(obj)
+                    user_skills = tuple(
+                        SkillInvocation(
+                            name=raw_skill_name(sname),
+                            trigger="explicit",
+                            detection="attached",
+                            evidence=Evidence(_NATIVE, field="manually_attached_skills", record=f"rowid:{rowid}"),
+                            path=spath,
+                        )
+                        for sname, spath in attached
+                        if raw_skill_name(sname)
+                    )
+                    self._add("user_message", rowid, text=text, origin="human", skills=user_skills)
                 else:
-                    raw = scan_cursor._text_from_content(content)
-                    if isinstance(raw, str) and raw.strip():
+                    if isinstance(raw_text, str) and raw_text.strip():
                         # The conversation view drops <user_info>/rules context
                         # blocks; they surface here as typed-only injected events.
-                        self._add("user_message", rowid, text=raw.strip(), origin="injected")
+                        self._add("user_message", rowid, text=raw_text.strip(), origin="injected")
                 continue
             if role == "assistant":
                 if not isinstance(content, list):
@@ -304,12 +321,17 @@ class _CursorFeed:
                 call_id = str(part.get("toolCallId") or "")
                 name = str(part.get("toolName") or "tool")
                 raw_input = _json_args(part.get("args"))
+                tskills = skill_from_tool_call(
+                    name, raw_input, record=f"rowid:{rowid}", call_id=call_id,
+                    catalog=self.skill_catalog or None,
+                )
                 index = self._add(
                     "tool_call",
                     rowid,
                     name=name,
                     call_id=call_id,
                     raw_input=raw_input,
+                    skills=tskills,
                 )
                 if index is None:
                     continue

@@ -55,11 +55,13 @@ from sesskit.models import (
     QuestionItem,
     QuestionOption,
     SessionOutcome,
+    SkillInvocation,
     ToolResultOutcome,
     Usage,
 )
 from sesskit.parsers import opencode as scan_opencode
 from sesskit.parsers.common import classify_tool
+from sesskit.skills import raw_skill_name, skill_from_tool_call
 
 _NATIVE = "native"
 _UNKNOWN = "unknown"
@@ -576,8 +578,16 @@ def _v1_part(
             name, raw_input, call_id, status, question_output, record,
             "part.data.state.input",
         )
+        meta = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+        meta_name = str(meta.get("name") or "").strip() or None
+        meta_dir = str(meta.get("dir") or meta.get("directory") or "").strip() or None
+        tskills = skill_from_tool_call(
+            name, raw_input, record=record, call_id=call_id,
+            fallback_name=meta_name, fallback_path=meta_dir,
+        )
         _add(events, "tool_call", ts, msg_key, record, "part.data",
-             name=name, call_id=call_id, raw_input=raw_input, interaction=interaction)
+             name=name, call_id=call_id, raw_input=raw_input, interaction=interaction,
+             skills=tskills)
         if status in {"completed", "error"}:
             result_status = "error" if status == "error" else "ok"
             _add(events, "tool_result", ts, msg_key, record,
@@ -776,8 +786,16 @@ def _v2_part(
         name, raw_input, call_id, status, question_text, record,
         "data.content.state.input",
     )
+    meta = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+    meta_name = str(meta.get("name") or "").strip() or None
+    meta_dir = str(meta.get("directory") or meta.get("dir") or "").strip() or None
+    tskills = skill_from_tool_call(
+        name, raw_input, record=record, call_id=call_id,
+        fallback_name=meta_name, fallback_path=meta_dir,
+    )
     _add(events, "tool_call", ts, msg_key, record, "data.content",
-         name=name, call_id=call_id, raw_input=raw_input, interaction=interaction)
+         name=name, call_id=call_id, raw_input=raw_input, interaction=interaction,
+         skills=tskills)
     if status in {"completed", "error"}:
         result_status = "error" if status == "error" else "ok"
         raw_output = state.get("error") if status == "error" else state.get("content")
@@ -1676,7 +1694,8 @@ class _V2Feed:
             record = f"session_message:{row_id}"
             if row_type == "idle" and data.get("outcome") == "failed":
                 self.idle_failed = (record, "data.outcome")
-            if row_type in {"system", "synthetic", "compaction", "idle"}:
+            if row_type in {"system", "synthetic", "compaction", "idle",
+                            "shell", "model-switched", "agent-switched", "location-switched"}:
                 if row_type == "compaction":
                     _add(self.events, "thinking", _timestamp(data.get("time", {}).get("created")
                          if isinstance(data.get("time"), dict) else None) or _timestamp(row["time_created"]),
@@ -1689,13 +1708,46 @@ class _V2Feed:
             ts = (_timestamp(data.get("time", {}).get("created")
                   if isinstance(data.get("time"), dict) else None)
                   or _timestamp(row["time_created"]))
+            if row_type == "skill":
+                sname = raw_skill_name(str(data.get("skill") or data.get("name") or ""))
+                stext = str(data.get("text") or "").strip()
+                skill_tuple = (
+                    (SkillInvocation(
+                        name=sname,
+                        trigger="explicit",
+                        detection="attached",
+                        evidence=Evidence(_NATIVE, field="session_message.type=skill", record=record),
+                    ),)
+                    if sname
+                    else ()
+                )
+                _add(self.events, "user_message", ts, _message_key(self._session_id, row_id),
+                     record, "data.text", text=stext or (f"[Skill activated: {sname}]" if sname else ""),
+                     origin="injected", skills=skill_tuple)
+                continue
             if row_type == "user":
                 self.calls_in_turn.clear()
                 self.resolved_in_turn.clear()
                 text = data.get("text")
+                raw_skills = data.get("skills")
+                user_skills: tuple[SkillInvocation, ...] = ()
+                if isinstance(raw_skills, list):
+                    extracted: list[SkillInvocation] = []
+                    for sk in raw_skills:
+                        if not isinstance(sk, dict):
+                            continue
+                        sname = raw_skill_name(str(sk.get("id") or sk.get("name") or ""))
+                        if sname:
+                            extracted.append(SkillInvocation(
+                                name=sname,
+                                trigger="explicit",
+                                detection="attached",
+                                evidence=Evidence(_NATIVE, field="data.skills", record=record),
+                            ))
+                    user_skills = tuple(extracted)
                 _add(self.events, "user_message", ts, _message_key(self._session_id, row_id),
                      record, "data.text", text=text if isinstance(text, str) else "",
-                     origin="human")
+                     origin="human", skills=user_skills)
                 self.tail_role, self.tail_data, self.tail_record = "user", data, record
                 self.tail_unresolved = False
                 continue

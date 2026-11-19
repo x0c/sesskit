@@ -287,6 +287,7 @@ def parse_timestamp(value) -> float | None:
 _KIND_BY_NAME = {
     "read": "read",
     "read_file": "read",
+    "readfile": "read",
     "view": "read",
     "view_file": "read",
     "view_file_outline": "read",
@@ -329,6 +330,9 @@ _KIND_BY_NAME = {
     "fetch": "web",
     "read_url_content": "web",
     "task": "task",
+    "skill": "skill",
+    "load_skill": "skill",
+    "use_skill": "skill",
     "todowrite": "todo",
     "todo_write": "todo",
     "askuserquestion": "question",

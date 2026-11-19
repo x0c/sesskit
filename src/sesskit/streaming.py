@@ -62,6 +62,13 @@ def message_stream_record_to_dict(record: MessageStreamRecord) -> dict:
     return asdict(record)
 
 
+def _activity_event_dict(event: ActivityEvent) -> dict[str, Any]:
+    payload = asdict(event)
+    if "skills" in payload and not isinstance(payload["skills"], list):
+        payload["skills"] = list(payload["skills"] or ())
+    return payload
+
+
 class MessageStream(AbstractContextManager["MessageStream"]):
     """Nonblocking observer with bounded display state and opaque checkpoints.
 
@@ -160,7 +167,7 @@ class MessageStream(AbstractContextManager["MessageStream"]):
                         self._history_reset = True
                     self._first_history_poll = False
                     for event in events:
-                        pending[f"history:{event.seq}"] = json_event(asdict(event), max_bytes=None)[0]
+                        pending[f"history:{event.seq}"] = json_event(_activity_event_dict(event), max_bytes=None)[0]
                     self._history = pending
                     # Reader cold loads may be a bounded tail, not all history.
                     self._truncated = bool(self._history and min(e["seq"] for e in self._history.values()) > 1)
@@ -212,7 +219,7 @@ class MessageStream(AbstractContextManager["MessageStream"]):
                 Evidence("inferred", field="legacy_conversation_position"),
                 text=message.text, ts=message.timestamp,
             )
-            values[f"history:{index}"] = asdict(event)
+            values[f"history:{index}"] = _activity_event_dict(event)
         self._history_reset = (
             values != self._history
             or self._legacy_version is None

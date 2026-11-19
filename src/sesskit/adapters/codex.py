@@ -30,6 +30,7 @@ class CodexAdapter(RuntimeAdapter):
         usage_data=True,
         compaction_markers=True,
         message_origin=True,
+        skill_invocations=True,
     )
 
     def scan(self, limit: int = 50, keep_ids: set[str] | None = None,

@@ -30,6 +30,7 @@ class OpenCodeAdapter(RuntimeAdapter):
         compaction_markers=True,
         message_origin=True,
         performance_data=True,
+        skill_invocations=True,
     )
 
     def scan(self, limit: int = 50, keep_ids: set[str] | None = None,
