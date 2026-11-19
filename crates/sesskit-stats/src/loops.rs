@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
 
@@ -293,8 +295,55 @@ impl<'de> Deserialize<'de> for NonEmptyTextOrList {
     }
 }
 
+const LINE_READER_BUF_BYTES: usize = 64 * 1024;
+const LINE_BUF_SHRINK_THRESHOLD: usize = 256 * 1024;
+
 fn trim_cr(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn for_each_line_bytes<F>(bytes: &[u8], mut visit: F) -> Result<(), FallbackError>
+where
+    F: FnMut(&[u8]) -> Result<bool, FallbackError>,
+{
+    for raw_line in bytes.split(|b| *b == b'\n') {
+        if !visit(trim_cr(raw_line))? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn for_each_line_reader<R: BufRead, F>(mut reader: R, mut visit: F) -> Result<(), FallbackError>
+where
+    F: FnMut(&[u8]) -> Result<bool, FallbackError>,
+{
+    let mut buf = Vec::with_capacity(LINE_READER_BUF_BYTES);
+    loop {
+        buf.clear();
+        let n = match reader.read_until(b'\n', &mut buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        let raw = buf.strip_suffix(b"\n").unwrap_or(&buf);
+        let keep_going = visit(trim_cr(raw))?;
+        if buf.capacity() > LINE_BUF_SHRINK_THRESHOLD {
+            buf = Vec::with_capacity(LINE_READER_BUF_BYTES);
+        }
+        if !keep_going {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn open_line_reader(path: &Path) -> Option<BufReader<File>> {
+    File::open(path)
+        .ok()
+        .map(|file| BufReader::with_capacity(LINE_READER_BUF_BYTES, file))
 }
 
 fn looks_like_nonstandard_json(raw: &[u8]) -> bool {
@@ -358,37 +407,39 @@ struct ClaudeMessage {
     content: NonEmptyTextOrList,
 }
 
-pub fn claude_from_bytes(bytes: &[u8]) -> CountResult {
+fn claude_with_lines<F>(iter: F) -> CountResult
+where
+    F: FnOnce(&mut dyn FnMut(&[u8]) -> Result<bool, FallbackError>) -> Result<(), FallbackError>,
+{
     let mut count = 0u64;
     let mut seen_ids: HashSet<String> = HashSet::new();
-    for raw_line in bytes.split(|b| *b == b'\n') {
-        let line = trim_cr(raw_line);
+    let mut visit = |line: &[u8]| -> Result<bool, FallbackError> {
         if line.trim_ascii().is_empty() {
-            continue;
+            return Ok(true);
         }
         if !jsonl::contains(line, b"\\u") {
             let ty = jsonl::top_level(line, [b"type"])[0].and_then(Raw::str);
             if ty != Some("assistant") {
-                continue;
+                return Ok(true);
             }
         }
         let Some(row) = parse_object::<ClaudeRow>(line)? else {
-            continue;
+            return Ok(true);
         };
         if row.is_meta.0 || row.is_sidechain.0 || row.is_api_error.0 {
-            continue;
+            return Ok(true);
         }
         if row.kind.0.as_deref() != Some("assistant") {
-            continue;
+            return Ok(true);
         }
         let Some(msg) = row.message.0 else {
-            continue;
+            return Ok(true);
         };
         if msg.model.0.as_deref().map(str::trim) == Some("<synthetic>") {
-            continue;
+            return Ok(true);
         }
         if !msg.content.0 {
-            continue;
+            return Ok(true);
         }
         if let Some(id) = msg.id.0.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             if seen_ids.insert(id.to_owned()) {
@@ -397,8 +448,18 @@ pub fn claude_from_bytes(bytes: &[u8]) -> CountResult {
         } else {
             count += 1;
         }
-    }
+        Ok(true)
+    };
+    iter(&mut visit)?;
     Ok(Some(count))
+}
+
+pub fn claude_from_bytes(bytes: &[u8]) -> CountResult {
+    claude_with_lines(|visit| for_each_line_bytes(bytes, visit))
+}
+
+pub fn claude_from_reader<R: BufRead>(reader: R) -> CountResult {
+    claude_with_lines(|visit| for_each_line_reader(reader, visit))
 }
 
 // --- Codex -----------------------------------------------------------------
@@ -423,16 +484,18 @@ struct CodexPayload {
     last_agent_message: NonEmptyStrFlag,
 }
 
-pub fn codex_from_bytes(bytes: &[u8]) -> CountResult {
+fn codex_with_lines<F>(iter: F) -> CountResult
+where
+    F: FnOnce(&mut dyn FnMut(&[u8]) -> Result<bool, FallbackError>) -> Result<(), FallbackError>,
+{
     let mut ri_loops = 0u64;
     let mut in_step = false;
     let mut legacy_loops = 0u64;
     let mut turn_has_agent_msg = false;
 
-    for raw_line in bytes.split(|b| *b == b'\n') {
-        let line = trim_cr(raw_line);
+    let mut visit = |line: &[u8]| -> Result<bool, FallbackError> {
         if line.trim_ascii().is_empty() {
-            continue;
+            return Ok(true);
         }
         if !jsonl::contains(line, b"\\u") {
             let ty = jsonl::top_level(line, [b"type"])[0].and_then(Raw::str);
@@ -440,14 +503,14 @@ pub fn codex_from_bytes(bytes: &[u8]) -> CountResult {
                 ty,
                 Some("response_item" | "token_usage_record" | "event_msg" | "compacted")
             ) {
-                continue;
+                return Ok(true);
             }
         }
         let Some(row) = parse_object::<CodexRow>(line)? else {
-            continue;
+            return Ok(true);
         };
         let Some(kind) = row.kind.0.as_deref() else {
-            continue;
+            return Ok(true);
         };
         match kind {
             "token_usage_record" | "compacted" => {
@@ -455,7 +518,7 @@ pub fn codex_from_bytes(bytes: &[u8]) -> CountResult {
             }
             "response_item" => {
                 let Some(pl) = row.payload.0 else {
-                    continue;
+                    return Ok(true);
                 };
                 let pt = pl.ptype.0.as_deref();
                 let role = pl.role.0.as_deref();
@@ -484,7 +547,7 @@ pub fn codex_from_bytes(bytes: &[u8]) -> CountResult {
             }
             "event_msg" => {
                 let Some(pl) = row.payload.0 else {
-                    continue;
+                    return Ok(true);
                 };
                 let pt = pl.ptype.0.as_deref();
                 if matches!(
@@ -520,9 +583,19 @@ pub fn codex_from_bytes(bytes: &[u8]) -> CountResult {
             }
             _ => {}
         }
-    }
+        Ok(true)
+    };
 
+    iter(&mut visit)?;
     Ok(Some(if ri_loops > 0 { ri_loops } else { legacy_loops }))
+}
+
+pub fn codex_from_bytes(bytes: &[u8]) -> CountResult {
+    codex_with_lines(|visit| for_each_line_bytes(bytes, visit))
+}
+
+pub fn codex_from_reader<R: BufRead>(reader: R) -> CountResult {
+    codex_with_lines(|visit| for_each_line_reader(reader, visit))
 }
 
 // --- Pi --------------------------------------------------------------------
@@ -668,32 +741,36 @@ struct PiEntry {
     is_valid_assistant: bool,
 }
 
-pub fn pi_from_bytes(bytes: &[u8]) -> CountResult {
+fn pi_with_lines<F>(iter: F) -> CountResult
+where
+    F: FnOnce(&mut dyn FnMut(&[u8]) -> Result<bool, FallbackError>) -> Result<(), FallbackError>,
+{
     let mut header_checked = false;
+    let mut valid_header = false;
     let mut entries: Vec<PiEntry> = Vec::new();
 
-    for raw_line in bytes.split(|b| *b == b'\n') {
-        let line = trim_cr(raw_line);
+    let mut visit = |line: &[u8]| -> Result<bool, FallbackError> {
         if line.trim_ascii().is_empty() {
-            continue;
+            return Ok(true);
         }
         let Some(row) = parse_object::<PiRow>(line)? else {
-            continue;
+            return Ok(true);
         };
         if !header_checked {
             header_checked = true;
             if row.kind.0.as_deref() != Some("session")
                 || row.id.0.as_deref().map_or(true, str::is_empty)
             {
-                return Ok(None);
+                return Ok(false);
             }
+            valid_header = true;
             entries.push(PiEntry {
                 is_message: false,
                 id: row.id.0,
                 parent_id: row.parent_id.0,
                 is_valid_assistant: false,
             });
-            continue;
+            return Ok(true);
         }
         let is_message = row.kind.0.as_deref() == Some("message") && row.message.0.is_some();
         let is_valid_assistant = row.message.0.as_ref().is_some_and(|m| {
@@ -705,9 +782,12 @@ pub fn pi_from_bytes(bytes: &[u8]) -> CountResult {
             parent_id: row.parent_id.0,
             is_valid_assistant,
         });
-    }
+        Ok(true)
+    };
 
-    if !header_checked {
+    iter(&mut visit)?;
+
+    if !valid_header {
         return Ok(None);
     }
 
@@ -765,6 +845,14 @@ pub fn pi_from_bytes(bytes: &[u8]) -> CountResult {
         }
     }
     Ok(Some(count))
+}
+
+pub fn pi_from_bytes(bytes: &[u8]) -> CountResult {
+    pi_with_lines(|visit| for_each_line_bytes(bytes, visit))
+}
+
+pub fn pi_from_reader<R: BufRead>(reader: R) -> CountResult {
+    pi_with_lines(|visit| for_each_line_reader(reader, visit))
 }
 
 // --- Antigravity -----------------------------------------------------------
@@ -975,23 +1063,25 @@ struct AgRow {
     media: HasValidMedia,
 }
 
-pub fn antigravity_from_bytes(bytes: &[u8]) -> CountResult {
+fn antigravity_with_lines<F>(iter: F) -> CountResult
+where
+    F: FnOnce(&mut dyn FnMut(&[u8]) -> Result<bool, FallbackError>) -> Result<(), FallbackError>,
+{
     let mut has_any_record = false;
     let mut count = 0u64;
-    for raw_line in bytes.split(|b| *b == b'\n') {
-        let line = trim_cr(raw_line);
+    let mut visit = |line: &[u8]| -> Result<bool, FallbackError> {
         if line.trim_ascii().is_empty() {
-            continue;
+            return Ok(true);
         }
         let Some(row) = parse_object::<AgRow>(line)? else {
-            continue;
+            return Ok(true);
         };
         if !row.step_index.0 || row.kind.0.is_none() {
-            continue;
+            return Ok(true);
         }
         has_any_record = true;
         if row.kind.0.as_deref() != Some("PLANNER_RESPONSE") {
-            continue;
+            return Ok(true);
         }
         let has_content = row
             .content
@@ -1007,8 +1097,18 @@ pub fn antigravity_from_bytes(bytes: &[u8]) -> CountResult {
         if has_content || has_thinking || row.tool_calls.0 || row.media.0 {
             count += 1;
         }
-    }
+        Ok(true)
+    };
+    iter(&mut visit)?;
     Ok(if has_any_record { Some(count) } else { None })
+}
+
+pub fn antigravity_from_bytes(bytes: &[u8]) -> CountResult {
+    antigravity_with_lines(|visit| for_each_line_bytes(bytes, visit))
+}
+
+pub fn antigravity_from_reader<R: BufRead>(reader: R) -> CountResult {
+    antigravity_with_lines(|visit| for_each_line_reader(reader, visit))
 }
 
 // --- Cursor ----------------------------------------------------------------
@@ -1075,31 +1175,31 @@ pub fn cursor_from_store(path: &Path) -> CountResult {
 pub fn count_path(runtime: &str, path: &Path) -> CountResult {
     match runtime {
         "claude" => {
-            let Ok(bytes) = std::fs::read(path) else {
+            let Some(reader) = open_line_reader(path) else {
                 return Ok(None);
             };
-            claude_from_bytes(&bytes)
+            claude_from_reader(reader)
         }
         "codex" => {
-            let Ok(bytes) = std::fs::read(path) else {
+            let Some(reader) = open_line_reader(path) else {
                 return Ok(None);
             };
-            codex_from_bytes(&bytes)
+            codex_from_reader(reader)
         }
         "pi" => {
-            let Ok(bytes) = std::fs::read(path) else {
+            let Some(reader) = open_line_reader(path) else {
                 return Ok(None);
             };
-            pi_from_bytes(&bytes)
+            pi_from_reader(reader)
         }
         "antigravity" => {
             if path.extension().map_or(true, |e| e != "jsonl") {
                 return Ok(None);
             }
-            let Ok(bytes) = std::fs::read(path) else {
+            let Some(reader) = open_line_reader(path) else {
                 return Ok(None);
             };
-            antigravity_from_bytes(&bytes)
+            antigravity_from_reader(reader)
         }
         "cursor" => cursor_from_store(path),
         _ => Ok(None),
@@ -1238,5 +1338,30 @@ mod tests {
         }
         assert_eq!(cursor_from_store(&db), Ok(Some(2)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streaming_readers_match_bytes_across_large_lines_and_early_stop() {
+        let padding = "x".repeat(300 * 1024);
+        let codex = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"/tmp\"}}}}\r\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{padding}\"}}]}}}}\r\n\
+             {{\"type\":\"token_usage_record\",\"payload\":{{}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"done\"}}]}}}}"
+        );
+        assert_eq!(
+            codex_from_reader(std::io::Cursor::new(codex.as_bytes())),
+            codex_from_bytes(codex.as_bytes())
+        );
+        assert_eq!(codex_from_reader(std::io::Cursor::new(codex.as_bytes())), Ok(Some(2)));
+
+        let invalid_pi = b"{\"type\":\"message\",\"id\":\"m1\",\"message\":{\"role\":\"assistant\",\"content\":\"hi\"}}\n";
+        assert_eq!(pi_from_reader(std::io::Cursor::new(invalid_pi)), Ok(None));
+        assert_eq!(pi_from_bytes(invalid_pi), Ok(None));
+
+        let ag = b"{\"step_index\":0,\"type\":\"PLANNER_RESPONSE\",\"content\":\"ok\"}\r\n";
+        assert_eq!(antigravity_from_reader(std::io::Cursor::new(ag)), Ok(Some(1)));
+        let claude = b"{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"content\":\"ok\"}}\n";
+        assert_eq!(claude_from_reader(std::io::Cursor::new(claude)), Ok(Some(1)));
     }
 }

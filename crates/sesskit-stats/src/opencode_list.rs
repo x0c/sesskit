@@ -13,11 +13,11 @@ use serde_json::{json, Map, Value};
 
 const SKIP_TYPES: [&str; 4] = ["system", "synthetic", "compaction", "idle"];
 
-struct Row {
-    id: String,
-    row_type: String,
+struct Row<'a> {
+    id: &'a str,
+    row_type: &'a str,
     seq: i64,
-    data: String,
+    data: &'a str,
     data_length: i64,
 }
 
@@ -51,10 +51,10 @@ impl SessionAggregate {
         }
     }
 
-    fn add(&mut self, row: Row) -> Result<(), String> {
+    fn add(&mut self, row: Row<'_>) -> Result<(), String> {
         self.size_bytes += row.data_length;
-        let data = parse_compact(&row.data)?;
-        match row.row_type.as_str() {
+        let data = parse_compact(row.data)?;
+        match row.row_type {
             "user" => {
                 let text = string_field(&data, "text");
                 if !self.has_user {
@@ -91,11 +91,11 @@ impl SessionAggregate {
             }
             _ => {}
         }
-        let status = status_data(&row.row_type, &data);
-        if !SKIP_TYPES.contains(&row.row_type.as_str()) {
+        let status = status_data(row.row_type, &data);
+        if !SKIP_TYPES.contains(&row.row_type) {
             self.status_rows.clear();
         }
-        self.status_rows.push((row.row_type, status));
+        self.status_rows.push((row.row_type.to_owned(), status));
         Ok(())
     }
 }
@@ -236,14 +236,27 @@ pub fn project_json(db_path: &Path, session_ids: &[String]) -> Result<String, St
             .query([session_id])
             .map_err(|error| error.to_string())?;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let id = row
+                .get_ref(0)
+                .map_err(|error| error.to_string())?
+                .as_str()
+                .map_err(|error| error.to_string())?;
+            let row_type = row
+                .get_ref(1)
+                .map_err(|error| error.to_string())?
+                .as_str_or_null()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            let data = row
+                .get_ref(3)
+                .map_err(|error| error.to_string())?
+                .as_str()
+                .map_err(|error| error.to_string())?;
             let record = Row {
-                id: row.get(0).map_err(|error| error.to_string())?,
-                row_type: row
-                    .get::<_, Option<String>>(1)
-                    .map_err(|error| error.to_string())?
-                    .unwrap_or_default(),
+                id,
+                row_type,
                 seq: row.get(2).map_err(|error| error.to_string())?,
-                data: row.get(3).map_err(|error| error.to_string())?,
+                data,
                 data_length: row.get(4).map_err(|error| error.to_string())?,
             };
             aggregate.add(record)?;
@@ -258,50 +271,47 @@ pub fn project_json(db_path: &Path, session_ids: &[String]) -> Result<String, St
 mod tests {
     use super::*;
 
-    fn row(row_type: &str, seq: i64, data: Value) -> Row {
-        let data = data.to_string();
-        Row {
-            id: format!("m{seq}"),
-            row_type: row_type.to_owned(),
-            seq,
-            data_length: data.len() as i64,
-            data,
-        }
+    fn add_row(aggregate: &mut SessionAggregate, row_type: &str, seq: i64, data: Value) {
+        let id = format!("m{seq}");
+        let encoded = data.to_string();
+        aggregate
+            .add(Row {
+                id: &id,
+                row_type,
+                seq,
+                data_length: encoded.len() as i64,
+                data: &encoded,
+            })
+            .unwrap();
     }
 
     #[test]
     fn aggregate_keeps_only_listing_facts() {
         let mut aggregate = SessionAggregate::new();
-        aggregate
-            .add(row("user", 1, json!({"text": "first", "ignored": "x"})))
-            .unwrap();
-        aggregate
-            .add(row(
-                "assistant",
-                2,
-                json!({
-                    "content": [
-                        {"type": "reasoning", "reasoningEncryptedContent": "secret"},
-                        {"type": "text", "text": " answer "},
-                        {"type": "tool", "state": {"input": "large"}},
-                    ],
-                    "finish": "tool-calls",
-                }),
-            ))
-            .unwrap();
-        aggregate
-            .add(row(
-                "assistant",
-                3,
-                json!({
-                    "content": [{"type": "tool", "state": {"output": "large"}}],
-                    "error": {"message": "quota", "status": 429},
-                }),
-            ))
-            .unwrap();
-        aggregate
-            .add(row("idle", 4, json!({"outcome": "failed"})))
-            .unwrap();
+        add_row(&mut aggregate, "user", 1, json!({"text": "first", "ignored": "x"}));
+        add_row(
+            &mut aggregate,
+            "assistant",
+            2,
+            json!({
+                "content": [
+                    {"type": "reasoning", "reasoningEncryptedContent": "secret"},
+                    {"type": "text", "text": " answer "},
+                    {"type": "tool", "state": {"input": "large"}},
+                ],
+                "finish": "tool-calls",
+            }),
+        );
+        add_row(
+            &mut aggregate,
+            "assistant",
+            3,
+            json!({
+                "content": [{"type": "tool", "state": {"output": "large"}}],
+                "error": {"message": "quota", "status": 429},
+            }),
+        );
+        add_row(&mut aggregate, "idle", 4, json!({"outcome": "failed"}));
         let value = serde_json::to_value(aggregate).unwrap();
         assert_eq!(value["first_user"], "first");
         assert_eq!(
@@ -331,10 +341,10 @@ mod tests {
     fn malformed_rows_request_python_fallback() {
         let mut aggregate = SessionAggregate::new();
         let result = aggregate.add(Row {
-            id: "broken".to_owned(),
-            row_type: "assistant".to_owned(),
+            id: "broken",
+            row_type: "assistant",
             seq: 1,
-            data: "{".to_owned(),
+            data: "{",
             data_length: 1,
         });
         assert!(result.is_err());
