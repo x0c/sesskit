@@ -31,7 +31,7 @@ SessKit 尚未上架 PyPI。请在项目的虚拟环境中安装固定发布版�
 需要 **Python 3.10+**。支持的平台：**macOS 与 Linux**（助手历史落在 `~` 下）。不宣称支持 Windows。
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.11" sesskit
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.12" sesskit
 python -m sesskit describe
 ```
 
@@ -66,7 +66,7 @@ sesskit verify --sample 30
 快照命令均输出同一套 JSON envelope：
 
 ```json
-{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.11"}}
+{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.12"}}
 ```
 
 ## Python API
@@ -142,6 +142,16 @@ Transcript v1 是兼容投影，不包含更丰富的 Python 模型中的所有�
 `sesskit search` 搜索标题和摘要，不搜索完整对话正文。
 导出内容可能包含秘密；分享或上传前请先检查。
 
+## 常见问题
+
+### 如何将 Claude Code 或 Codex 的会话记录导出为 JSON？
+
+批量导出可执行 `sesskit export --since 7d --out /tmp/week.json`，单条会话可使用 `sesskit show <会话id或前缀> --full` 或 `sesskit share <会话id> --out /tmp/share.json`。所有快照命令均输出统一 JSON envelope，并遵循 [`schemas/`](schemas/) 契约。
+
+### SessKit 会启动助手或修改本地历史文件吗？
+
+不会。SessKit 对会话历史保持严格只读，既不启动或恢复任何编码助手，也不改写原始历史文件（仅显式运行 `sesskit upgrade` 时会更新其自身的 pip 安装包）。
+
 ## 🧩 AI 编程工具链里的相关工具
 
 如果你每天在多个 AI 编程助手之间切换，看看这套本地优先工具链的其余部分：
@@ -156,37 +166,7 @@ Transcript v1 是兼容投影，不包含更丰富的 Python 模型中的所有�
 
 ## 发布校验（维护者）
 
-安装用户看到[安装](#安装)即可：SessKit 尚未上架 PyPI。
-
-维护者无需信任工作树即可校验已发布的版本：
-
-```bash
-python scripts/publish.py verify --version 0.2.23 --check-only
-```
-
-`v0.2.23` 产物的预期哈希（GitHub release API 中也有记录）：
-
-- wheel `sesskit-0.2.23-py3-none-any.whl`：`sha256:30fcf7e063c29d594262a8223b368af2d0e6bd8958e3b65792ada2d9a8964d81`
-- sdist `sesskit-0.2.23.tar.gz`：`sha256:acc70a9033f0f9c945ad4f0df53600f61ff5ea5417580df5c930410c2d76f084`
-
-本地发布不依赖 CI。先校验，再用环境变量里的凭据上传——该脚本没有
-password/token 参数，密钥不会出现在 argv 或 shell 历史上。先把 PyPI
-token 存进系统密钥库一次（运行时提示输入，命令行里不出现密钥明文），
-上传时再引用：
-
-```bash
-python scripts/publish.py check-dist --version 0.2.23 --dist dist
-security add-generic-password -s pypi-sesskit -a __token__ -w
-TWINE_USERNAME=__token__ TWINE_PASSWORD="$(security find-generic-password -s pypi-sesskit -w)" \
-  python scripts/publish.py upload --version 0.2.23 --dist dist --confirm-upload
-```
-
-（Linux 请用各自的密钥库，例如 `secret-tool lookup server pypi.org`，
-保持同一模式：命令里不写密钥明文。）
-
-CI 发布由 [.github/workflows/publish-pypi.yml](.github/workflows/publish-pypi.yml)
-在 `v*` tag 推送（或手动 dispatch 已有 tag）时经 PyPI Trusted Publishing
-完成——无预存 API 令牌（GitHub 每次运行按需签发短期 OIDC 凭据）。
+维护者请参见 [docs/MAINTENANCE.md](docs/MAINTENANCE.md)。
 
 ## 非目标（v1）
 

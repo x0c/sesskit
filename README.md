@@ -32,7 +32,7 @@ SessKit is not on PyPI yet. Install the fixed-release wheel in your project's vi
 Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not claimed on Windows.
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.11" sesskit
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.12" sesskit
 python -m sesskit describe
 ```
 
@@ -78,7 +78,7 @@ unverified.
 Snapshot commands print one JSON envelope:
 
 ```json
-{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.11"}}
+{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.12"}}
 ```
 
 ## Python API
@@ -156,6 +156,16 @@ See [`schemas/`](schemas/) and [`docs/CONTRACT.md`](docs/CONTRACT.md).
 Transcript v1 is a compatibility projection, not every field in the richer Python
 model. `sesskit search` matches titles and excerpts, not full conversation text.
 Exported content may contain secrets; review it before sharing or uploading.
+
+## FAQ
+
+### How do I export Claude Code or Codex session transcripts to JSON?
+
+Run `sesskit export --since 7d --out /tmp/week.json` for a range export, or `sesskit show <session-id-or-prefix> --full` / `sesskit share <session-id> --out /tmp/share.json` for a single session. All snapshot commands output one stable JSON envelope or validate against the published [`schemas/`](schemas/).
+
+### Does SessKit launch agents or modify my local history files?
+
+No. Session history reading is strictly read-only. SessKit never launches agents, resumes chats, or mutates runtime history files (the explicit `sesskit upgrade` command only updates its own pip-managed installation).
 
 ## 🧩 Related Tools in the AI Coding Suite
 
