@@ -8,7 +8,7 @@ import sqlite3
 from pathlib import Path
 
 from sesskit import cli
-from sesskit.models import make_session_info
+from sesskit.models import SessionInfo, make_session_info
 from sesskit.parsers import antigravity, claude, codex, cursor, kimi, opencode, pi
 
 
@@ -50,12 +50,14 @@ def test_make_session_info_normalizes_last_msg_role():
         native_title=None, fallback_title="t", status_tag="", path="/tmp/3.jsonl",
         last_user_msg="ask", last_agent_msg="", last_msg_role="assistant",
     )["last_msg_role"] == "user"
-    assert make_session_info(
+    minimal = make_session_info(
         source="pi", id="4", short_id="4", cwd="/tmp", mtime=1.0,
         time_source="file_mtime", event_time=1.0, file_mtime=1.0, size_bytes=1,
         native_title=None, fallback_title="t", status_tag="", path="/tmp/4.jsonl",
         last_user_msg="", last_agent_msg="", last_msg_role="user",
-    )["last_msg_role"] is None
+    )
+    assert minimal["last_msg_role"] is None
+    assert set(minimal) == SessionInfo.__required_keys__
 
 
 def test_schemas_identical_and_include_last_msg_role():

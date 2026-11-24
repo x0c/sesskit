@@ -140,7 +140,7 @@ Native Rust counting (`sesskit._native`) and the pure-Python fallback (`SESSKIT_
 
 ### Latest message speaker (`last_msg_role`, 2026-11-24)
 
-`SessionInfo` and `session.v1.json` expose an optional `last_msg_role: Literal["user", "assistant"] | None` indicating which of `last_user_msg` vs `last_agent_msg` occurred more recently in native history.
+`SessionInfo` includes `last_msg_role: Literal["user", "assistant"] | None` (populated by `make_session_info` on every parsed session, `None` when unknown or empty; optional in `session.v1.json` for wire compatibility) indicating which of `last_user_msg` vs `last_agent_msg` occurred more recently in native history.
 
 - Updated only when real user text sets `last_user_msg` or real assistant text / unsuperseded terminal failure evidence sets `last_agent_msg`; tool-only, thinking-only, and metadata rows must not flip `last_msg_role`.
 - Respects bounded-tail vs wider-backfill ordering: a user prompt present in the bounded status tail is strictly newer than an older assistant reply recovered via wider backward backfill.

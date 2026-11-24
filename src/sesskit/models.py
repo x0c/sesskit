@@ -35,6 +35,8 @@ class _SessionInfoRequired(TypedDict):
     first_user_msg: str
     last_user_msg: str
     last_agent_msg: str
+    # Speaker of whichever of last_user_msg / last_agent_msg occurred more recently.
+    last_msg_role: Literal["user", "assistant"] | None
     path: str
 
 
@@ -60,8 +62,6 @@ class SessionInfo(_SessionInfoRequired, total=False):
     # fragmented streaming rows of one response merge into 1; None when
     # unavailable/unreliable).
     loop_count: int | None
-    # Speaker of whichever of last_user_msg / last_agent_msg occurred more recently.
-    last_msg_role: Literal["user", "assistant"] | None
 
 
 @dataclass(frozen=True)
