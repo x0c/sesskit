@@ -138,6 +138,15 @@ Real-history sampling and fixture coverage are different evidence: a runtime wit
 
 Native Rust counting (`sesskit._native`) and the pure-Python fallback (`SESSKIT_NATIVE=0`) must produce identical `loop_count` values on all valid, malformed-tail, and edge histories, and both `scan_sessions` and `refresh_session` must populate the same `loop_count`. Derived caches (`ListRecordMemo`, `PerformanceCache`) retain `loop_count` and treat cached records missing `loop_count` (or from an older cache version) as stale.
 
+### Latest message speaker (`last_msg_role`, 2026-11-24)
+
+`SessionInfo` and `session.v1.json` expose an optional `last_msg_role: Literal["user", "assistant"] | None` indicating which of `last_user_msg` vs `last_agent_msg` occurred more recently in native history.
+
+- Updated only when real user text sets `last_user_msg` or real assistant text / unsuperseded terminal failure evidence sets `last_agent_msg`; tool-only, thinking-only, and metadata rows must not flip `last_msg_role`.
+- Respects bounded-tail vs wider-backfill ordering: a user prompt present in the bounded status tail is strictly newer than an older assistant reply recovered via wider backward backfill.
+- Respects superseded-error fallback: when an empty-body failure excerpt is superseded by newer branch activity, `last_msg_role` reflects the surviving `last_user_msg` vs `last_agent_msg`.
+- `make_session_info` normalizes `last_msg_role` against the clipped excerpts so it never points to an empty `last_user_msg` or `last_agent_msg` when the other excerpt is non-empty. List caches treat missing `last_msg_role` or older cache tags as stale.
+
 ## Export / share writes
 
 - Refuse writing onto a session history path (or its symlink); see `sesskit.paths.assert_not_history_path`.

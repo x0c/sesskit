@@ -238,6 +238,7 @@ struct SessionAggregate {
     last_user: String,
     goal_rows: Vec<Value>,
     last_agent_message: Value,
+    last_msg_role: Option<&'static str>,
     status_rows: Vec<(String, Value)>,
     assistant_errors: Vec<Value>,
     last_anchor: String,
@@ -253,6 +254,7 @@ impl SessionAggregate {
             last_user: String::new(),
             goal_rows: Vec::new(),
             last_agent_message: json!({}),
+            last_msg_role: None,
             status_rows: Vec::new(),
             assistant_errors: Vec::new(),
             last_anchor: String::new(),
@@ -270,6 +272,9 @@ impl SessionAggregate {
                 if !self.has_user {
                     self.first_user = text.clone();
                 }
+                if !text.trim_matches(python_whitespace).is_empty() {
+                    self.last_msg_role = Some("user");
+                }
                 self.last_user = text;
                 self.has_user = true;
             }
@@ -280,6 +285,7 @@ impl SessionAggregate {
                 }
                 if let Some(content) = last_text_content(&data) {
                     self.last_agent_message = content;
+                    self.last_msg_role = Some("assistant");
                 }
                 if json_truthy(data.get("error")) {
                     self.assistant_errors
@@ -528,6 +534,7 @@ mod tests {
             value["last_agent_message"]["content"][0]["text"],
             " answer "
         );
+        assert_eq!(value["last_msg_role"], "assistant");
         assert_eq!(value["last_anchor"], "m3:3");
         assert_eq!(value["status_rows"].as_array().unwrap().len(), 2);
         assert_eq!(value["assistant_errors"][0]["error"]["status"], 429);

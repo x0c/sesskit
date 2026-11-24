@@ -60,6 +60,8 @@ class SessionInfo(_SessionInfoRequired, total=False):
     # fragmented streaming rows of one response merge into 1; None when
     # unavailable/unreliable).
     loop_count: int | None
+    # Speaker of whichever of last_user_msg / last_agent_msg occurred more recently.
+    last_msg_role: Literal["user", "assistant"] | None
 
 
 @dataclass(frozen=True)
@@ -428,11 +430,30 @@ def make_session_info(
     first_user_msg: str | None = "",
     last_user_msg: str | None = "",
     last_agent_msg: str | None = "",
+    last_msg_role: str | None = None,
     **extra: object,
 ) -> SessionInfo:
     """Assemble a SessionInfo dict shared by all runtime parsers."""
     from sesskit.parsers.common import shorten_cwd
     from sesskit.titles import clip_user_excerpt
+
+    clipped_last_user = clip_user_excerpt(last_user_msg)
+    clipped_last_agent = clip_user_excerpt(last_agent_msg)
+    resolved_role: Literal["user", "assistant"] | None
+    if last_msg_role == "user":
+        resolved_role = (
+            "user" if clipped_last_user else ("assistant" if clipped_last_agent else None)
+        )
+    elif last_msg_role == "assistant":
+        resolved_role = (
+            "assistant" if clipped_last_agent else ("user" if clipped_last_user else None)
+        )
+    elif clipped_last_user and not clipped_last_agent:
+        resolved_role = "user"
+    elif clipped_last_agent and not clipped_last_user:
+        resolved_role = "assistant"
+    else:
+        resolved_role = None
 
     session: SessionInfo = {
         "source": source,
@@ -453,8 +474,9 @@ def make_session_info(
         "live": False,
         "pid": None,
         "first_user_msg": clip_user_excerpt(first_user_msg),
-        "last_user_msg": clip_user_excerpt(last_user_msg),
-        "last_agent_msg": clip_user_excerpt(last_agent_msg),
+        "last_user_msg": clipped_last_user,
+        "last_agent_msg": clipped_last_agent,
+        "last_msg_role": resolved_role,
         "path": path,
     }
     session.update(extra)  # type: ignore[typeddict-item]

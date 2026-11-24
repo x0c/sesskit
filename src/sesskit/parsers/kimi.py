@@ -541,6 +541,7 @@ def _build_session_info(
         first_user_msg=preprocess_excerpt(first_user_msg, host),
         last_user_msg=preprocess_excerpt(last_user_msg, host),
         last_agent_msg=preprocess_excerpt(last_agent_msg, host),
+        last_msg_role=last_role,
         completion_id=completion_id_for(
             status_tag=status_tag,
             anchor=anchor,
@@ -587,6 +588,8 @@ def _cached_session_info(
         info = cache.get_session("kimi", wire_path, cache_tag)
     else:
         info = cache.get_session("kimi", wire_path)
+    if info is not None and "last_msg_role" not in info:
+        info = None
     if info is None:
         info = _build_session_info(session_dir, session_id, host)
         if info is not None:
@@ -767,6 +770,8 @@ def clone_session(session: SessionInfo) -> SessionInfo:
     except OSError:
         pass
     info = _build_session_info(dst_dir, new_id)
+    if info is not None and "last_msg_role" not in info:
+        info = None
     if info is None:
         shutil.rmtree(dst_dir, ignore_errors=True)
         raise ValueError("复制后的会话无法被扫描识别")

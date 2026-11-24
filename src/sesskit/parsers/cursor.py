@@ -350,6 +350,7 @@ def _build_session_info(
         path=history_path,
         first_user_msg=preprocess_excerpt(first_user_msg, host),
         last_user_msg=preprocess_excerpt(last_user_msg, host),
+        last_msg_role="user" if last_user_msg else None,
         # Cursor 历史里没有独立的「助手最终答复」字段可提取，保持空串。
         completion_id=completion_id,
         **extra,
@@ -392,7 +393,7 @@ def _cursor_cache_extra_version(chat_dir: str, host: HostExtension | None) -> st
         file_signature(store_db),
         # WAL 里的未 checkpoint 写入不会 bump 主库 mtime；签名必须带上。
         file_signature(store_db + "-wal"),
-        "loop-v1",
+        "loop-v2",
     )) + host_cache_tag(host)
 
 

@@ -130,6 +130,7 @@ def session_payload(session: dict, fields: list[str] | None = None) -> dict:
         "pid": session.get("pid"),
         "last_user": _trim(session.get("last_user_msg")),
         "last_agent": _trim(session.get("last_agent_msg")),
+        "last_msg_role": session.get("last_msg_role"),
     }
     return _apply_fields(payload, fields)
 

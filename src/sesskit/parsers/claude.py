@@ -262,9 +262,9 @@ def _read_tail(path: str, max_bytes: int = 65536, *, excerpt: bool = False) -> l
 _BACKFILL_WINDOWS = (512 * 1024, 4 * 1024 * 1024)
 
 
-def _last_texts(entries: list[dict]) -> tuple[str | None, str | None]:
-    """Newest real user text and newest assistant text, same rules as the tail loop."""
-    user = agent = None
+def _last_texts_with_role(entries: list[dict]) -> tuple[str | None, str | None, str | None]:
+    """Newest real user text, newest assistant text, and which spoke last."""
+    user = agent = last_role = None
     for e in reversed(entries):
         if e.get("isMeta") or e.get("isSidechain"):
             continue
@@ -273,31 +273,43 @@ def _last_texts(entries: list[dict]) -> tuple[str | None, str | None]:
             text = _extract_text(e.get("message", {}).get("content", ""))
             if text and not is_interrupted_marker(text):
                 user = text
+                if last_role is None:
+                    last_role = "user"
         elif user is None and t == "attachment":
             text = queued_command_text(e)
             if text:
                 user = text
+                if last_role is None:
+                    last_role = "user"
         elif agent is None and t == "assistant":
             content = e.get("message", {}).get("content", [])
             if isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text" and (part.get("text") or "").strip():
                         agent = part["text"]
+                        if last_role is None:
+                            last_role = "assistant"
                         break
         if user is not None and agent is not None:
             break
+    return user, agent, last_role
+
+
+def _last_texts(entries: list[dict]) -> tuple[str | None, str | None]:
+    """Newest real user text and newest assistant text, same rules as the tail loop."""
+    user, agent, _role = _last_texts_with_role(entries)
     return user, agent
 
 
-def _backfill_excerpts(fpath: str) -> tuple[str | None, str | None]:
+def _backfill_excerpts(fpath: str) -> tuple[str | None, str | None, str | None]:
     """Long tool-heavy turns leave no text in the 64 KB tail; read further back, bounded."""
-    user = agent = None
+    user = agent = role = None
     size = os.path.getsize(fpath)
     for window in _BACKFILL_WINDOWS:
-        user, agent = _last_texts(_read_tail(fpath, max_bytes=window, excerpt=True))
+        user, agent, role = _last_texts_with_role(_read_tail(fpath, max_bytes=window, excerpt=True))
         if agent or window >= size:
             break
-    return user, agent
+    return user, agent, role
 
 
 INTERRUPTED_MARKER = "[Request interrupted by user]"
@@ -670,6 +682,8 @@ def _build_session_info(
 
     last_user_msg = None
     last_agent_msg = None
+    last_user_pos = -1
+    last_agent_pos = -1
     last_was_user = None
     event_time = None
     # 终局判定只认原生 turn 结束证据：assistant 文本行的 stop_reason。
@@ -725,6 +739,7 @@ def _build_session_info(
                 last_content_idx = idx
             elif text:
                 last_user_msg = text
+                last_user_pos = idx
                 title_candidates.append(("last_user", text))
                 last_was_user = True
                 last_content_idx = idx
@@ -732,6 +747,7 @@ def _build_session_info(
             text = queued_command_text(e)
             if text:
                 last_user_msg = text
+                last_user_pos = idx
                 title_candidates.append(("last_user", text))
                 last_was_user = True
                 last_content_idx = idx
@@ -744,6 +760,7 @@ def _build_session_info(
                     # 裸 .get("text", "") 的默认值只在 key 缺失时生效，`or ""` 兜底。
                     if isinstance(part, dict) and part.get("type") == "text" and (part.get("text") or "").strip():
                         last_agent_msg = part["text"]
+                        last_agent_pos = idx
                         title_candidates.append(("last_agent", last_agent_msg))
                         last_was_user = False
                         last_content_idx = idx
@@ -775,6 +792,7 @@ def _build_session_info(
         # 报错不进标题候选（标题仍用真实提问），但列表与通知要看到人话。
         status_tag = titles.STATUS_ABORTED
         last_agent_msg = last_error_text
+        last_agent_pos = last_error_idx
         id_anchor = last_error_anchor
         id_tail_text = (last_error_msg or "")[:120]
         terminal_error = terminal_error_evidence(
@@ -814,12 +832,19 @@ def _build_session_info(
     # (last_user_msg vanishes across the 64 KB boundary and would re-key
     # the same terminal event). Display excerpts still use the wider-window
     # backfill below; they just no longer feed identity.
+    last_msg_role = (
+        "user"
+        if last_user_pos > last_agent_pos
+        else ("assistant" if last_agent_pos > last_user_pos else None)
+    )
     tail_text = id_tail_text
     if not last_agent_msg:
         # List excerpts only; status and completion_id above stay on the 64 KB window.
-        wider_user, wider_agent = _backfill_excerpts(fpath)
+        wider_user, wider_agent, wider_role = _backfill_excerpts(fpath)
         last_user_msg = last_user_msg or wider_user
         last_agent_msg = last_agent_msg or wider_agent
+        if last_msg_role is None:
+            last_msg_role = wider_role
     extra: dict[str, object] = dict(terminal_error)
     if compute_loop_count:
         from sesskit.native_projection import count_loops
@@ -842,6 +867,7 @@ def _build_session_info(
         first_user_msg=preprocess_excerpt(first_user_msg, host),
         last_user_msg=preprocess_excerpt(last_user_msg, host),
         last_agent_msg=preprocess_excerpt(last_agent_msg, host),
+        last_msg_role=last_msg_role,
         completion_id=completion_id_for(
             status_tag=status_tag,
             anchor=id_anchor,
@@ -1022,6 +1048,7 @@ def _cached_session_info(
         info = cache.get_session("claude", fpath)
     if info is not None and (
         "loop_count" not in info
+        or "last_msg_role" not in info
         or (
             info.get("fallback_title") == "(仅本地命令)"
             and _IMAGE_TITLE_PREFIX.match(str(info.get("first_user_msg") or ""))

@@ -661,6 +661,8 @@ def _build_session_info_from_entries(
     error_placeholder: tuple[int, str] | None = None
     newest_content_pos = -1
     newest_assistant_pos = -1
+    last_user_pos = -1
+    last_text_agent_pos = -1
     event_time = parse_timestamp(header.get("timestamp"))
     for position, item in enumerate(branch):
         message = item["message"]
@@ -690,6 +692,7 @@ def _build_session_info_from_entries(
             last_stop_reason = None
             last_error_text = ""
             newest_content_pos = position
+            last_user_pos = position
         elif role == "assistant":
             stop_reason = str(message.get("stopReason") or "").strip() or None
             error_text = str(message.get("errorMessage") or "").strip()
@@ -701,11 +704,13 @@ def _build_session_info_from_entries(
             if text:
                 last_agent = text
                 newest_content_pos = position
+                last_text_agent_pos = position
             if stop_reason in {"error", "aborted"} or error_text:
                 # Empty-body failures (rate limit / abort) still own the turn.
                 last_stop_reason = stop_reason if stop_reason in {"error", "aborted"} else "error"
                 if not text and error_text:
                     error_placeholder = (position, error_text)
+    last_agent_pos = last_text_agent_pos
     if error_placeholder is not None:
         error_pos, error_text = error_placeholder
         # Newer content or a newer assistant entry supersedes the failure; fall
@@ -713,6 +718,12 @@ def _build_session_info_from_entries(
         # latest user prompt instead of a stale error).
         if error_pos == newest_assistant_pos and error_pos > newest_content_pos:
             last_agent = error_text
+            last_agent_pos = error_pos
+    last_msg_role = (
+        "user"
+        if last_user_pos > last_agent_pos
+        else ("assistant" if last_agent_pos > last_user_pos else None)
+    )
     if not first_user:
         return None
     try:
@@ -756,6 +767,7 @@ def _build_session_info_from_entries(
         first_user_msg=preprocess_excerpt(first_user, host),
         last_user_msg=preprocess_excerpt(last_user, host),
         last_agent_msg=preprocess_excerpt(last_agent, host),
+        last_msg_role=last_msg_role,
         completion_id=completion_id_for(
             status_tag=status,
             anchor=f"{leaf_id or ''}:{(last_stop_reason or '')}",
@@ -798,7 +810,7 @@ def _memoized_session_info(
     The stamp is taken before the build, so a write racing the parse only makes
     the next scan rebuild; it can never pin an older record to a newer file.
     """
-    version = (stamp, ListRecordMemo.host_key(host))
+    version = ("pi-list-v2", stamp, ListRecordMemo.host_key(host))
     cached = _LIST_MEMO.get(path, version)
     if cached is not MEMO_MISS:
         return cached  # type: ignore[return-value]
@@ -808,9 +820,9 @@ def _memoized_session_info(
     extra_version = ""
     if host_tag is not None and session_cache is not None:
         digest = hashlib.sha256(
-            repr(("pi-list-v1", stamp[3], host_tag)).encode("utf-8", "surrogatepass")
+            repr(("pi-list-v2", stamp[3], host_tag)).encode("utf-8", "surrogatepass")
         ).hexdigest()
-        extra_version = f"pi-list-v1:{digest}"
+        extra_version = f"pi-list-v2:{digest}"
         disk_cached = session_cache.get_session("pi", path, extra_version)
         if isinstance(disk_cached, dict):
             if disk_cached.get("_empty"):

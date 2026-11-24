@@ -86,6 +86,18 @@
     "last_agent": {
       "type": "string"
     },
+    "last_msg_role": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "user",
+        "assistant",
+        null
+      ],
+      "description": "Speaker of the newest message excerpt (user | assistant | null)."
+    },
     "terminal_error_kind": {
       "type": "string",
       "description": "Closed failure class for status_tag=aborted rows; absent when unknown."

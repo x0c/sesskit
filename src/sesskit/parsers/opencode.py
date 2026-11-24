@@ -96,6 +96,14 @@ SELECT
        AND json_extract(p.data, '$.synthetic') IS NOT 1
        AND json_extract(m.data, '$.role') = 'assistant'
      ORDER BY m.time_created DESC, m.id DESC, p.id DESC LIMIT 1)   AS last_agent_text,
+  (SELECT json_extract(m.data, '$.role')
+     FROM message m JOIN part p ON p.message_id = m.id
+     WHERE m.session_id = s.id
+       AND json_extract(p.data, '$.type') = 'text'
+       AND json_extract(p.data, '$.synthetic') IS NOT 1
+       AND json_extract(m.data, '$.role') IN ('user', 'assistant')
+       AND TRIM(COALESCE(json_extract(p.data, '$.text'), '')) != ''
+     ORDER BY m.time_created DESC, m.id DESC, p.id DESC LIMIT 1)   AS last_msg_role,
   (SELECT COALESCE(SUM(LENGTH(p.data)), 0) FROM part p
      WHERE p.session_id = s.id)                                     AS content_bytes,
   (SELECT COUNT(*) FROM message m
@@ -693,8 +701,16 @@ def _build_session_info(
             message=error_text_from_msg(last_msg),
         )
     last_agent_text = str(row["last_agent_text"] or "")
+    try:
+        raw_role = row["last_msg_role"]
+    except (IndexError, KeyError):
+        raw_role = None
+    last_msg_role = raw_role if raw_role in ("user", "assistant") else None
     if not last_agent_text and status == titles.STATUS_ABORTED:
-        last_agent_text = error_text_from_msg(last_msg)
+        err_text = error_text_from_msg(last_msg)
+        if err_text.strip():
+            last_agent_text = err_text
+            last_msg_role = "assistant"
     tail_text = (
         f"{str(row['last_user_text'] or '')[:120]}\n"
         f"{last_agent_text[:120]}"
@@ -722,6 +738,7 @@ def _build_session_info(
         first_user_msg=preprocess_excerpt(first_user, host),
         last_user_msg=preprocess_excerpt(str(row["last_user_text"] or ""), host),
         last_agent_msg=preprocess_excerpt(last_agent_text, host),
+        last_msg_role=last_msg_role,
         completion_id=completion_id_for(
             status_tag=status,
             anchor=str(row["last_msg_key"] or ""),
@@ -759,7 +776,7 @@ def _v2_list_version(
     host: HostExtension | None,
     versions: dict[str, tuple],
 ) -> tuple:
-    return (tuple(row), versions.get(str(row["id"])), ListRecordMemo.host_key(host))
+    return ("oc-v2-list-v2", tuple(row), versions.get(str(row["id"])), ListRecordMemo.host_key(host))
 
 
 def _v2_cache_version_str(
@@ -767,11 +784,11 @@ def _v2_cache_version_str(
     host_tag: str,
     versions: dict[str, tuple],
 ) -> str:
-    payload = ("oc-v2-list-v1", tuple(row), versions.get(str(row["id"])), host_tag)
+    payload = ("oc-v2-list-v2", tuple(row), versions.get(str(row["id"])), host_tag)
     digest = hashlib.sha256(
         repr(payload).encode("utf-8", "surrogatepass")
     ).hexdigest()
-    return f"oc-v2-list-v1:{digest}"
+    return f"oc-v2-list-v2:{digest}"
 
 
 def _v2_disk_cache_hooks(host: HostExtension | None):
@@ -864,17 +881,23 @@ def _v2_list_facts(msg_rows: list[sqlite3.Row]) -> dict:
     goal_rows: list[dict] = []
     assistant_datas: list[dict] = []
     last_anchor = ""
+    last_msg_role: str | None = None
     loop_count = 0
     for msg_row, raw in zip(msg_rows, projected, strict=True):
         data = _v2_json_dict(raw)
         row_type = str(msg_row["type"] or "")
         typed_rows.append((row_type, _v2_status_fact(row_type, data)))
         if row_type == "user":
-            user_texts.append(_v2_user_text(data))
+            user_text = _v2_user_text(data)
+            user_texts.append(user_text)
+            if user_text.strip():
+                last_msg_role = "user"
         elif row_type == "assistant":
             assistant_datas.append(data)
             if _v2_is_valid_assistant_loop(data):
                 loop_count += 1
+            if _v2_assistant_text(data).strip():
+                last_msg_role = "assistant"
             # 原生轮次锚点：同文本不同轮次靠消息 id/seq 区分。
             last_anchor = f"{msg_row['id']}:{msg_row['seq']}"
         elif row_type == "synthetic":
@@ -898,6 +921,7 @@ def _v2_list_facts(msg_rows: list[sqlite3.Row]) -> dict:
         "last_user": user_texts[-1] if user_texts else "",
         "goal_rows": goal_rows,
         "last_agent_message": last_agent_message,
+        "last_msg_role": last_msg_role,
         "status_rows": typed_rows[status_start:],
         "assistant_errors": [{"error": data["error"]} for data in assistant_datas if data.get("error")],
         "last_anchor": last_anchor,
@@ -927,6 +951,8 @@ def _session_info_from_v2_facts(
         first_user = ""
         last_user = ""
     last_agent_text = _v2_assistant_text(facts["last_agent_message"])
+    raw_role = facts.get("last_msg_role")
+    last_msg_role = raw_role if raw_role in ("user", "assistant") else None
     status, error_data = _status_and_error_v2(facts["status_rows"])
     terminal_error: dict[str, object] = {}
     if status == titles.STATUS_ABORTED:
@@ -940,6 +966,8 @@ def _session_info_from_v2_facts(
             candidate = error_text_from_msg(assistant_data)
             if candidate.strip():
                 last_agent_text = candidate
+                if error_data is not None:
+                    last_msg_role = "assistant"
                 break
 
     cwd = row["directory"] or ""
@@ -981,6 +1009,7 @@ def _session_info_from_v2_facts(
         first_user_msg=preprocess_excerpt(first_user, host),
         last_user_msg=preprocess_excerpt(last_user, host),
         last_agent_msg=preprocess_excerpt(last_agent_text, host),
+        last_msg_role=last_msg_role,
         completion_id=completion_id_for(
             status_tag=status,
             anchor=facts["last_anchor"],

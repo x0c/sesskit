@@ -693,6 +693,7 @@ def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage
     first_user = ""
     last_user = ""
     last_agent = ""
+    last_msg_role: str | None = None
     first_ts: float | None = None
     last_ts: float | None = None
     for idx, row in enumerate(rows, 1):
@@ -712,6 +713,7 @@ def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage
                 if not first_user:
                     first_user = tracker.row_user_text
                 last_user = tracker.row_user_text
+                last_msg_role = "user"
                 messages.append(
                     ConversationMessage(role="user", text=tracker.row_user_text, timestamp=ts)
                 )
@@ -722,6 +724,7 @@ def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage
                 last_ts = ts
             if tracker.row_reply_text:
                 last_agent = tracker.row_reply_text
+                last_msg_role = "assistant"
                 messages.append(
                     ConversationMessage(
                         role="assistant", text=tracker.row_reply_text, timestamp=ts
@@ -736,6 +739,7 @@ def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage
         "first_user": first_user,
         "last_user": last_user,
         "last_agent": last_agent,
+        "last_msg_role": last_msg_role,
         "first_ts": first_ts,
         "last_ts": last_ts,
         "model": tracker.model,
@@ -1324,10 +1328,12 @@ def _build_session_info(
         tail_status = str(meta.get("tail_status") or "").upper()
         tail_error = str(meta.get("tail_error") or "").strip()
         status_tag = _status_for_transcript(meta, summary)
+        last_msg_role = meta.get("last_msg_role")
         terminal_error: dict[str, object] = {}
         if status_tag == titles.STATUS_ABORTED:
             if tail_error:
                 last_agent = preprocess_excerpt(tail_error, host) or tail_error
+                last_msg_role = "assistant"
             anchor = str(step) if step is not None else f"row:{len(rows)}"
             id_tail = tail_error or last_agent or last_user
             fallback_msg = (
@@ -1371,6 +1377,7 @@ def _build_session_info(
             first_user_msg=first_user,
             last_user_msg=last_user,
             last_agent_msg=last_agent,
+            last_msg_role=last_msg_role,
             completion_id=completion_id,
             **terminal_error,
         )
@@ -1524,7 +1531,7 @@ def _memoized_session_info(
         if hist_row:
             hist_ver = (hist_row.get("text"), hist_row.get("ts"), hist_row.get("cwd"))
     version = (
-        "ag-list-v1",
+        "ag-list-v2",
         cid,
         transcript_path or "",
         db_path or "",
@@ -1548,7 +1555,7 @@ def _memoized_session_info(
         digest = hashlib.sha256(
             repr((*version[:-1], host_tag)).encode("utf-8", "surrogatepass")
         ).hexdigest()
-        extra_version = f"ag-list-v1:{digest}"
+        extra_version = f"ag-list-v2:{digest}"
         disk_cached = session_cache.get_session("antigravity", primary_path, extra_version)
         if isinstance(disk_cached, dict):
             if disk_cached.get("_empty"):

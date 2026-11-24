@@ -433,20 +433,30 @@ def _backfill_activity_time(path: str) -> float | None:
     return None
 
 
-def _backfill_excerpts(path: str) -> tuple[str | None, str | None]:
+def _backfill_excerpts(path: str) -> tuple[str | None, str | None, str | None]:
     """Newest user prompt / assistant reply beyond the status tail, bounded."""
-    user = agent = None
+    user = agent = role = None
     size = os.path.getsize(path)
     for window in _BACKFILL_WINDOWS:
-        user = agent = None
+        user = agent = role = None
         for entry in reversed(_read_session_tail(path, max_bytes=window, excerpt=True)):
-            user = user or _user_message_text(entry) or None
-            agent = agent or _assistant_message_text(entry) or None
+            if user is None:
+                text = _user_message_text(entry) or None
+                if text:
+                    user = text
+                    if role is None:
+                        role = "user"
+            if agent is None:
+                text = _assistant_message_text(entry) or None
+                if text:
+                    agent = text
+                    if role is None:
+                        role = "assistant"
             if user and agent:
                 break
         if agent or window >= size:
             break
-    return user, agent
+    return user, agent, role
 
 
 def _status_tag(last_event_type: str | None) -> str:
@@ -639,6 +649,9 @@ def _build_session_info(
     error_excerpt_pos: int | None = None
     text_excerpt = ""
     content_excerpt_pos: int | None = None
+    last_user_pos = -1
+    last_text_agent_pos = -1
+    last_agent_pos = -1
     tail_has_activity_time = False
     for idx, e in enumerate(tail_entries):
         entry_time = _activity_time(e)
@@ -665,12 +678,15 @@ def _build_session_info(
             last_user_msg = user_text
             last_event_type = "user_message"
             content_excerpt_pos = idx
+            last_user_pos = idx
             tail_fingerprint = f"user:{_native_event_id(e, payload)}:{user_text[:120]}"
         elif assistant_text:
             last_agent_msg = assistant_text
             text_excerpt = assistant_text
             last_event_type = "agent_message"
             content_excerpt_pos = idx
+            last_text_agent_pos = idx
+            last_agent_pos = idx
             tail_fingerprint = f"agent:{_native_event_id(e, payload)}:{assistant_text[:120]}"
         elif t == "event_msg" and pt == "task_complete":
             msg = str(payload.get("last_agent_message") or "").strip()
@@ -679,10 +695,13 @@ def _build_session_info(
                 last_agent_msg = msg
                 text_excerpt = msg
                 content_excerpt_pos = idx
+                last_text_agent_pos = idx
+                last_agent_pos = idx
             elif err_text:
                 # Quota / provider failures often complete with null last_agent_message.
                 last_agent_msg = err_text
                 error_excerpt_pos = idx
+                last_agent_pos = idx
             last_event_type = "task_complete_error" if err_text else "task_complete"
             if err_text:
                 raw_err = payload.get("error")
@@ -778,11 +797,19 @@ def _build_session_info(
         # failure stale, so the preview falls back to the last real reply (empty
         # when the wider read finds none, letting clients show the last prompt).
         last_agent_msg = text_excerpt
+        last_agent_pos = last_text_agent_pos
+    last_msg_role = (
+        "user"
+        if last_user_pos > last_agent_pos
+        else ("assistant" if last_agent_pos > last_user_pos else None)
+    )
     if not last_agent_msg:
         # List excerpts only; status and completion identity stay on the 8 KB tail.
-        wider_user, wider_agent = _backfill_excerpts(path)
+        wider_user, wider_agent, wider_role = _backfill_excerpts(path)
         last_user_msg = last_user_msg or wider_user
         last_agent_msg = last_agent_msg or wider_agent
+        if last_msg_role is None:
+            last_msg_role = wider_role
     from sesskit.models import completion_id_for
 
     extra: dict[str, object] = dict(terminal_error)
@@ -810,6 +837,7 @@ def _build_session_info(
             readable_user_text(last_user_msg) if last_user_msg else last_user_msg, host,
         ),
         last_agent_msg=preprocess_excerpt(last_agent_msg, host),
+        last_msg_role=last_msg_role,
         thread_source=thread_source,  # 运行时私有字段，见 SessionInfo 的 total=False 部分
         completion_id=completion_id_for(
             status_tag=status,
@@ -924,7 +952,7 @@ def scan_signature() -> tuple | None:
 def _cache_version(host: HostExtension | None) -> str:
     # 新版记录把真实消息放进 response_item；提升解析缓存版本，让旧版误判为
     # “新会话”的派生结果自动重读，而不必让用户手动清缓存。
-    index_version = repr((file_signature(SESSION_INDEX), "response-item-v2", "question-reply-v1", "loop-v1"))
+    index_version = repr((file_signature(SESSION_INDEX), "response-item-v2", "question-reply-v1", "loop-v2"))
     return index_version + host_cache_tag(host)
 
 
