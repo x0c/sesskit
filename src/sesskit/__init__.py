@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.3.14"
+__version__ = "0.3.15"
 
 from sesskit.activity import load_activity, to_v1_dicts
 from sesskit.activity_reader import (

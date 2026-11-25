@@ -130,7 +130,16 @@ _ASYNC_SUBAGENT_PHRASES = (
     "background task",
     "will be notified",
     "launched in the background",
+    "created the following subagent",
 )
+
+
+def _is_truthy_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return False
 
 
 def _roots() -> list[str]:
@@ -380,20 +389,23 @@ def match_pending_call(
 
 
 def _extract_json_id(text: str) -> str:
-    stripped = text.strip()
-    if not stripped.startswith("{"):
-        return ""
-    try:
-        parsed = json.loads(stripped)
-    except ValueError:
-        return ""
-    if not isinstance(parsed, dict):
-        return ""
-    for key in ("task_id", "taskId", "conversation_id", "conversationId", "agent_id", "workflow_id", "id"):
-        val = parsed.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return ""
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        pos = text.find("{", idx)
+        if pos == -1:
+            return ""
+        try:
+            parsed, end = decoder.raw_decode(text, pos)
+        except ValueError:
+            idx = pos + 1
+            continue
+        if isinstance(parsed, dict):
+            for key in ("task_id", "taskId", "conversation_id", "conversationId", "agent_id", "workflow_id", "id"):
+                val = parsed.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        idx = max(end, pos + 1)
 
 
 def _maybe_async_launch_token(
@@ -403,6 +415,8 @@ def _maybe_async_launch_token(
     lineno: int,
     status_upper: str,
 ) -> str:
+    if "Task Description: Cron:" in content:
+        return ""
     if status_upper == "RUNNING":
         bg_match = _BG_TASK_ID_RE.search(content)
         if bg_match:
@@ -553,7 +567,7 @@ class AntigravityTurnTracker:
                     self.pending_by_step[step_val + 1 + index] = call_id
                 tool_name = str(call.get("name") or "")
                 tool_args = coerce_tool_args(call.get("args"))
-                is_daemon = tool_args.get("IsDaemon") is True
+                is_daemon = _is_truthy_flag(tool_args.get("IsDaemon"))
                 self.call_meta[call_id] = (tool_name, tool_args, is_daemon)
             self.row_reply_text = reply
             self.tail_type = kind
@@ -668,11 +682,11 @@ class AntigravityTurnTracker:
             and "No background tasks are currently running." in content_str
         ):
             self._clear_async_kind(frozenset({"bg_task", "timer"}))
-        action = str(tool_args.get("Action") or tool_args.get("action") or "").strip()
+        action = str(tool_args.get("Action") or tool_args.get("action") or "").strip().lower()
         if tool_name == "manage_task" and status_upper == "DONE":
             if action == "kill_all":
                 self._clear_async_kind(frozenset({"bg_task", "timer"}))
-            elif action == "kill":
+            elif action in {"kill", "cancel"}:
                 tid = tool_args.get("TaskId")
                 if isinstance(tid, str) and tid.strip():
                     self._resolve_async_token(tid)
@@ -680,10 +694,15 @@ class AntigravityTurnTracker:
             if action == "kill_all":
                 self._clear_async_kind(frozenset({"invoke_subagent"}))
             elif action in {"kill", "cancel"}:
-                for key in ("id", "agent_id", "conversation_id", "TaskId"):
+                for key in ("id", "agent_id", "conversation_id", "conversationId", "TaskId"):
                     val = tool_args.get(key)
                     if isinstance(val, str) and val.strip():
                         self._resolve_async_token(val)
+                conv_ids = tool_args.get("ConversationIds")
+                if isinstance(conv_ids, list):
+                    for item in conv_ids:
+                        if isinstance(item, str) and item.strip():
+                            self._resolve_async_token(item)
 
 
 def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage], dict]:

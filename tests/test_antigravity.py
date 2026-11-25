@@ -1882,3 +1882,138 @@ def test_side_user_input_during_running_background_task_preserves_pending(tmp_pa
     assert load_activity({"source": "antigravity", "path": str(cpath), "id": "cancel-q"}).outcome.status == "done"
 
 
+def test_prefixed_subagent_json_id_kill_and_cron_daemon(tmp_path: Path) -> None:
+    from sesskit.activity import load_activity
+    from sesskit.parsers.antigravity import AntigravityTurnTracker
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    root = tmp_path / ".gemini" / "antigravity-cli"
+    root.mkdir(parents=True)
+    uris = json.dumps([f"file://{proj}"])
+    _init_summaries_db_with_idle(
+        root,
+        [
+            ("sub-session", "Subagent Async", "", uris, 4, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+            ("cron-str", "Cron String Flag", "", uris, 4, "CASCADE_RUN_STATUS_IDLE", 0, 0),
+        ],
+    )
+    sub_rows = [
+        {
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-25T10:00:00Z",
+            "content": "<USER_REQUEST>delegate</USER_REQUEST>",
+        },
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-25T10:00:01Z",
+            "tool_calls": [{"name": "invoke_subagent", "args": {"Role": "Worker"}}],
+        },
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-11-25T10:00:02Z",
+            "content": (
+                "Created At: 2026-11-25T10:00:02Z\n"
+                "Completed At: 2026-11-25T10:00:03Z\n"
+                "Created the following subagent:\n"
+                '{\n  "conversationId": "sub-123",\n  "logAbsPath": "/tmp/sub.log"\n}'
+            ),
+        },
+        {
+            "step_index": 3,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-25T10:00:04Z",
+            "content": "Subagent launched, waiting for result.",
+        },
+    ]
+    sub_path = _write_transcript(root, "sub-session", sub_rows)
+    scanned = {s["id"]: s for s in _scan_root(root, limit=20)}
+    assert scanned["sub-session"]["status_tag"] == titles.STATUS_PENDING
+    assert load_activity({"source": "antigravity", "path": str(sub_path), "id": "sub-session"}).outcome.status == "pending"
+
+    tracker = AntigravityTurnTracker()
+    for idx, row in enumerate(sub_rows, 1):
+        tracker.observe(row, lineno=idx)
+    assert "sub-123" in tracker.pending_async
+    tracker.observe(
+        {
+            "step_index": 4,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-25T10:00:05Z",
+            "tool_calls": [{"name": "manage_subagents", "args": {"Action": "kill", "ConversationIds": ["sub-123"]}}],
+        },
+        lineno=5,
+    )
+    tracker.observe({"step_index": 5, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": "ok"}, lineno=6)
+    assert not tracker.pending_async
+
+    sub_rows.extend([
+        {
+            "step_index": 4,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": "2026-11-25T10:00:10Z",
+            "content": "<SYSTEM_MESSAGE>\n[Message] sender=sub-123 content=done\n</SYSTEM_MESSAGE>",
+        },
+        {
+            "step_index": 5,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-25T10:00:11Z",
+            "content": "All done.",
+        },
+    ])
+    _write_transcript(root, "sub-session", sub_rows)
+    assert {s["id"]: s for s in _scan_root(root, limit=20)}["sub-session"]["status_tag"] == titles.STATUS_DONE
+
+    # Cron task with string IsDaemon="true" / Task Description: Cron: never holds pending_async.
+    _write_transcript(
+        root,
+        "cron-str",
+        [
+            sub_rows[0],
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-25T10:00:01Z",
+                "tool_calls": [{"name": "schedule", "args": {"CronExpression": "*/5 * * * *", "IsDaemon": "true"}}],
+            },
+            {
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-25T10:00:02Z",
+                "content": "Tool is running as a background task with task id: cron-str/task-2\nTask Description: Cron: */5 * * * *",
+            },
+            {
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-25T10:00:03Z",
+                "content": "Cron active.",
+            },
+        ],
+    )
+    assert {s["id"]: s for s in _scan_root(root, limit=20)}["cron-str"]["status_tag"] == titles.STATUS_DONE
+
+
+
