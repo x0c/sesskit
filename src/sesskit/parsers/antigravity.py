@@ -37,7 +37,7 @@ tool calls, tool-result rows (including mid-turn tool ``ERROR``/``INVALID``),
 ``summary.get("killed")``, ``ERROR_MESSAGE`` rows, or non-tool terminal rows
 with ``ERROR``/``CANCELED``/``CANCELLED`` status map to ``STATUS_ABORTED`` with
 deterministic ``completion_id_for`` and ``terminal_error_evidence``; anything else
-(including non-killed sqlite-only rows) maps to ``STATUS_NONE`` (never default
+(including sqlite-only rows without a terminal error) maps to ``STATUS_NONE`` (never default
 to success). Subagent conversations marked in ``conversation_summaries.db`` or
 ``conversation_parents`` are excluded from ``scan_sessions``.
 """
@@ -53,10 +53,12 @@ import re
 import shutil
 import sqlite3
 import threading
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 from sesskit import titles
 from sesskit.models import ConversationMessage, SessionInfo, effective_session_time, make_session_info
+from sesskit.parsers.antigravity_errors import ErrorStep, ErrorStepMerge, read_error_steps
 from sesskit.parsers.common import (
     MEMO_MISS,
     HostExtension,
@@ -512,7 +514,7 @@ class AntigravityTurnTracker:
         status_upper = str(row.get("status") or "").upper()
         media = normalize_media(row.get("media"))
         row_error = _row_error_text(row)
-        record = f"line:{lineno}" if lineno else ""
+        record = f"line:{lineno}" if lineno else str(row.get("_db_error_record") or "")
 
         if kind == "USER_INPUT":
             raw_content = row.get("content") or ""
@@ -705,7 +707,20 @@ class AntigravityTurnTracker:
                             self._resolve_async_token(item)
 
 
-def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage], dict]:
+def merge_turn_errors(path: str, rows: Iterable[dict]) -> Iterator[dict]:
+    """Supply JSONL rows plus native SQLite turn errors for this history path."""
+    steps = read_error_steps(path) or ()
+    if path.endswith(".db"):
+        steps = tuple(step for step in steps if step.is_db_tail)
+    merger = ErrorStepMerge(steps)
+    source_rows = (row for row in rows if _is_antigravity_record(row))
+    for _, row in merger.rows(enumerate(source_rows, 1), final=True):
+        yield row
+
+
+def _transcript_conversation(
+    rows: list[dict], errors: tuple[ErrorStep, ...] = (),
+) -> tuple[list[ConversationMessage], dict]:
     """Project transcript rows to plain user/assistant turns plus list hints."""
     messages: list[ConversationMessage] = []
     tracker = AntigravityTurnTracker()
@@ -715,10 +730,13 @@ def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage
     last_msg_role: str | None = None
     first_ts: float | None = None
     last_ts: float | None = None
-    for idx, row in enumerate(rows, 1):
+    tail_error_code: int | None = None
+    for idx, row in ErrorStepMerge(errors).rows(enumerate(rows, 1), final=True):
         created = row.get("created_at")
         ts = parse_timestamp(created) if isinstance(created, str) else None
         tracker.observe(row, lineno=idx)
+        if tracker.tail_record == (f"line:{idx}" if idx else row.get("_db_error_record")):
+            tail_error_code = row.get("_db_http_status") if not idx else None
         kind = str(row.get("type") or "")
         row_status = str(row.get("status") or "").upper()
         if kind == "USER_INPUT":
@@ -771,6 +789,7 @@ def _transcript_conversation(rows: list[dict]) -> tuple[list[ConversationMessage
         "pending_async": tuple(sorted(tracker.pending_async)),
         "tail_step_index": tracker.tail_step_index,
         "tail_error": tracker.tail_error,
+        "tail_error_code": tail_error_code,
     }
     return messages, meta
 
@@ -1303,9 +1322,10 @@ def _build_session_info(
     ]
     if transcript_path:
         rows = _iter_transcript_rows(transcript_path)
-        if not rows:
+        errors = read_error_steps(transcript_path) or ()
+        if not rows and not errors:
             return None
-        _messages, meta = _transcript_conversation(rows)
+        _messages, meta = _transcript_conversation(rows, errors)
         # Transcript-only sessions still honor the summaries cwd when the
         # transcript itself carries no working directory (expected: the
         # transcript format has no cwd field).
@@ -1363,6 +1383,7 @@ def _build_session_info(
             fallback_kind = "user_interrupt" if is_killed else "error"
             terminal_error = terminal_error_evidence(
                 kind="" if tail_error else fallback_kind,
+                code=meta.get("tail_error_code"),
                 message=tail_error or fallback_msg,
             )
         elif status_tag == titles.STATUS_DONE:
@@ -1400,8 +1421,8 @@ def _build_session_info(
             completion_id=completion_id,
             **terminal_error,
         )
-    # SQLite-only session: no conversation text, but the database itself is
-    # the history. List with unknown status; never claim done.
+    # SQLite-only sessions have no conversation text for success inference,
+    # but can still carry an explicit native terminal error.
     if db_path and os.path.isfile(db_path):
         cwd, event_time = _db_cwd_and_times(db_path, summary)
         try:
@@ -1434,7 +1455,17 @@ def _build_session_info(
         from sesskit.models import completion_id_for
 
         terminal_error = {}
-        if (summary or {}).get("killed"):
+        errors = read_error_steps(db_path) or ()
+        latest = errors[-1] if errors and errors[-1].is_db_tail else None
+        if latest is not None and not _summary_is_active(summary):
+            status_tag = titles.STATUS_ABORTED
+            last_agent_disp = preprocess_excerpt(latest.message, host) or latest.message
+            event_time = parse_timestamp(latest.created_at) or event_time
+            completion_id = completion_id_for(
+                status_tag=status_tag, anchor=str(latest.index), tail_text=latest.message,
+            )
+            terminal_error = terminal_error_evidence(code=latest.http_status, message=latest.message)
+        elif (summary or {}).get("killed"):
             status_tag = titles.STATUS_ABORTED
             completion_id = completion_id_for(
                 status_tag=status_tag,
@@ -1467,6 +1498,7 @@ def _build_session_info(
             first_user_msg=first_user,
             last_user_msg=last_user,
             last_agent_msg=last_agent_disp,
+            last_msg_role="assistant" if latest is not None and not _summary_is_active(summary) else None,
             completion_id=completion_id,
             **terminal_error,
         )
@@ -1550,7 +1582,7 @@ def _memoized_session_info(
         if hist_row:
             hist_ver = (hist_row.get("text"), hist_row.get("ts"), hist_row.get("cwd"))
     version = (
-        "ag-list-v2",
+        "ag-list-v3",
         cid,
         transcript_path or "",
         db_path or "",
@@ -1574,7 +1606,7 @@ def _memoized_session_info(
         digest = hashlib.sha256(
             repr((*version[:-1], host_tag)).encode("utf-8", "surrogatepass")
         ).hexdigest()
-        extra_version = f"ag-list-v2:{digest}"
+        extra_version = f"ag-list-v3:{digest}"
         disk_cached = session_cache.get_session("antigravity", primary_path, extra_version)
         if isinstance(disk_cached, dict):
             if disk_cached.get("_empty"):
@@ -1671,8 +1703,8 @@ def _sort_key(cid: str, transcripts: dict[str, str], dbs: dict[str, str]) -> flo
 def load_conversation(path: str, *, include_errors: bool = False) -> list[ConversationMessage]:
     """Load plain user/assistant turns from a transcript path or sqlite db path.
 
-    SQLite-only histories carry usage metadata but no plain transcript; they
-    load as an empty (readable, zero-turn) conversation rather than an error.
+    SQLite-only histories carry no plain transcript. Native turn errors can
+    still be included when requested.
     Missing paths raise ``FileNotFoundError``; the adapter translates the
     SessKit-path case to ``ConversationLoadError``.
     """
@@ -1680,8 +1712,6 @@ def load_conversation(path: str, *, include_errors: bool = False) -> list[Conver
         raise FileNotFoundError("session has no history path (runtime=antigravity)")
     if not os.path.exists(path):
         raise FileNotFoundError(f"history path not found: {path}")
-    if path.endswith(".db"):
-        return []
     from sesskit.activity_antigravity import load_antigravity_activity
     from sesskit.conversation import project_session_conversation
 

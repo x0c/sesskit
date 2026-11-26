@@ -16,6 +16,7 @@ with FIFO fallback, so committed event sequence numbers never shift on append.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -43,6 +44,7 @@ from sesskit.models import (
     Usage,
 )
 from sesskit.parsers import antigravity as scan_antigravity
+from sesskit.parsers.antigravity_errors import ErrorStep, ErrorStepMerge, read_error_steps
 from sesskit.parsers.common import classify_tool, parse_timestamp
 from sesskit.skills import raw_skill_name, skill_from_tool_call
 
@@ -103,10 +105,12 @@ def _antigravity_error(
     record: str,
     field: str = "error",
     scope: str = "turn",
+    http_status: int | None = None,
 ) -> AgentError:
     err_kind, retryable = classify_error(
         runtime="antigravity",
         kind="error",
+        code=http_status,
         message=message,
     )
     return AgentError(
@@ -115,7 +119,7 @@ def _antigravity_error(
         Evidence(_NATIVE, field=field, record=record),
         retryable=retryable,
         scope=scope,  # type: ignore[arg-type]
-        http_status=native_http_status(None, message),
+        http_status=http_status or native_http_status(None, message),
     )
 
 
@@ -254,7 +258,7 @@ class _AntigravityFeed:
         for lineno, row in rows:
             if not scan_antigravity._is_antigravity_record(row):
                 continue
-            record = _record_ref(lineno)
+            record = _record_ref(lineno) if lineno else row["_db_error_record"]
             kind = str(row.get("type") or "")
             source = str(row.get("source") or "")
             status_upper = str(row.get("status") or "").upper()
@@ -466,8 +470,11 @@ class _AntigravityFeed:
                     error=_antigravity_error(
                         err_msg,
                         record=record,
-                        field="error" if kind == "ERROR_MESSAGE" else "status",
+                        field="step_payload" if not lineno else (
+                            "error" if kind == "ERROR_MESSAGE" else "status"
+                        ),
                         scope="turn",
+                        http_status=row.get("_db_http_status") if not lineno else None,
                     ),
                 )
 
@@ -488,9 +495,13 @@ class _AntigravityOutcomeAcc:
 
     def __init__(self) -> None:
         self._tracker = scan_antigravity.AntigravityTurnTracker()
+        self._db_status: int | None = None
 
     def add(self, lineno: int, row: dict) -> None:
+        before = self._tracker.tail_record
         self._tracker.observe(row, lineno=lineno)
+        if before != self._tracker.tail_record:
+            self._db_status = row.get("_db_http_status") if not lineno else None
 
     def result(self) -> SessionOutcome:
         tracker = self._tracker
@@ -502,7 +513,10 @@ class _AntigravityOutcomeAcc:
         ):
             fallback = "canceled" if "CANCEL" in tracker.tail_status else "error"
             err_text = tracker.tail_error or fallback
-            field = "error" if tracker.tail_type == "ERROR_MESSAGE" else "status"
+            field = (
+                "step_payload" if tracker.tail_record.startswith("steps:")
+                else "error" if tracker.tail_type == "ERROR_MESSAGE" else "status"
+            )
             ev = Evidence(_NATIVE, field=field, record=tracker.tail_record)
             return SessionOutcome(
                 "aborted",
@@ -512,6 +526,7 @@ class _AntigravityOutcomeAcc:
                     record=tracker.tail_record,
                     field=field,
                     scope="turn",
+                    http_status=self._db_status,
                 ),
             )
         if tracker.tail_status == "RUNNING":
@@ -567,12 +582,9 @@ def load_antigravity_activity(session: dict) -> ActivitySnapshot:
             events=(),
             outcome=SessionOutcome("unknown", Evidence(_UNKNOWN)),
         )
+    errors = read_error_steps(path) or ()
     if path.endswith(".db"):
-        return ActivitySnapshot(
-            state="empty",
-            events=(),
-            outcome=SessionOutcome("unknown", Evidence(_UNKNOWN)),
-        )
+        return _db_activity(errors)
     rows: list[tuple[int, dict]] = []
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
@@ -592,6 +604,10 @@ def load_antigravity_activity(session: dict) -> ActivitySnapshot:
             events=(),
             outcome=SessionOutcome("unknown", Evidence(_UNKNOWN)),
         )
+    return _rows_activity(list(ErrorStepMerge(errors).rows(rows, final=True)))
+
+
+def _rows_activity(rows: list[tuple[int, dict]]) -> ActivitySnapshot:
     feed = _AntigravityFeed()
     feed.feed(rows)
     feed.finish_snapshot()
@@ -613,10 +629,29 @@ def load_antigravity_activity(session: dict) -> ActivitySnapshot:
     )
 
 
+def _db_activity(errors: tuple[ErrorStep, ...]) -> ActivitySnapshot:
+    snapshot = _rows_activity([(0, step.row()) for step in errors])
+    if errors and not errors[-1].is_db_tail:
+        return replace(snapshot, outcome=SessionOutcome("unknown", Evidence(_UNKNOWN)))
+    return snapshot
+
+
 class AntigravityActivityReader(_JsonlActivityReaderBase):
-    """Byte-offset incremental reader over an Antigravity JSONL transcript."""
+    """Byte-offset JSONL reader with exact-session SQLite error evidence."""
 
     RUNTIME = "antigravity"
+    _error_steps: tuple[ErrorStep, ...] = ()
+    _error_hash = ""
+
+    def _prepare_rebuild(self) -> None:
+        self._error_merge = ErrorStepMerge(self._error_steps)
+
+    def _prepare_rows(self, rows: list[tuple[int, dict]], *, final: bool = False
+                      ) -> list[tuple[int, dict]]:
+        if not self._error_steps:
+            return rows
+        valid = ((line, row) for line, row in rows if scan_antigravity._is_antigravity_record(row))
+        return list(self._error_merge.rows(valid, final=final))
 
     def _new_feed(self) -> _AntigravityFeed:
         return _AntigravityFeed()
@@ -634,13 +669,34 @@ class AntigravityActivityReader(_JsonlActivityReaderBase):
             )
         return {
             "model": feed.current_model if feed is not None else None,
+            "db_errors": self._error_hash,
             "last_emit": _dedup_tail_hash(last),
             "unresolved": unresolved[:_AUX_CALL_CAP],
             "unresolved_truncated": len(unresolved) > _AUX_CALL_CAP,
         }
 
+    def _try_cheap_resume(self, stat: os.stat_result, saved: dict[str, Any]) -> bool:
+        if self._saved_error_hash(saved) != self._error_hash:
+            return False
+        return super()._try_cheap_resume(stat, saved)
+
+    @staticmethod
+    def _saved_error_hash(saved: dict[str, Any]) -> str:
+        aux = saved.get("aux")
+        return str(aux.get("db_errors") or "") if isinstance(aux, dict) else ""
+
     def _sync(self) -> None:
-        if not self._path.endswith(".db"):
+        db_only = self._path.endswith(".db")
+        steps = read_error_steps(self._path)
+        changed = False
+        if steps is not None and steps != self._error_steps:
+            self._error_steps = steps
+            content = tuple((s.index, s.message, s.created_at, s.http_status,
+                             db_only and s.is_db_tail) for s in steps)
+            error_hash = hashlib.sha256(repr(content).encode()).hexdigest() if content else ""
+            changed = error_hash != self._error_hash
+            self._error_hash = error_hash
+        if not db_only and not (changed and self._initialized):
             super()._sync()
             return
         try:
@@ -648,58 +704,39 @@ class AntigravityActivityReader(_JsonlActivityReaderBase):
         except OSError:
             self._mark_unavailable()
             return
-        if not os.path.isfile(self._path):
-            self._mark_unavailable()
-            return
-        if not self._initialized:
-            saved = self._pending_cursor
-            self._pending_cursor = None
-            self._initialized = True
-            self._materialized = True
-            self._events = []
-            self._new_events = []
-            self._outcome = SessionOutcome("unknown", Evidence(_UNKNOWN))
-            self._state = "empty"
-            if (
-                saved is not None
-                and saved.get("state") == "empty"
-                and saved.get("dev") == stat.st_dev
-                and saved.get("ino") == stat.st_ino
-                and saved.get("size") == stat.st_size
-            ):
-                self._gen = self._resume_gen(saved)
-                self._last_reset = False
-            else:
-                self._gen = (
-                    self._resume_gen(saved) + 1
-                    if saved is not None
-                    else (2 if self._pending_invalid else 1)
-                )
-                self._last_reset = True
-            self._dev = stat.st_dev
-            self._ino = stat.st_ino
-            self._size = stat.st_size
-            self._mtime_ns = stat.st_mtime_ns
-            return
-        identity_changed = (
-            self._state == "unavailable"
-            or stat.st_dev != self._dev
-            or stat.st_ino != self._ino
-        )
-        self._dev = stat.st_dev
-        self._ino = stat.st_ino
-        self._size = stat.st_size
-        self._mtime_ns = stat.st_mtime_ns
-        self._state = "empty"
-        self._outcome = SessionOutcome("unknown", Evidence(_UNKNOWN))
-        self._events = []
+        if db_only:
+            self._sync_db_only(stat, changed)
+        else:
+            # DB-only writes can insert into the committed JSONL history.
+            # Rebuild only when the decoded error evidence actually changes.
+            self._rebuild(stat, fresh_gen=self._gen + 1)
+
+    def _sync_db_only(self, stat: os.stat_result, changed: bool) -> None:
+        identity = (stat.st_dev, stat.st_ino)
         self._new_events = []
-        self._materialized = True
-        if identity_changed:
+        self._last_reset = False
+        if not self._initialized:
+            saved, self._pending_cursor = self._pending_cursor, None
+            reuse = (saved is not None and (saved.get("dev"), saved.get("ino")) == identity
+                     and self._saved_error_hash(saved) == self._error_hash)
+            self._gen = (self._resume_gen(saved) + (not reuse) if saved is not None
+                         else (2 if self._pending_invalid else 1))
+            self._last_reset = not reuse
+        elif changed or self._state == "unavailable" or identity != (self._dev, self._ino):
             self._gen += 1
             self._last_reset = True
         else:
-            self._last_reset = False
+            return
+        snapshot = _db_activity(self._error_steps)
+        self._events = list(snapshot.events)
+        if self._last_reset:
+            self._new_events = self._events[-self._tail_events:]
+        self._state = snapshot.state
+        self._outcome = snapshot.outcome
+        self._initialized = self._materialized = True
+        self._dev, self._ino = identity
+        self._size = stat.st_size
+        self._mtime_ns = stat.st_mtime_ns
 
     def _materialize_full(self) -> None:
         if self._path.endswith(".db"):

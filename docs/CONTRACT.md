@@ -268,11 +268,11 @@ Use these when implementing or reviewing parsers (not an event-bus API — SessK
 | Kimi | Stable `step.end` / assistant tail | Cancel / failure markers in wire history |
 | Antigravity | Terminal `PLANNER_RESPONSE` with `status == "DONE"`, empty `tool_calls`, non-empty `content`/media, zero open calls, zero non-daemon `pending_async`, and DB idle (`not CASCADE_RUN_STATUS_RUNNING` / `not_fully_idle`; thinking-only rows, tool calls/results, mid-turn tool `ERROR`/`INVALID`, `SYSTEM_MESSAGE`, `USER_INPUT` stay `pending`) | `ERROR_MESSAGE` turn rows (e.g. quota/rate-limit/API errors), non-tool `ERROR`/`CANCELED`/`CANCELLED`, or DB `killed` → aborted |
 
-### Verified Antigravity SQLite-only turn errors (open)
+### Antigravity SQLite-backed turn errors
 
 Antigravity CLI 1.5.18 displayed `Individual quota reached` (HTTP 429) in two live sessions. Read-only queries found the missing terminal steps in `conversations/<id>.db`: `steps.step_type = 17`, `status = 3`, and the error text in the binary `step_payload`, with `error_details` null. The corresponding step indices were absent from both JSONL transcripts and their chunk exports. The installed history reader still emitted the ordinary JSONL tool errors, but emitted no quota error and left both sessions pending.
 
-When adding support, use the per-conversation step record as the source of truth. Interpret the payload before classifying the outcome; neither `status = 3` nor nearby tool failures establish a turn error by themselves. Verify exact step identity, ordering and deduplication when both stores contain the same error. Do not infer session attribution from shared CLI log timestamps. SQLite-only terminal error extraction remains unimplemented.
+Merge those records into the matched conversation by native step index, preserving the JSONL record order and emitting one error per step even when the export also includes it. Use the protobuf's user-facing error text, creation time and HTTP status; never expose its raw transport details. A newer user or agent step supersedes earlier errors for the current outcome without erasing their history. Ordinary tool failures remain tool results. Incremental readers observe DB/WAL-only changes, without rebuilding the transcript for changes that leave native error evidence untouched. Do not infer session attribution from shared CLI log timestamps.
 
 ### Verified gaps closed (2026-09-15 live Mac runs)
 

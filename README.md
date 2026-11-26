@@ -32,7 +32,7 @@ SessKit is not on PyPI yet. Install the fixed-release wheel in your project's vi
 Requires **Python 3.10+**. Supported platforms: **macOS and Linux** (agents store history under `~`). Not claimed on Windows.
 
 ```bash
-python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.15" sesskit
+python -m pip install --no-index --find-links "https://github.com/x0c/sesskit/releases/expanded_assets/v0.3.16" sesskit
 python -m sesskit describe
 ```
 
@@ -78,7 +78,7 @@ unverified.
 Snapshot commands print one JSON envelope:
 
 ```json
-{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.15"}}
+{"ok": true, "data": {...}, "error": null, "meta": {"version": 1, "tool_version": "0.3.16"}}
 ```
 
 ## Python API

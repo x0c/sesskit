@@ -248,6 +248,13 @@ class _JsonlActivityReaderBase(ActivityReader):
     def _finish_rebuild(self, feed: Any) -> None:
         """Hook run once after the last rebuild batch, before events are read."""
 
+    def _prepare_rebuild(self) -> None:
+        """Reset any adapter-specific row preparation before a rebuild."""
+
+    def _prepare_rows(self, rows: list[tuple[int, dict]], *, final: bool = False
+                      ) -> list[tuple[int, dict]]:
+        return rows
+
     # -- public protocol ---------------------------------------------------
 
     @property
@@ -435,6 +442,7 @@ class _JsonlActivityReaderBase(ActivityReader):
         of events is delivered, keeping the response bounded while seqs
         stay snapshot-global.
         """
+        self._prepare_rebuild()
         feed = self._new_feed()
         acc = self._new_acc()
         batch: list[tuple[int, dict]] = []
@@ -443,13 +451,13 @@ class _JsonlActivityReaderBase(ActivityReader):
         committed = 0
         last_line = b""
 
-        def drain() -> None:
+        def drain(*, final: bool = False) -> None:
             nonlocal batch, batch_bytes
-            if not batch:
-                return
-            feed.feed(batch)
-            for row_lineno, entry in batch:
-                acc.add(row_lineno, entry)
+            ready = self._prepare_rows(batch, final=final)
+            if ready:
+                feed.feed(ready)
+                for row_lineno, entry in ready:
+                    acc.add(row_lineno, entry)
             batch = []
             batch_bytes = 0
 
@@ -467,7 +475,7 @@ class _JsonlActivityReaderBase(ActivityReader):
                     batch_bytes += len(raw)
                     if len(batch) >= _ROW_BATCH_ROWS or batch_bytes >= _ROW_BATCH_BYTES:
                         drain()
-            drain()
+            drain(final=True)
             total = handle.tell()
             head_len = min(_HEAD_FP_BYTES, total)
             head = _head_checksum(handle, head_len)
@@ -523,8 +531,8 @@ class _JsonlActivityReaderBase(ActivityReader):
             self._mtime_ns = stat.st_mtime_ns
             return
         base = self._next_lineno - 1
-        batch = [(base + lineno, entry)
-                 for lineno, entry in _parse_json_rows(lines)]
+        batch = self._prepare_rows([(base + lineno, entry)
+                                    for lineno, entry in _parse_json_rows(lines)])
         self.lines_parsed += len(lines)
         assert self._feed is not None and self._acc is not None
         fresh = self._feed.feed(batch)
