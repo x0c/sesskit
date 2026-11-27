@@ -39,7 +39,8 @@ with ``ERROR``/``CANCELED``/``CANCELLED`` status map to ``STATUS_ABORTED`` with
 deterministic ``completion_id_for`` and ``terminal_error_evidence``; anything else
 (including sqlite-only rows without a terminal error) maps to ``STATUS_NONE`` (never default
 to success). Subagent conversations marked in ``conversation_summaries.db`` or
-``conversation_parents`` are excluded from ``scan_sessions``.
+``conversation_parents`` and native side-question trajectories are excluded
+from ``scan_sessions``.
 """
 
 from __future__ import annotations
@@ -97,6 +98,8 @@ _TOOL_RESULT_TYPES = frozenset(
 _NON_TOOL_TYPES = frozenset(
     {"PLANNER_RESPONSE", "USER_INPUT", "CHECKPOINT", "SYSTEM_MESSAGE", "ERROR_MESSAGE"}
 )
+# Native TRAJECTORY_TYPE_SIDE_QUESTION in Antigravity CLI 1.5.18.
+_SIDE_QUESTION_TRAJECTORY_TYPE = 22
 _ABORT_STATUSES = frozenset({"ERROR", "CANCELED", "CANCELLED"})
 _CLOSED_TOOL_STATUSES = frozenset({"DONE", "ERROR", "INVALID"})
 _TERMINAL_TASK_STATUSES = frozenset(
@@ -1121,13 +1124,26 @@ def _looks_like_cwd(candidate: str) -> bool:
     return len(candidate) <= 512
 
 
-def _db_cwd_and_times(db_path: str, summary: dict | None) -> tuple[str, float | None]:
+def _db_list_context(
+    db_path: str, cid: str, summary: dict | None,
+) -> tuple[str, float | None] | None:
+    """Read workspace and time; return None only for a native side question."""
     cwd = ""
     event_time: float | None = None
     conn = _connect_ro(db_path)
     if conn is None:
         return cwd, event_time
     try:
+        try:
+            side_question = conn.execute(
+                "SELECT 1 FROM trajectory_meta WHERE cascade_id = ? AND trajectory_type = ? LIMIT 1",
+                (cid, _SIDE_QUESTION_TRAJECTORY_TYPE),
+            ).fetchone()
+        except sqlite3.Error:
+            # Older stores may lack trajectory metadata; do not guess from text or parent links.
+            side_question = None
+        if side_question is not None:
+            return None
         try:
             row = conn.execute(
                 "SELECT data FROM trajectory_metadata_blob WHERE id='main' LIMIT 1"
@@ -1320,27 +1336,20 @@ def _build_session_info(
     candidate_roots = [
         r for r in ((summary or {}).get("root"), *_root_from_history_path(transcript_path, db_path)) if r
     ]
+    db_exists = bool(db_path and os.path.isfile(db_path))
+    db_context = _db_list_context(db_path or "", cid, summary) if db_exists or summary else ("", None)
+    if db_context is None:
+        return None
+    cwd, db_time = db_context
     if transcript_path:
         rows = _iter_transcript_rows(transcript_path)
         errors = read_error_steps(transcript_path) or ()
         if not rows and not errors:
             return None
         _messages, meta = _transcript_conversation(rows, errors)
-        # Transcript-only sessions still honor the summaries cwd when the
-        # transcript itself carries no working directory (expected: the
-        # transcript format has no cwd field).
-        cwd = ""
         event_time = meta.get("last_ts") or meta.get("first_ts")
-        if db_path and os.path.isfile(db_path):
-            db_cwd, db_time = _db_cwd_and_times(db_path, summary)
-            cwd = db_cwd
-            if event_time is None:
-                event_time = db_time
-        elif summary is not None:
-            db_cwd, db_time = _db_cwd_and_times(db_path or "", summary)
-            cwd = db_cwd
-            if event_time is None:
-                event_time = db_time
+        if event_time is None:
+            event_time = db_time
         try:
             file_mtime = os.path.getmtime(transcript_path)
         except OSError:
@@ -1423,8 +1432,8 @@ def _build_session_info(
         )
     # SQLite-only sessions have no conversation text for success inference,
     # but can still carry an explicit native terminal error.
-    if db_path and os.path.isfile(db_path):
-        cwd, event_time = _db_cwd_and_times(db_path, summary)
+    if db_path and db_exists:
+        event_time = db_time
         try:
             file_mtime = os.path.getmtime(db_path)
         except OSError:
@@ -1581,8 +1590,9 @@ def _memoized_session_info(
         hist_row = history.get(cid)
         if hist_row:
             hist_ver = (hist_row.get("text"), hist_row.get("ts"), hist_row.get("cwd"))
+    cache_version = "ag-list-v4"
     version = (
-        "ag-list-v3",
+        cache_version,
         cid,
         transcript_path or "",
         db_path or "",
@@ -1606,7 +1616,7 @@ def _memoized_session_info(
         digest = hashlib.sha256(
             repr((*version[:-1], host_tag)).encode("utf-8", "surrogatepass")
         ).hexdigest()
-        extra_version = f"ag-list-v3:{digest}"
+        extra_version = f"{cache_version}:{digest}"
         disk_cached = session_cache.get_session("antigravity", primary_path, extra_version)
         if isinstance(disk_cached, dict):
             if disk_cached.get("_empty"):

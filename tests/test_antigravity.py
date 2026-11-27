@@ -206,6 +206,65 @@ def test_subagents_excluded_via_summaries_and_parents_table(tmp_path: Path) -> N
     assert sessions[0]["status_tag"] == titles.STATUS_DONE
 
 
+@pytest.mark.parametrize("with_transcript", [False, True])
+def test_side_question_excluded_by_native_trajectory_type(
+    tmp_path: Path, with_transcript: bool,
+) -> None:
+    root = tmp_path / "history"
+    conversations = root / "conversations"
+    conversations.mkdir(parents=True)
+    rows = [
+        {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+         "status": "DONE", "content": "A short question"},
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE",
+         "content": "A short answer"},
+    ]
+    paths = {}
+    cases = [
+        ("side", "side", 22),
+        ("main", "main", 4),
+        ("fork", "fork", 4),
+        ("other-cascade", "side", 22),
+        ("legacy", "", None),
+    ]
+    for cid, cascade_id, trajectory_type in cases:
+        db_path = conversations / f"{cid}.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE trajectory_metadata_blob (id TEXT, data BLOB)")
+            conn.execute(
+                "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)",
+                (tmp_path.as_uri().encode(),),
+            )
+            conn.execute("CREATE TABLE parent_references (idx INTEGER, data BLOB)")
+            if cid in {"side", "fork"}:
+                conn.execute("INSERT INTO parent_references VALUES (0, ?)", (b"parent",))
+            if trajectory_type is not None:
+                conn.execute(
+                    "CREATE TABLE trajectory_meta "
+                    "(trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER, source INTEGER)"
+                )
+                conn.execute(
+                    "INSERT INTO trajectory_meta VALUES (?, ?, ?, 17)",
+                    (f"trajectory-{cid}", cascade_id, trajectory_type),
+                )
+        paths[cid] = _write_transcript(root, cid, rows) if with_transcript else db_path
+
+    # Like the CLI /btw history, the SQLite type is present without a summary row.
+    with mock.patch.object(ag, "_roots", return_value=[str(root)]):
+        assert {s["id"] for s in ag.scan_sessions(limit=20, keep_ids={"side"})} == {
+            "main", "fork", "other-cascade", "legacy",
+        }
+        assert ag.scan_sessions(limit=0, keep_ids={"side"}) == []
+        assert ag.refresh_session({"id": "side", "path": str(paths["side"])}) is None
+        fork = ag.refresh_session({"id": "fork", "path": str(paths["fork"])})
+        assert fork is not None and fork["id"] == "fork"
+    assert all(path.is_file() for path in paths.values())
+    if with_transcript:
+        assert [message.text for message in ag.load_conversation(str(paths["side"]))] == [
+            "A short question", "A short answer",
+        ]
+
+
 def test_pbtxt_annotation_title_fallback_and_summary_precedence(tmp_path: Path) -> None:
     proj = tmp_path / "proj"
     proj.mkdir()
